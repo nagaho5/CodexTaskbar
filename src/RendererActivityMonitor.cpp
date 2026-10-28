@@ -150,10 +150,15 @@ std::filesystem::path RendererActivityMonitor::FindLogFile() const {
     std::error_code ec;
     const std::filesystem::path packages = localAppData / L"Packages";
     if (std::filesystem::is_directory(packages, ec)) {
-        for (std::filesystem::directory_iterator it(packages, ec), end;
+        for (std::filesystem::directory_iterator it(
+                 packages,
+                 std::filesystem::directory_options::skip_permission_denied,
+                 ec),
+             end;
              !ec && it != end;
              it.increment(ec)) {
             if (!it->is_directory(ec)) continue;
+
             const std::wstring name = it->path().filename().wstring();
             if (!StartsWith(name, L"OpenAI.Codex_")) continue;
 
@@ -168,12 +173,13 @@ std::filesystem::path RendererActivityMonitor::FindLogFile() const {
     // Non-MSIX fallback for future/alternate desktop packaging.
     logDirs.push_back(localAppData / L"Codex" / L"Logs");
 
-    std::filesystem::path bestNamed;
-    std::filesystem::file_time_type bestNamedTime{};
-    bool haveNamed = false;
-    std::filesystem::path bestFallback;
-    std::filesystem::file_time_type bestFallbackTime{};
-    bool haveFallback = false;
+    std::filesystem::path bestDesktopLog;
+    std::filesystem::file_time_type bestDesktopLogTime{};
+    bool haveDesktopLog = false;
+
+    std::filesystem::path bestFallbackLog;
+    std::filesystem::file_time_type bestFallbackLogTime{};
+    bool haveFallbackLog = false;
 
     auto consider = [](
         const std::filesystem::path& path,
@@ -182,8 +188,10 @@ std::filesystem::path RendererActivityMonitor::FindLogFile() const {
         bool& haveBest) {
         std::error_code localEc;
         if (!std::filesystem::is_regular_file(path, localEc)) return;
+
         const auto time = std::filesystem::last_write_time(path, localEc);
         if (localEc) return;
+
         if (!haveBest || time > bestTime) {
             best = path;
             bestTime = time;
@@ -195,27 +203,39 @@ std::filesystem::path RendererActivityMonitor::FindLogFile() const {
         std::error_code localEc;
         if (!std::filesystem::is_directory(dir, localEc)) continue;
 
-        // The Desktop process normally writes renderer activity to Codex.log.
-        // Prefer that file across all candidate package roots.
-        consider(
-            dir / L"Codex.log",
-            bestNamed,
-            bestNamedTime,
-            haveNamed);
-
-        for (std::filesystem::directory_iterator it(dir, localEc), end;
+        // Packaged Windows Desktop writes session logs under date folders:
+        // Logs\\YYYY\\MM\\DD\\codex-desktop-*.log
+        for (std::filesystem::recursive_directory_iterator it(
+                 dir,
+                 std::filesystem::directory_options::skip_permission_denied,
+                 localEc),
+             end;
              !localEc && it != end;
              it.increment(localEc)) {
             if (!it->is_regular_file(localEc)) continue;
-            consider(
-                it->path(),
-                bestFallback,
-                bestFallbackTime,
-                haveFallback);
+
+            const std::filesystem::path path = it->path();
+            const std::wstring filename = path.filename().wstring();
+            const std::wstring extension = path.extension().wstring();
+            if (_wcsicmp(extension.c_str(), L".log") != 0) continue;
+
+            if (StartsWith(filename, L"codex-desktop-")) {
+                consider(
+                    path,
+                    bestDesktopLog,
+                    bestDesktopLogTime,
+                    haveDesktopLog);
+            } else {
+                consider(
+                    path,
+                    bestFallbackLog,
+                    bestFallbackLogTime,
+                    haveFallbackLog);
+            }
         }
     }
 
-    return haveNamed ? bestNamed : bestFallback;
+    return haveDesktopLog ? bestDesktopLog : bestFallbackLog;
 }
 
 void RendererActivityMonitor::SwitchLog(const std::filesystem::path& path) {
