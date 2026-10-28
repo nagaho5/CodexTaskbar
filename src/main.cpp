@@ -800,11 +800,11 @@ public:
             24, 302, 410, 22, hwnd, nullptr, instance_, nullptr);
 
         CreateWindowW(
-            L"BUTTON", L"确定", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
+            L"BUTTON", L"确定", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
             270, 344, 76, 28, hwnd,
             reinterpret_cast<HMENU>(IDOK), instance_, nullptr);
         CreateWindowW(
-            L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE,
+            L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
             358, 344, 76, 28, hwnd,
             reinterpret_cast<HMENU>(IDCANCEL), instance_, nullptr);
 
@@ -838,8 +838,10 @@ public:
 
     bool MeasureContextMenuItem(MEASUREITEMSTRUCT* item) const {
         if (!item || item->CtlType != ODT_MENU) return false;
-        item->itemWidth = 176;
-        item->itemHeight = 28;
+        UINT dpi = mainWindow_ && IsWindow(mainWindow_) ? GetDpiForWindow(mainWindow_) : 96;
+        if (dpi == 0) dpi = 96;
+        item->itemWidth = static_cast<UINT>(MulDiv(176, static_cast<int>(dpi), 96));
+        item->itemHeight = static_cast<UINT>(MulDiv(28, static_cast<int>(dpi), 96));
         return true;
     }
 
@@ -858,8 +860,14 @@ public:
         SetBkMode(item->hDC, TRANSPARENT);
         SetTextColor(item->hDC, disabled ? RGB(145, 145, 145) : RGB(242, 242, 242));
 
+        UINT dpi = mainWindow_ && IsWindow(mainWindow_) ? GetDpiForWindow(mainWindow_) : 96;
+        if (dpi == 0) dpi = 96;
+        const int leftPadding = MulDiv(30, static_cast<int>(dpi), 96);
+        const int checkPadding = MulDiv(8, static_cast<int>(dpi), 96);
+        const int checkWidth = MulDiv(16, static_cast<int>(dpi), 96);
+
         RECT textRect = item->rcItem;
-        textRect.left += 30;
+        textRect.left += leftPadding;
         const auto* text = reinterpret_cast<const wchar_t*>(item->itemData);
         if (text) {
             DrawTextW(
@@ -872,14 +880,59 @@ public:
 
         if ((item->itemState & ODS_CHECKED) != 0) {
             RECT checkRect = item->rcItem;
-            checkRect.left += 8;
-            checkRect.right = checkRect.left + 16;
+            checkRect.left += checkPadding;
+            checkRect.right = checkRect.left + checkWidth;
             DrawTextW(
                 item->hDC,
                 L"✓",
                 -1,
                 &checkRect,
                 DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        }
+        return true;
+    }
+
+    bool DrawSettingsButton(DRAWITEMSTRUCT* item) const {
+        if (!item || item->CtlType != ODT_BUTTON) return false;
+
+        const bool pressed = (item->itemState & ODS_SELECTED) != 0;
+        const bool disabled = (item->itemState & ODS_DISABLED) != 0;
+        const COLORREF background = pressed ? RGB(62, 62, 62) : RGB(42, 42, 42);
+        HBRUSH backgroundBrush = CreateSolidBrush(background);
+        if (backgroundBrush) {
+            FillRect(item->hDC, &item->rcItem, backgroundBrush);
+            DeleteObject(backgroundBrush);
+        }
+
+        HPEN borderPen = CreatePen(PS_SOLID, 1, RGB(92, 92, 92));
+        HGDIOBJ oldPen = borderPen ? SelectObject(item->hDC, borderPen) : nullptr;
+        HGDIOBJ oldBrush = SelectObject(item->hDC, GetStockObject(NULL_BRUSH));
+        Rectangle(
+            item->hDC,
+            item->rcItem.left,
+            item->rcItem.top,
+            item->rcItem.right,
+            item->rcItem.bottom);
+        SelectObject(item->hDC, oldBrush);
+        if (oldPen) SelectObject(item->hDC, oldPen);
+        if (borderPen) DeleteObject(borderPen);
+
+        wchar_t label[64]{};
+        GetWindowTextW(item->hwndItem, label, static_cast<int>(std::size(label)));
+        SetBkMode(item->hDC, TRANSPARENT);
+        SetTextColor(item->hDC, disabled ? RGB(145, 145, 145) : RGB(242, 242, 242));
+        RECT textRect = item->rcItem;
+        DrawTextW(
+            item->hDC,
+            label,
+            -1,
+            &textRect,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+        if ((item->itemState & ODS_FOCUS) != 0) {
+            RECT focus = item->rcItem;
+            InflateRect(&focus, -3, -3);
+            DrawFocusRect(item->hDC, &focus);
         }
         return true;
     }
@@ -1151,6 +1204,13 @@ private:
                 SetTextColor(dc, RGB(242, 242, 242));
                 SetBkColor(dc, RGB(36, 36, 36));
                 return reinterpret_cast<LRESULT>(app->DarkControlBrush());
+            }
+            break;
+
+        case WM_DRAWITEM:
+            if (app && app->DrawSettingsButton(
+                    reinterpret_cast<DRAWITEMSTRUCT*>(lParam))) {
+                return TRUE;
             }
             break;
 
