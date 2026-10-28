@@ -57,6 +57,8 @@ private:
         std::int64_t revision{-1};
         std::string ownerClientId;
         std::string activeTurnId;
+        bool hasTurnActivity{false};
+        bool turnActive{false};
         int lastFiles{0};
         int lastAdded{0};
         int lastRemoved{0};
