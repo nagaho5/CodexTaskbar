@@ -36,6 +36,16 @@ std::int64_t IntegerField(
     return value && value->IsNumber() ? value->AsInt64(fallback) : fallback;
 }
 
+std::string StatusField(const JsonValue& object) {
+    const JsonValue* value = FindAny(object, {"status", "state"});
+    if (!value) return {};
+    if (value->IsString()) return value->AsString();
+    if (value->IsObject()) {
+        return StringField(*value, {"type", "status", "state"});
+    }
+    return {};
+}
+
 bool IsActiveStatus(std::string value) {
     value.erase(
         std::remove_if(value.begin(), value.end(), [](char ch) {
@@ -112,20 +122,24 @@ std::string ReadExactTurnDiff(const JsonValue& turn) {
 bool LooksLikeTurnEntity(const JsonValue& value) {
     if (!value.IsObject()) return false;
 
-    const std::string id = StringField(value, {"turnId", "turn_id", "id"});
-    const std::string status = StringField(value, {"status", "state"});
-    if (id.empty() || status.empty()) return false;
+    // Canonical Desktop IPC turns use turnId; legacy app-server-shaped turns
+    // may use id. Do not require status to be a string: newer Desktop builds
+    // can represent status as an object such as {type:"active"}.
+    const std::string turnId = StringField(value, {"turnId", "turn_id"});
+    const std::string legacyId = StringField(value, {"id"});
+    if (turnId.empty() && legacyId.empty()) return false;
 
-    // Thread items also have id/status fields. Require a field unique to the
-    // actual Turn shape so a trailing message/fileChange entity cannot be
-    // mistaken for a new turn and wipe the exact diff we just received.
+    // Thread items can also have id/status. Require a turn-shaped field.
     return value.Find("items") != nullptr ||
+           value.Find("params") != nullptr ||
+           value.Find("diff") != nullptr ||
            value.Find("rootTurnId") != nullptr ||
            value.Find("root_turn_id") != nullptr ||
            value.Find("startedAt") != nullptr ||
            value.Find("started_at") != nullptr ||
            value.Find("completedAt") != nullptr ||
-           value.Find("completed_at") != nullptr;
+           value.Find("completed_at") != nullptr ||
+           value.Find("turnStartedAtMs") != nullptr;
 }
 
 const JsonValue* FindCanonicalLatestTurn(const JsonValue& conversation) {
@@ -149,12 +163,17 @@ const JsonValue* FindCanonicalLatestTurn(const JsonValue& conversation) {
             const auto& entryArray = entries->AsArray();
             for (auto entryIt = entryArray.rbegin(); entryIt != entryArray.rend(); ++entryIt) {
                 if (!entryIt->IsObject()) continue;
-                std::string key = StringField(*entryIt, {"key"});
-                if (key.empty()) key = StringField(*entryIt, {"value"});
-                if (key.empty()) continue;
-
+                // Current canonical history entries carry both key and value.
+                // The entity lookup key is commonly entry.value; entry.key can be
+                // an ordering/React key. Resolve value first when it exists in
+                // entitiesByKey, then fall back to key for older builds.
                 const auto& object = entities->AsObject();
-                const auto found = object.find(key);
+                std::string entityKey = StringField(*entryIt, {"value"});
+                auto found = entityKey.empty() ? object.end() : object.find(entityKey);
+                if (found == object.end()) {
+                    entityKey = StringField(*entryIt, {"key"});
+                    found = entityKey.empty() ? object.end() : object.find(entityKey);
+                }
                 if (found != object.end() && LooksLikeTurnEntity(found->second)) {
                     return &found->second;
                 }
@@ -916,7 +935,7 @@ ThreadMetrics DesktopThreadMonitor::DeriveMetrics(const std::string& threadId, T
     const JsonValue* latestTurn = FindCanonicalLatestTurn(state.document);
     if (latestTurn) {
         const std::string turnId = StringField(*latestTurn, {"turnId", "turn_id", "id"});
-        const std::string status = StringField(*latestTurn, {"status", "state"});
+        const std::string status = StatusField(*latestTurn);
         const bool snapshotActive = IsActiveStatus(status);
 
         // Live turn/* notifications are authoritative once observed. A follower
