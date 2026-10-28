@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <ctime>
 #include <cwchar>
+#include <cwctype>
 #include <iterator>
 #include <memory>
 #include <mutex>
@@ -53,6 +54,15 @@ std::wstring ModulePath() {
 }
 
 bool IsCodexDesktopRunning() {
+    // Fast path: Codex Desktop exposes this pipe while its app-server bridge is alive.
+    // WaitNamedPipe does not connect to or consume the pipe; it only checks availability.
+    if (WaitNamedPipeW(L"\\\\.\\pipe\\codex-ipc", 0)) {
+        return true;
+    }
+
+    // Windows Store/MSIX Codex currently runs its Electron shell as ChatGPT.exe
+    // inside ...\\WindowsApps\\OpenAI.Codex_<version>_...\\app\\ChatGPT.exe.
+    // Older/dev builds may use Codex.exe, so keep that candidate too.
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snapshot == INVALID_HANDLE_VALUE) {
         return false;
@@ -61,13 +71,36 @@ bool IsCodexDesktopRunning() {
     PROCESSENTRY32W entry{};
     entry.dwSize = sizeof(entry);
     bool found = false;
+
     if (Process32FirstW(snapshot, &entry)) {
         do {
-            if (_wcsicmp(entry.szExeFile, L"OpenAI.Codex.exe") == 0 ||
-                _wcsicmp(entry.szExeFile, L"OpenAI.Codex") == 0) {
-                found = true;
-                break;
+            const bool candidate =
+                _wcsicmp(entry.szExeFile, L"ChatGPT.exe") == 0 ||
+                _wcsicmp(entry.szExeFile, L"Codex.exe") == 0;
+            if (!candidate) {
+                continue;
             }
+
+            HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ProcessID);
+            if (!process) {
+                continue;
+            }
+
+            wchar_t imagePath[32768]{};
+            DWORD length = static_cast<DWORD>(std::size(imagePath));
+            if (QueryFullProcessImageNameW(process, 0, imagePath, &length) && length > 0) {
+                std::wstring path(imagePath, length);
+                std::transform(path.begin(), path.end(), path.begin(), [](wchar_t ch) { return static_cast<wchar_t>(std::towlower(ch)); });
+
+                if (path.find(L"\\windowsapps\\openai.codex_") != std::wstring::npos ||
+                    path.find(L"\\openai\\codex\\") != std::wstring::npos) {
+                    found = true;
+                    CloseHandle(process);
+                    break;
+                }
+            }
+
+            CloseHandle(process);
         } while (Process32NextW(snapshot, &entry));
     }
 
