@@ -1,3 +1,3 @@
-tag=v0.2.6
-source_commit=2461dc1ec7949281c1e65fa94ce126eeb9e6010c
-reason=task timing, 200ms hover polling, 5s quota retry, and scoped current-turn fileChange fallback
+tag=v0.2.7
+source_commit=6455350aa5c48fa0dd7be3c89c24030e1934b18c
+reason=active-state percentage colors, custom color picker, active-only diff/time rows, and row ordering
