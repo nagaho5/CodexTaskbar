@@ -224,6 +224,91 @@ void CountUnifiedDiff(const std::string& diff, int& files, int& added, int& remo
     }
 }
 
+bool CountCompletedFileChangeFallback(
+    const JsonValue& turn,
+    int& files,
+    int& added,
+    int& removed) {
+    files = 0;
+    added = 0;
+    removed = 0;
+
+    const JsonValue* items = turn.Find("items");
+    if (!items || !items->IsArray()) return false;
+
+    std::set<std::string, std::less<>> changedPaths;
+    bool sawCompletedFileChange = false;
+
+    for (const JsonValue& item : items->AsArray()) {
+        if (!item.IsObject() ||
+            StringField(item, {"type"}) != "fileChange" ||
+            StringField(item, {"status"}) != "completed") {
+            continue;
+        }
+
+        const JsonValue* changes = item.Find("changes");
+        if (!changes || !changes->IsArray()) continue;
+        sawCompletedFileChange = true;
+
+        for (const JsonValue& change : changes->AsArray()) {
+            if (!change.IsObject()) continue;
+
+            std::string path = StringField(change, {"path"});
+            std::string kindType;
+            std::string movePath;
+            if (const JsonValue* kind = change.Find("kind"); kind && kind->IsObject()) {
+                kindType = StringField(*kind, {"type"});
+                movePath = StringField(*kind, {"move_path", "movePath"});
+            }
+            if (!movePath.empty()) path = movePath;
+            if (!path.empty()) changedPaths.insert(path);
+
+            const std::string diff = StringField(change, {"diff"});
+            if (diff.empty()) continue;
+
+            if ((kindType == "add" || kindType == "delete") &&
+                diff.find("@@ ") == std::string::npos) {
+                int lineCount = 0;
+                std::size_t start = 0;
+                while (start < diff.size()) {
+                    ++lineCount;
+                    const std::size_t end = diff.find('\n', start);
+                    if (end == std::string::npos) break;
+                    start = end + 1;
+                    if (start == diff.size()) break;
+                }
+                if (kindType == "add") added += lineCount;
+                else removed += lineCount;
+                continue;
+            }
+
+            std::size_t start = 0;
+            bool inHunk = false;
+            while (start <= diff.size()) {
+                const std::size_t end = diff.find('\n', start);
+                const std::string_view line(
+                    diff.data() + start,
+                    (end == std::string::npos ? diff.size() : end) - start);
+
+                if (line.starts_with("@@ ")) {
+                    inHunk = true;
+                } else if (inHunk && line.starts_with("+") && !line.starts_with("+++")) {
+                    ++added;
+                } else if (inHunk && line.starts_with("-") && !line.starts_with("---")) {
+                    ++removed;
+                }
+
+                if (end == std::string::npos) break;
+                start = end + 1;
+            }
+        }
+    }
+
+    files = static_cast<int>(changedPaths.size());
+    return sawCompletedFileChange &&
+           (files > 0 || added > 0 || removed > 0);
+}
+
 int Percent(std::int64_t numerator, std::int64_t denominator) {
     if (numerator < 0 || denominator <= 0) return 0;
     const double raw = 100.0 * static_cast<double>(numerator) / static_cast<double>(denominator);
@@ -612,6 +697,7 @@ void DesktopThreadMonitor::ProcessFrame(const std::string& json) {
         if (!turnId.empty() && turnId != state.activeTurnId) {
             state.activeTurnId = turnId;
             state.hasLastDiff = false;
+            state.lastDiffExact = false;
             state.lastFiles = state.lastAdded = state.lastRemoved = 0;
         }
         state.hasTurnActivity = true;
@@ -660,6 +746,7 @@ void DesktopThreadMonitor::ProcessFrame(const std::string& json) {
         if (!turnId.empty() && !state.activeTurnId.empty() &&
             turnId != state.activeTurnId) {
             state.hasLastDiff = false;
+            state.lastDiffExact = false;
             state.lastFiles = state.lastAdded = state.lastRemoved = 0;
         }
         if (!turnId.empty()) state.activeTurnId = turnId;
@@ -673,6 +760,7 @@ void DesktopThreadMonitor::ProcessFrame(const std::string& json) {
             state.lastRemoved);
         state.hasLastDiff =
             state.lastFiles > 0 || state.lastAdded > 0 || state.lastRemoved > 0;
+        state.lastDiffExact = state.hasLastDiff;
         state.updateSequence = ++updateSequence_;
         SelectAndPublish();
         return;
@@ -948,6 +1036,7 @@ ThreadMetrics DesktopThreadMonitor::DeriveMetrics(const std::string& threadId, T
             // Recovery path when CodexTaskbar attached after turn/started.
             state.activeTurnId = turnId;
             state.hasLastDiff = false;
+            state.lastDiffExact = false;
             state.lastFiles = state.lastAdded = state.lastRemoved = 0;
             state.hasTurnActivity = false;
         }
@@ -981,6 +1070,26 @@ ThreadMetrics DesktopThreadMonitor::DeriveMetrics(const std::string& threadId, T
                     state.lastRemoved);
                 state.hasLastDiff =
                     state.lastFiles > 0 || state.lastAdded > 0 || state.lastRemoved > 0;
+                state.lastDiffExact = state.hasLastDiff;
+            } else {
+                // Desktop can keep edits only as completed fileChange items and
+                // omit turn.diff for follower clients. Use a current-turn-only
+                // fallback so live progress remains visible; exact diff wins
+                // automatically whenever it is published.
+                int fallbackFiles = 0;
+                int fallbackAdded = 0;
+                int fallbackRemoved = 0;
+                if (CountCompletedFileChangeFallback(
+                        *latestTurn,
+                        fallbackFiles,
+                        fallbackAdded,
+                        fallbackRemoved)) {
+                    state.lastFiles = fallbackFiles;
+                    state.lastAdded = fallbackAdded;
+                    state.lastRemoved = fallbackRemoved;
+                    state.hasLastDiff = true;
+                    state.lastDiffExact = false;
+                }
             }
         }
     } else if (state.hasTurnActivity) {
@@ -990,6 +1099,7 @@ ThreadMetrics DesktopThreadMonitor::DeriveMetrics(const std::string& threadId, T
 
     if (state.hasLastDiff) {
         metrics.hasDiff = true;
+        metrics.diffExact = state.lastDiffExact;
         metrics.changedFiles = state.lastFiles;
         metrics.addedLines = state.lastAdded;
         metrics.removedLines = state.lastRemoved;
