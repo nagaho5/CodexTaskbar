@@ -70,6 +70,10 @@ private:
     bool InitializeClient();
     void ApplyCurrentConfig(bool force);
     void FollowThread(const std::string& threadId, bool following);
+    bool SendFollowFrame(
+        const std::string& threadId,
+        bool following,
+        const std::string& targetClientId = {});
     bool SendFrame(const std::string& json);
     bool PumpPipe(DWORD timeoutMs);
     void ProcessFrame(const std::string& json);
