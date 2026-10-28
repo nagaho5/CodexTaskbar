@@ -56,6 +56,7 @@ constexpr int kCheckShowDiff = 2008;
 constexpr int kRadioManualThread = 2009;
 constexpr int kRadioAutoThread = 2010;
 constexpr int kEditThreadId = 2011;
+constexpr int kCheckShowDiffFiles = 2012;
 
 struct QuotaPayload {
     QuotaSnapshot snapshot;
@@ -389,6 +390,7 @@ public:
         showContext_ = ReadRegistryDword(L"ShowContext", 1) != 0;
         showCache_ = ReadRegistryDword(L"ShowCache", 0) != 0;
         showDiff_ = ReadRegistryDword(L"ShowDiff", 1) != 0;
+        showDiffFiles_ = ReadRegistryDword(L"ShowDiffFiles", 1) != 0;
         automaticThreadMode_ = ReadRegistryDword(L"AutomaticThreadMode", 0) != 0;
         manualThreadId_ = ReadRegistryString(L"ManualThreadId");
 
@@ -573,11 +575,18 @@ public:
         const int spacing = 5;
 
         SIZE fileSize{}, addSize{}, removeSize{};
-        GetTextExtentPoint32W(dc, files.c_str(), static_cast<int>(files.size()), &fileSize);
+        if (showDiffFiles_) {
+            GetTextExtentPoint32W(dc, files.c_str(), static_cast<int>(files.size()), &fileSize);
+        }
         GetTextExtentPoint32W(dc, added.c_str(), static_cast<int>(added.size()), &addSize);
         GetTextExtentPoint32W(dc, removed.c_str(), static_cast<int>(removed.size()), &removeSize);
 
-        const int totalWidth = fileSize.cx + addSize.cx + removeSize.cx + spacing * 2;
+        const int itemCount = showDiffFiles_ ? 3 : 2;
+        const int totalWidth =
+            (showDiffFiles_ ? fileSize.cx : 0) +
+            addSize.cx +
+            removeSize.cx +
+            spacing * (itemCount - 1);
         int x = static_cast<int>(row.left) +
                 std::max(0, (static_cast<int>(row.right - row.left) - totalWidth) / 2);
 
@@ -586,9 +595,11 @@ public:
         const int y = static_cast<int>(row.top) +
                       std::max(0, (static_cast<int>(row.bottom - row.top) - static_cast<int>(tm.tmHeight)) / 2);
 
-        SetTextColor(dc, RGB(255, 255, 255));
-        TextOutW(dc, x, y, files.c_str(), static_cast<int>(files.size()));
-        x += fileSize.cx + spacing;
+        if (showDiffFiles_) {
+            SetTextColor(dc, RGB(255, 255, 255));
+            TextOutW(dc, x, y, files.c_str(), static_cast<int>(files.size()));
+            x += fileSize.cx + spacing;
+        }
 
         SetTextColor(dc, RGB(66, 214, 116));
         TextOutW(dc, x, y, added.c_str(), static_cast<int>(added.size()));
@@ -722,7 +733,8 @@ public:
         checkbox(kCheckShowSevenDayPercent, L"7天百分比", 24, 103, showSevenDayPercent_);
         checkbox(kCheckShowContext, L"Context百分比", 210, 103, showContext_, 180);
         checkbox(kCheckShowCache, L"Cache命中率", 24, 128, showCache_);
-        checkbox(kCheckShowDiff, L"代码改动（文件/新增/删除）", 210, 128, showDiff_, 220);
+        checkbox(kCheckShowDiff, L"代码改动", 210, 128, showDiff_, 100);
+        checkbox(kCheckShowDiffFiles, L"显示文件数", 318, 128, showDiffFiles_, 112);
 
         CreateWindowW(L"STATIC", L"会话来源：", WS_CHILD | WS_VISIBLE,
             24, 166, 100, 22, hwnd, nullptr, instance_, nullptr);
@@ -781,6 +793,7 @@ public:
         showContext_ = checked(kCheckShowContext);
         showCache_ = checked(kCheckShowCache);
         showDiff_ = checked(kCheckShowDiff);
+        showDiffFiles_ = checked(kCheckShowDiffFiles);
         automaticThreadMode_ = checked(kRadioAutoThread);
 
         wchar_t threadText[256]{};
@@ -797,6 +810,7 @@ public:
         WriteRegistryDword(L"ShowContext", showContext_ ? 1u : 0u);
         WriteRegistryDword(L"ShowCache", showCache_ ? 1u : 0u);
         WriteRegistryDword(L"ShowDiff", showDiff_ ? 1u : 0u);
+        WriteRegistryDword(L"ShowDiffFiles", showDiffFiles_ ? 1u : 0u);
         WriteRegistryDword(L"AutomaticThreadMode", automaticThreadMode_ ? 1u : 0u);
         WriteRegistryString(L"ManualThreadId", manualThreadId_);
         SetAutoStartRegistry(autoStart_);
@@ -1326,8 +1340,10 @@ private:
         }
         if (IsDiffRowVisible()) {
             if (!result.empty()) result += L"  ";
-            result += std::to_wstring(threadMetrics_.changedFiles) + L" " +
-                      std::to_wstring(threadMetrics_.addedLines) + L" " +
+            if (showDiffFiles_) {
+                result += std::to_wstring(threadMetrics_.changedFiles) + L" ";
+            }
+            result += std::to_wstring(threadMetrics_.addedLines) + L" " +
                       std::to_wstring(threadMetrics_.removedLines);
         }
         return result;
@@ -1667,6 +1683,7 @@ private:
     bool showContext_{true};
     bool showCache_{false};
     bool showDiff_{true};
+    bool showDiffFiles_{true};
     bool automaticThreadMode_{false};
     int fontSize_{10};
     unsigned tickCount_{0};
