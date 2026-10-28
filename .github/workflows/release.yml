@@ -1,0 +1,49 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/release-trigger"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure
+        shell: pwsh
+        run: cmake -S . -B build -A x64
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build --config Release --parallel
+
+      - name: Prepare checksums
+        shell: pwsh
+        run: |
+          $exe = "build\Release\CodexTaskbar.exe"
+          if (!(Test-Path $exe)) { throw "CodexTaskbar.exe was not produced." }
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  CodexTaskbar.exe" | Set-Content -Encoding ascii "build\Release\SHA256.txt"
+          Get-Item $exe | Format-List Name,Length,FullName
+          Get-Content "build\Release\SHA256.txt"
+
+      - name: Create GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "v0.1.$env:GITHUB_RUN_NUMBER"
+          gh release create $tag `
+            "build\Release\CodexTaskbar.exe" `
+            "build\Release\SHA256.txt" `
+            --target "$env:GITHUB_SHA" `
+            --title "CodexTaskbar $tag" `
+            --notes "Windows x64 native build. Compact Codex 5h/7d quota display for the Windows 10 taskbar."
