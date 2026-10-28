@@ -1,3 +1,3 @@
-tag=v0.2.7
-source_commit=6455350aa5c48fa0dd7be3c89c24030e1934b18c
-reason=active-state percentage colors, custom color picker, active-only diff/time rows, and row ordering
+tag=v0.2.8
+source_commit=86f7c3d2d0d6dec2fcaf3390cbef0eeecf29b9c4
+reason=left-click Codex activation, hover connection freshness, optional warning colors and duration format, compact diff spacing, and 7-day first-line layout
