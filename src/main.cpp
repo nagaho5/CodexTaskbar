@@ -28,6 +28,7 @@ namespace {
 
 constexpr wchar_t kMainClass[] = L"CodexTaskbar.Main";
 constexpr wchar_t kWidgetClass[] = L"CodexTaskbar.Widget";
+constexpr wchar_t kHoverClass[] = L"CodexTaskbar.Hover";
 constexpr wchar_t kSettingsClass[] = L"CodexTaskbar.Settings";
 constexpr wchar_t kSettingsKey[] = L"Software\\Nagaho5\\CodexTaskbar";
 constexpr wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
@@ -40,6 +41,7 @@ constexpr UINT kQuotaMessage = WM_APP + 2;
 constexpr UINT kQuotaErrorMessage = WM_APP + 3;
 constexpr UINT kThreadMetricsMessage = WM_APP + 4;
 constexpr UINT_PTR kTickTimer = 1;
+constexpr UINT_PTR kHoverTimer = 2;
 
 constexpr UINT kMenuSettings = 1001;
 constexpr UINT kMenuAutoStart = 1002;
@@ -377,6 +379,9 @@ public:
         if (darkControlBrush_) {
             DeleteObject(darkControlBrush_);
         }
+        if (hoverWindow_ && IsWindow(hoverWindow_)) {
+            DestroyWindow(hoverWindow_);
+        }
         if (darkMenuBrush_) {
             DeleteObject(darkMenuBrush_);
         }
@@ -441,13 +446,13 @@ public:
         StartWorker();
         OnTick();
         SetTimer(mainWindow_, kTickTimer, 1000, nullptr);
+        SetTimer(mainWindow_, kHoverTimer, 100, nullptr);
         return true;
     }
 
     int Run() {
         MSG msg{};
         while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
-            RelayTooltipMessage(msg);
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -997,11 +1002,9 @@ public:
 
     void WidgetDestroyed(HWND hwnd) {
         if (widgetWindow_ == hwnd) {
-            if (tooltipWindow_ && IsWindow(tooltipWindow_)) {
-                DestroyWindow(tooltipWindow_);
-            }
-            tooltipWindow_ = nullptr;
-            tooltipActive_ = false;
+            HideHoverPopup();
+            hoverInside_ = false;
+            hoverStartTick_ = 0;
             widgetWindow_ = nullptr;
             widgetVisible_ = false;
         }
@@ -1038,8 +1041,13 @@ private:
         case WM_TIMER:
             if (app && wParam == kTickTimer) {
                 app->OnTick();
+                return 0;
             }
-            return 0;
+            if (app && wParam == kHoverTimer) {
+                app->UpdateHoverState();
+                return 0;
+            }
+            break;
 
         case kTrayMessage:
             if (app) {
@@ -1087,6 +1095,7 @@ private:
 
         case WM_DESTROY:
             KillTimer(hwnd, kTickTimer);
+            KillTimer(hwnd, kHoverTimer);
             PostQuitMessage(0);
             return 0;
         }
@@ -1114,12 +1123,6 @@ private:
             }
             break;
 
-        case WM_MOUSEMOVE:
-            if (app) {
-                app->ArmTooltipLeave(hwnd);
-            }
-            break;
-
         case WM_DPICHANGED_AFTERPARENT:
             if (app) {
                 app->RecreateFont();
@@ -1128,24 +1131,18 @@ private:
             }
             break;
 
-        case WM_MOUSELEAVE:
-            if (app) {
-                app->HideTooltip();
-            }
-            return 0;
-
         case WM_LBUTTONDOWN:
         case WM_MBUTTONDOWN:
         case WM_RBUTTONDOWN:
             if (app) {
-                app->HideTooltip();
+                app->ResetHoverState();
             }
             break;
 
         case WM_RBUTTONUP:
         case WM_CONTEXTMENU:
             if (app) {
-                app->HideTooltip();
+                app->ResetHoverState();
                 app->ShowContextMenu();
                 return 0;
             }
@@ -1156,6 +1153,36 @@ private:
                 app->WidgetDestroyed(hwnd);
             }
             break;
+        }
+
+        return DefWindowProcW(hwnd, message, wParam, lParam);
+    }
+
+    static LRESULT CALLBACK HoverWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
+        auto* app = reinterpret_cast<CodexTaskbarApp*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+
+        if (message == WM_NCCREATE) {
+            const auto* create = reinterpret_cast<CREATESTRUCTW*>(lParam);
+            app = static_cast<CodexTaskbarApp*>(create->lpCreateParams);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(app));
+        }
+
+        switch (message) {
+        case WM_ERASEBKGND:
+            return 1;
+
+        case WM_PAINT:
+            if (app) {
+                app->PaintHoverPopup(hwnd);
+                return 0;
+            }
+            break;
+
+        case WM_MOUSEACTIVATE:
+            return MA_NOACTIVATE;
+
+        case WM_NCHITTEST:
+            return HTTRANSPARENT;
         }
 
         return DefWindowProcW(hwnd, message, wParam, lParam);
@@ -1261,6 +1288,17 @@ private:
         widgetClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
         widgetClass.hbrBackground = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
         if (!RegisterClassExW(&widgetClass) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+            return false;
+        }
+
+        WNDCLASSEXW hoverClass{};
+        hoverClass.cbSize = sizeof(hoverClass);
+        hoverClass.hInstance = instance_;
+        hoverClass.lpfnWndProc = HoverWndProc;
+        hoverClass.lpszClassName = kHoverClass;
+        hoverClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        hoverClass.hbrBackground = darkBackgroundBrush_;
+        if (!RegisterClassExW(&hoverClass) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
             return false;
         }
 
@@ -1415,7 +1453,6 @@ private:
             RecreateFont();
         }
 
-        EnsureTooltip();
     }
 
     void PositionWidget() {
@@ -1501,12 +1538,11 @@ private:
                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
         }
 
-        UpdateTooltipRect();
         InvalidateWidget();
     }
 
     void HideWidget() {
-        HideTooltip();
+        ResetHoverState();
         if (widgetWindow_ && IsWindow(widgetWindow_)) {
             ShowWindow(widgetWindow_, SW_HIDE);
         }
@@ -1594,107 +1630,186 @@ private:
         return result;
     }
 
-    void EnsureTooltip() {
-        if (!widgetWindow_ || !IsWindow(widgetWindow_)) return;
-        if (tooltipWindow_ && IsWindow(tooltipWindow_)) {
-            UpdateTooltipRect();
-            return;
-        }
+    void EnsureHoverPopup() {
+        if (hoverWindow_ && IsWindow(hoverWindow_)) return;
 
-        // Match TrafficMonitor's proven model: one standard tooltip tool covering
-        // the whole taskbar widget, with the real mouse MSG relayed before dispatch.
-        tooltipWindow_ = CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_NOACTIVATE,
-            TOOLTIPS_CLASSW,
-            nullptr,
-            WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
-            CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
-            widgetWindow_,
+        hoverWindow_ = CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+            kHoverClass,
+            L"CodexTaskbarHover",
+            WS_POPUP,
+            0,
+            0,
+            1,
+            1,
+            mainWindow_,
             nullptr,
             instance_,
-            nullptr);
-        if (!tooltipWindow_) return;
-
-        TOOLINFOW info{};
-        info.cbSize = sizeof(info);
-        info.hwnd = widgetWindow_;
-        info.uId = 1;
-        GetClientRect(widgetWindow_, &info.rect);
-        info.lpszText = tooltipBuffer_.data();
-        if (!SendMessageW(
-                tooltipWindow_,
-                TTM_ADDTOOLW,
-                0,
-                reinterpret_cast<LPARAM>(&info))) {
-            DestroyWindow(tooltipWindow_);
-            tooltipWindow_ = nullptr;
-            return;
-        }
-
-        SendMessageW(tooltipWindow_, TTM_SETMAXTIPWIDTH, 0, 520);
-        SendMessageW(tooltipWindow_, TTM_SETDELAYTIME, TTDT_INITIAL, 250);
-        SendMessageW(tooltipWindow_, TTM_SETDELAYTIME, TTDT_RESHOW, 100);
-        SendMessageW(tooltipWindow_, TTM_SETDELAYTIME, TTDT_AUTOPOP, 20000);
-        SetWindowPos(
-            tooltipWindow_,
-            HWND_TOPMOST,
-            0, 0, 0, 0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            this);
     }
 
-    void UpdateTooltipRect() {
-        if (!tooltipWindow_ || !IsWindow(tooltipWindow_) ||
-            !widgetWindow_ || !IsWindow(widgetWindow_)) {
-            return;
-        }
+    void PaintHoverPopup(HWND hwnd) {
+        PAINTSTRUCT ps{};
+        HDC dc = BeginPaint(hwnd, &ps);
 
-        TOOLINFOW info{};
-        info.cbSize = sizeof(info);
-        info.hwnd = widgetWindow_;
-        info.uId = 1;
-        GetClientRect(widgetWindow_, &info.rect);
-        SendMessageW(
-            tooltipWindow_,
-            TTM_NEWTOOLRECTW,
-            0,
-            reinterpret_cast<LPARAM>(&info));
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        FillRect(dc, &client, darkBackgroundBrush_);
+
+        HPEN border = CreatePen(PS_SOLID, 1, RGB(82, 82, 82));
+        HGDIOBJ oldPen = border ? SelectObject(dc, border) : nullptr;
+        HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+        Rectangle(dc, client.left, client.top, client.right, client.bottom);
+        SelectObject(dc, oldBrush);
+        if (oldPen) SelectObject(dc, oldPen);
+        if (border) DeleteObject(border);
+
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, RGB(242, 242, 242));
+        HFONT oldFont = font_ ? static_cast<HFONT>(SelectObject(dc, font_)) : nullptr;
+
+        RECT textRect = client;
+        const int padding = 10;
+        InflateRect(&textRect, -padding, -padding);
+        DrawTextW(
+            dc,
+            tooltipBuffer_.data(),
+            -1,
+            &textRect,
+            DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX);
+
+        if (oldFont) SelectObject(dc, oldFont);
+        EndPaint(hwnd, &ps);
     }
 
-    void RelayTooltipMessage(const MSG& message) {
-        if (!widgetWindow_ || message.hwnd != widgetWindow_) return;
-        if (message.message != WM_MOUSEMOVE &&
-            message.message != WM_LBUTTONDOWN &&
-            message.message != WM_LBUTTONUP &&
-            message.message != WM_MBUTTONDOWN &&
-            message.message != WM_MBUTTONUP) {
-            return;
-        }
+    void ShowHoverPopup(const POINT& cursor) {
+        EnsureHoverPopup();
+        if (!hoverWindow_ || !IsWindow(hoverWindow_)) return;
 
-        EnsureTooltip();
-        if (!tooltipWindow_ || !IsWindow(tooltipWindow_)) return;
         UpdateTooltipText();
 
-        MSG relay = message;
-        SendMessageW(
-            tooltipWindow_,
-            TTM_RELAYEVENT,
-            0,
-            reinterpret_cast<LPARAM>(&relay));
-    }
+        HDC dc = GetDC(hoverWindow_);
+        if (!dc) return;
+        HFONT oldFont = font_ ? static_cast<HFONT>(SelectObject(dc, font_)) : nullptr;
+        RECT measure{0, 0, 520, 0};
+        DrawTextW(
+            dc,
+            tooltipBuffer_.data(),
+            -1,
+            &measure,
+            DT_CALCRECT | DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
+        if (oldFont) SelectObject(dc, oldFont);
+        ReleaseDC(hoverWindow_, dc);
 
-    void ArmTooltipLeave(HWND hwnd) {
-        TRACKMOUSEEVENT tracking{};
-        tracking.cbSize = sizeof(tracking);
-        tracking.dwFlags = TME_LEAVE;
-        tracking.hwndTrack = hwnd;
-        TrackMouseEvent(&tracking);
-    }
+        const int padding = 10;
+        const int width = std::clamp(static_cast<int>(measure.right - measure.left) + padding * 2, 280, 560);
+        const int height = std::max(80, static_cast<int>(measure.bottom - measure.top) + padding * 2);
 
-    void HideTooltip() {
-        if (tooltipWindow_ && IsWindow(tooltipWindow_)) {
-            SendMessageW(tooltipWindow_, TTM_POP, 0, 0);
+        MONITORINFO monitorInfo{};
+        monitorInfo.cbSize = sizeof(monitorInfo);
+        HMONITOR monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
+        GetMonitorInfoW(monitor, &monitorInfo);
+
+        RECT widgetRect{};
+        RECT taskbarRect{};
+        GetWindowRect(widgetWindow_, &widgetRect);
+        GetWindowRect(taskbarWindow_, &taskbarRect);
+
+        int x = cursor.x + 12;
+        int y = cursor.y + 12;
+
+        const bool vertical =
+            (taskbarRect.bottom - taskbarRect.top) > (taskbarRect.right - taskbarRect.left);
+        if (vertical) {
+            const int taskbarCenter =
+                taskbarRect.left + (taskbarRect.right - taskbarRect.left) / 2;
+            const int monitorCenter =
+                monitorInfo.rcMonitor.left +
+                (monitorInfo.rcMonitor.right - monitorInfo.rcMonitor.left) / 2;
+            if (taskbarCenter <= monitorCenter) {
+                x = widgetRect.right + 8;
+            } else {
+                x = widgetRect.left - width - 8;
+            }
+            y = cursor.y + 8;
+        } else {
+            const int taskbarCenter =
+                taskbarRect.top + (taskbarRect.bottom - taskbarRect.top) / 2;
+            const int monitorCenter =
+                monitorInfo.rcMonitor.top +
+                (monitorInfo.rcMonitor.bottom - monitorInfo.rcMonitor.top) / 2;
+            x = cursor.x + 8;
+            y = taskbarCenter >= monitorCenter
+                ? widgetRect.top - height - 8
+                : widgetRect.bottom + 8;
         }
-        tooltipActive_ = false;
+
+        x = std::clamp(
+            x,
+            static_cast<int>(monitorInfo.rcMonitor.left),
+            std::max(static_cast<int>(monitorInfo.rcMonitor.left),
+                     static_cast<int>(monitorInfo.rcMonitor.right) - width));
+        y = std::clamp(
+            y,
+            static_cast<int>(monitorInfo.rcMonitor.top),
+            std::max(static_cast<int>(monitorInfo.rcMonitor.top),
+                     static_cast<int>(monitorInfo.rcMonitor.bottom) - height));
+
+        SetWindowPos(
+            hoverWindow_,
+            HWND_TOPMOST,
+            x,
+            y,
+            width,
+            height,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        hoverPopupVisible_ = true;
+        InvalidateRect(hoverWindow_, nullptr, TRUE);
+    }
+
+    void HideHoverPopup() {
+        if (hoverWindow_ && IsWindow(hoverWindow_)) {
+            ShowWindow(hoverWindow_, SW_HIDE);
+        }
+        hoverPopupVisible_ = false;
+    }
+
+    void ResetHoverState() {
+        hoverInside_ = false;
+        hoverStartTick_ = 0;
+        HideHoverPopup();
+    }
+
+    void UpdateHoverState() {
+        if (!widgetVisible_ || !widgetWindow_ || !IsWindow(widgetWindow_) ||
+            !IsWindowVisible(widgetWindow_)) {
+            ResetHoverState();
+            return;
+        }
+
+        POINT cursor{};
+        RECT widgetRect{};
+        if (!GetCursorPos(&cursor) || !GetWindowRect(widgetWindow_, &widgetRect)) {
+            ResetHoverState();
+            return;
+        }
+
+        const bool inside = PtInRect(&widgetRect, cursor) != FALSE;
+        if (!inside) {
+            ResetHoverState();
+            return;
+        }
+
+        const ULONGLONG now = GetTickCount64();
+        if (!hoverInside_) {
+            hoverInside_ = true;
+            hoverStartTick_ = now;
+            return;
+        }
+
+        if (!hoverPopupVisible_ && now - hoverStartTick_ >= 250) {
+            ShowHoverPopup(cursor);
+        }
     }
 
     void UpdateTooltipText() {
@@ -1753,18 +1868,8 @@ private:
 
         wcsncpy_s(tooltipBuffer_.data(), tooltipBuffer_.size(), text.c_str(), _TRUNCATE);
 
-        if (tooltipWindow_ && IsWindow(tooltipWindow_) &&
-            widgetWindow_ && IsWindow(widgetWindow_)) {
-            TOOLINFOW info{};
-            info.cbSize = sizeof(info);
-            info.hwnd = widgetWindow_;
-            info.uId = 1;
-            info.lpszText = tooltipBuffer_.data();
-            SendMessageW(
-                tooltipWindow_,
-                TTM_UPDATETIPTEXTW,
-                0,
-                reinterpret_cast<LPARAM>(&info));
+        if (hoverPopupVisible_ && hoverWindow_ && IsWindow(hoverWindow_)) {
+            InvalidateRect(hoverWindow_, nullptr, TRUE);
         }
     }
 
@@ -1793,7 +1898,7 @@ private:
         case kMenuAbout:
             MessageBoxW(
                 mainWindow_,
-                L"CodexTaskbar v0.2.4\n\n"
+                L"CodexTaskbar v0.2.5\n\n"
                 L"在 Windows 10 任务栏显示 Codex 配额、绑定会话上下文/缓存和本轮代码改动。\n"
                 L"配额来自官方 app-server；会话指标通过只读 Codex Desktop IPC follower 获取。",
                 L"关于 CodexTaskbar",
@@ -1923,7 +2028,7 @@ private:
     HWND settingsWindow_{nullptr};
     HWND taskbarWindow_{nullptr};
     HWND rebarWindow_{nullptr};
-    HWND tooltipWindow_{nullptr};
+    HWND hoverWindow_{nullptr};
     HFONT font_{nullptr};
     HBRUSH darkBackgroundBrush_{nullptr};
     HBRUSH darkControlBrush_{nullptr};
@@ -1934,7 +2039,9 @@ private:
     bool codexRunning_{false};
     bool codexRunningKnown_{false};
     bool widgetVisible_{false};
-    bool tooltipActive_{false};
+    bool hoverInside_{false};
+    bool hoverPopupVisible_{false};
+    ULONGLONG hoverStartTick_{0};
     bool verticalTaskbar_{true};
     bool quotaValid_{false};
     bool autoStart_{true};
