@@ -1071,7 +1071,7 @@ ThreadMetrics DesktopThreadMonitor::DeriveMetrics(const std::string& threadId, T
                 state.hasLastDiff =
                     state.lastFiles > 0 || state.lastAdded > 0 || state.lastRemoved > 0;
                 state.lastDiffExact = state.hasLastDiff;
-            } else {
+            } else if (!state.lastDiffExact) {
                 // Desktop can keep edits only as completed fileChange items and
                 // omit turn.diff for follower clients. Use a current-turn-only
                 // fallback so live progress remains visible; exact diff wins
