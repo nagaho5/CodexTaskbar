@@ -43,8 +43,7 @@ jobs:
           $tagLine = Get-Content ".github\release-trigger" | Where-Object { $_ -match '^tag=' } | Select-Object -First 1
           if (!$tagLine) { throw "release-trigger must contain tag=vX.Y.Z" }
           $tag = $tagLine.Substring(4).Trim()
-          if ($tag -notmatch '^v\d+\.\d+\.\d+
-) { throw "Invalid release tag: $tag" }
+          if ($tag -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') { throw "Invalid release tag: $tag" }
 
           gh release create $tag `
             "build\Release\CodexTaskbar.exe" `
