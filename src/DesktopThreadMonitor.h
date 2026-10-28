@@ -112,8 +112,8 @@ private:
     std::vector<unsigned char> readBuffer_;
     std::map<std::string, ThreadState, std::less<>> states_;
     std::set<std::string, std::less<>> followed_;
-    std::string autoSelectedThread_;
     std::string latestRouteThread_;
+    std::string latestRouteSourceClient_;
     std::uint64_t lastAppliedConfigGeneration_{0};
     std::uint64_t updateSequence_{0};
 };
