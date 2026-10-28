@@ -5,6 +5,8 @@ project(CodexTaskbar VERSION 0.1.0 LANGUAGES CXX)
 add_executable(CodexTaskbar WIN32
     src/main.cpp
     src/AppServerClient.cpp
+    src/DesktopThreadMonitor.cpp
+    src/SimpleJson.cpp
     src/CodexTaskbar.rc
 )
 
@@ -31,6 +33,7 @@ target_link_libraries(CodexTaskbar PRIVATE
     gdi32
     shell32
     advapi32
+    comctl32
 )
 
 set_target_properties(CodexTaskbar PROPERTIES
