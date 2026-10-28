@@ -455,8 +455,8 @@ bool DesktopThreadMonitor::ConnectPipe() {
     states_.clear();
     followed_.clear();
     clientId_.clear();
-    autoSelectedThread_.clear();
     latestRouteThread_.clear();
+    latestRouteSourceClient_.clear();
     return true;
 }
 
@@ -469,8 +469,8 @@ void DesktopThreadMonitor::DisconnectPipe() {
     clientId_.clear();
     states_.clear();
     followed_.clear();
-    autoSelectedThread_.clear();
     latestRouteThread_.clear();
+    latestRouteSourceClient_.clear();
 }
 
 bool DesktopThreadMonitor::InitializeClient() {
@@ -546,8 +546,8 @@ void DesktopThreadMonitor::ApplyCurrentConfig(bool force) {
     }
 
     if (!automatic) {
-        autoSelectedThread_.clear();
         latestRouteThread_.clear();
+        latestRouteSourceClient_.clear();
         for (auto it = followed_.begin(); it != followed_.end();) {
             if (*it != manualThread) {
                 const std::string old = *it;
@@ -822,7 +822,7 @@ void DesktopThreadMonitor::ProcessFrame(const std::string& json) {
     if (method == "ipc-connection-reset") {
         if (IntegerField(*root, {"version"}, -1) != 1) return;
         states_.clear();
-        autoSelectedThread_.clear();
+        latestRouteSourceClient_.clear();
         for (const std::string& threadId : followed_) {
             SendFollowFrame(threadId, true);
         }
@@ -841,24 +841,56 @@ void DesktopThreadMonitor::ProcessFollowingBroadcast(const JsonValue& root) {
     const std::string source = StringField(root, {"sourceClientId"});
     if (source.empty() || source == clientId_) return;
 
-    // Targeted frames are retained subscription/status replies, not fresh desktop routing hints.
-    if (const JsonValue* targets = root.Find("targetClientIds"); targets && targets->IsArray() && !targets->AsArray().empty()) {
+    // Targeted frames are retained subscription/status replies, not fresh
+    // Desktop routing hints. Only untargeted broadcasts describe the UI route.
+    if (const JsonValue* targets = root.Find("targetClientIds");
+        targets && targets->IsArray() && !targets->AsArray().empty()) {
         return;
     }
 
     const JsonValue* params = root.Find("params");
     if (!params || !params->IsObject()) return;
     if (StringField(*params, {"hostId"}) != "local") return;
+
     const JsonValue* followingValue = params->Find("following");
-    if (!followingValue || !followingValue->IsBool() || !followingValue->AsBool()) return;
+    if (!followingValue || !followingValue->IsBool()) return;
 
     const std::string threadId = StringField(*params, {"conversationId"});
     if (threadId.empty()) return;
 
-    latestRouteThread_ = threadId;
-    FollowThread(threadId, true);
+    if (!followingValue->AsBool()) {
+        // A switch commonly emits old-thread false followed by new-thread true.
+        // A late false for an older thread must never steal selection from the
+        // newer route.
+        if (threadId == latestRouteThread_ &&
+            (latestRouteSourceClient_.empty() || source == latestRouteSourceClient_)) {
+            latestRouteThread_.clear();
+            latestRouteSourceClient_.clear();
+            SelectAndPublish();
+        }
+        return;
+    }
 
-    // Bound experimental auto subscriptions. Manual binding is never evicted.
+    // The Desktop UI route is authoritative in automatic mode.
+    latestRouteThread_ = threadId;
+    latestRouteSourceClient_ = source;
+
+    // Re-entering an already-followed thread must still announce following=true.
+    // The owner publishes a fresh snapshot for every such announcement, fixing
+    // stale owner/revision state after switching away and back.
+    if (followed_.contains(threadId)) {
+        SendFollowFrame(threadId, true);
+    } else {
+        FollowThread(threadId, true);
+    }
+
+    // Switch presentation immediately. If the route has no cached state yet,
+    // SelectAndPublish emits an empty state for this route until the fresh
+    // snapshot arrives. Late updates from other threads only refresh caches.
+    SelectAndPublish();
+
+    // Bound experimental auto subscriptions. Manual binding and the current UI
+    // route are never evicted.
     std::string manualThread;
     {
         std::lock_guard lock(mutex_);
@@ -866,7 +898,7 @@ void DesktopThreadMonitor::ProcessFollowingBroadcast(const JsonValue& root) {
     }
     while (followed_.size() > 6) {
         auto it = std::find_if(followed_.begin(), followed_.end(), [&](const std::string& candidate) {
-            return candidate != manualThread && candidate != latestRouteThread_ && candidate != autoSelectedThread_;
+            return candidate != manualThread && candidate != latestRouteThread_;
         });
         if (it == followed_.end()) break;
         const std::string old = *it;
@@ -917,17 +949,9 @@ void DesktopThreadMonitor::ProcessStreamState(const JsonValue& root) {
     }
 
     state.updateSequence = ++updateSequence_;
-    ThreadMetrics metrics = DeriveMetrics(threadId, state);
 
-    bool automatic = false;
-    {
-        std::lock_guard lock(mutex_);
-        automatic = automaticMode_;
-    }
-    if (automatic && metrics.activeTurn) {
-        autoSelectedThread_ = threadId;
-    }
-
+    // Stream updates only refresh this thread's cache. They must never decide
+    // which conversation automatic mode presents; the latest Desktop route does.
     SelectAndPublish();
 }
 
@@ -941,20 +965,31 @@ void DesktopThreadMonitor::SelectAndPublish() {
     }
 
     std::string selected;
-    if (automatic) {
-        if (!autoSelectedThread_.empty() && states_.contains(autoSelectedThread_)) {
-            selected = autoSelectedThread_;
+
+    if (automatic && !latestRouteThread_.empty()) {
+        // The thread currently routed by Codex Desktop is authoritative.
+        // Never show another active thread while waiting for its fresh snapshot.
+        if (states_.contains(latestRouteThread_)) {
+            selected = latestRouteThread_;
         } else {
-            std::uint64_t newest = 0;
-            for (auto& [threadId, state] : states_) {
-                ThreadMetrics metrics = DeriveMetrics(threadId, state);
-                if (metrics.activeTurn && state.updateSequence >= newest) {
-                    newest = state.updateSequence;
-                    selected = threadId;
-                }
-            }
-            if (selected.empty() && !latestRouteThread_.empty() && states_.contains(latestRouteThread_)) {
-                selected = latestRouteThread_;
+            ThreadMetrics pending;
+            pending.connected = pipe_ != INVALID_HANDLE_VALUE && !clientId_.empty();
+            pending.threadId = latestRouteThread_;
+            Publish(pending);
+            return;
+        }
+    }
+
+    if (automatic && selected.empty()) {
+        // During startup/reset a route hint can be temporarily unavailable.
+        // Only then fall back to the newest active turn. This fallback is not
+        // sticky: the next route broadcast immediately takes priority.
+        std::uint64_t newest = 0;
+        for (auto& [threadId, state] : states_) {
+            ThreadMetrics metrics = DeriveMetrics(threadId, state);
+            if (metrics.activeTurn && state.updateSequence >= newest) {
+                newest = state.updateSequence;
+                selected = threadId;
             }
         }
     }
