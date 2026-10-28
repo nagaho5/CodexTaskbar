@@ -93,21 +93,61 @@ struct TurnView {
     std::string diff;
 };
 
+std::string ExtractLatestAggregatedDiff(const JsonValue* value, int depth = 0) {
+    if (!value || depth > 8) return {};
+
+    if (value->IsString()) {
+        return value->AsString();
+    }
+
+    if (value->IsArray()) {
+        const auto& array = value->AsArray();
+        for (auto it = array.rbegin(); it != array.rend(); ++it) {
+            std::string candidate = ExtractLatestAggregatedDiff(&*it, depth + 1);
+            if (!candidate.empty()) return candidate;
+        }
+        return {};
+    }
+
+    if (value->IsObject()) {
+        // Desktop's private turn.diff shape has changed across releases.
+        // Only inspect fields that can represent a turn-level aggregate; do NOT
+        // descend into per-file "changes", because summing those patch fragments
+        // does not equal Codex's net turn diff.
+        for (std::string_view key : {
+                 "unifiedDiff",
+                 "unified_diff",
+                 "latestUnifiedDiff",
+                 "latest_unified_diff",
+                 "outputDiff",
+                 "output_diff",
+                 "diff",
+                 "content",
+             }) {
+            if (const JsonValue* child = value->Find(key)) {
+                std::string candidate = ExtractLatestAggregatedDiff(child, depth + 1);
+                if (!candidate.empty()) return candidate;
+            }
+        }
+    }
+
+    return {};
+}
+
 void FindTurnViews(const JsonValue& value, std::vector<TurnView>& output, int depth = 0) {
     if (depth > 18) return;
     if (value.IsObject()) {
         const std::string status = StringField(value, {"status", "state"});
-        const std::string id = StringField(value, {"turnId", "turn_id"});
+        const std::string id = StringField(value, {"turnId", "turn_id", "id"});
         const JsonValue* diffValue = value.Find("diff");
 
-        if ((!id.empty() || !status.empty()) && (diffValue || value.Find("items") || value.Find("params"))) {
+        if ((!id.empty() || !status.empty()) &&
+            (diffValue || value.Find("items") || value.Find("params"))) {
             TurnView turn;
             turn.object = &value;
             turn.id = id;
             turn.status = status;
-            if (diffValue && diffValue->IsString()) {
-                turn.diff = diffValue->AsString();
-            }
+            turn.diff = ExtractLatestAggregatedDiff(diffValue);
             output.push_back(std::move(turn));
         }
 
@@ -125,6 +165,7 @@ void CountUnifiedDiff(const std::string& diff, int& files, int& added, int& remo
     files = 0;
     added = 0;
     removed = 0;
+    int fallbackFileHeaders = 0;
 
     std::size_t start = 0;
     while (start <= diff.size()) {
@@ -135,6 +176,8 @@ void CountUnifiedDiff(const std::string& diff, int& files, int& added, int& remo
 
         if (line.starts_with("diff --git ")) {
             ++files;
+        } else if (line.starts_with("--- ")) {
+            ++fallbackFileHeaders;
         } else if (line.starts_with("+") && !line.starts_with("+++")) {
             ++added;
         } else if (line.starts_with("-") && !line.starts_with("---")) {
@@ -144,69 +187,9 @@ void CountUnifiedDiff(const std::string& diff, int& files, int& added, int& remo
         if (end == std::string::npos) break;
         start = end + 1;
     }
-}
 
-
-void CountDiffLinesOnly(const std::string& diff, int& added, int& removed) {
-    std::size_t start = 0;
-    while (start <= diff.size()) {
-        const std::size_t end = diff.find('\n', start);
-        const std::string_view line(
-            diff.data() + start,
-            (end == std::string::npos ? diff.size() : end) - start);
-
-        if (line.starts_with("+") && !line.starts_with("+++")) {
-            ++added;
-        } else if (line.starts_with("-") && !line.starts_with("---")) {
-            ++removed;
-        }
-
-        if (end == std::string::npos) break;
-        start = end + 1;
-    }
-}
-
-void CollectFileChangeStats(
-    const JsonValue& value,
-    std::set<std::string, std::less<>>& files,
-    int& added,
-    int& removed,
-    int depth = 0) {
-    if (depth > 18) return;
-
-    if (value.IsObject()) {
-        std::string type = StringField(value, {"type", "kind"});
-        type.erase(
-            std::remove_if(type.begin(), type.end(), [](char ch) {
-                return ch == '-' || ch == '_' || ch == '/' || ch == ' ';
-            }),
-            type.end());
-        std::transform(type.begin(), type.end(), type.begin(), [](unsigned char ch) {
-            return static_cast<char>(std::tolower(ch));
-        });
-
-        if (type == "filechange") {
-            if (const JsonValue* changes = value.Find("changes"); changes && changes->IsArray()) {
-                for (const JsonValue& change : changes->AsArray()) {
-                    if (!change.IsObject()) continue;
-                    const std::string path = StringField(change, {"path"});
-                    if (!path.empty()) files.insert(path);
-                    const JsonValue* diff = change.Find("diff");
-                    if (diff && diff->IsString()) {
-                        CountDiffLinesOnly(diff->AsString(), added, removed);
-                    }
-                }
-            }
-            return;
-        }
-
-        for (const auto& [_, child] : value.AsObject()) {
-            CollectFileChangeStats(child, files, added, removed, depth + 1);
-        }
-    } else if (value.IsArray()) {
-        for (const JsonValue& child : value.AsArray()) {
-            CollectFileChangeStats(child, files, added, removed, depth + 1);
-        }
+    if (files == 0) {
+        files = fallbackFileHeaders;
     }
 }
 
@@ -584,6 +567,38 @@ void DesktopThreadMonitor::ProcessFrame(const std::string& json) {
     if (type != "broadcast") return;
     const std::string method = StringField(*root, {"method"});
 
+    if (method == "turn/diff/updated") {
+        const JsonValue* params = root->Find("params");
+        if (!params || !params->IsObject()) return;
+
+        const std::string threadId = StringField(*params, {"threadId", "conversationId"});
+        const std::string turnId = StringField(*params, {"turnId", "turn_id"});
+        const JsonValue* diffValue = params->Find("diff");
+        if (threadId.empty() || !followed_.contains(threadId) ||
+            !diffValue || !diffValue->IsString()) {
+            return;
+        }
+
+        ThreadState& state = states_[threadId];
+        if (!turnId.empty() && !state.activeTurnId.empty() &&
+            turnId != state.activeTurnId) {
+            state.hasLastDiff = false;
+            state.lastFiles = state.lastAdded = state.lastRemoved = 0;
+        }
+        if (!turnId.empty()) state.activeTurnId = turnId;
+
+        CountUnifiedDiff(
+            diffValue->AsString(),
+            state.lastFiles,
+            state.lastAdded,
+            state.lastRemoved);
+        state.hasLastDiff =
+            state.lastFiles > 0 || state.lastAdded > 0 || state.lastRemoved > 0;
+        state.updateSequence = ++updateSequence_;
+        SelectAndPublish();
+        return;
+    }
+
     if (method == "thread-stream-state-changed") {
         if (!IsTargetedToUs(*root, clientId_)) return;
         ProcessStreamState(*root);
@@ -842,9 +857,13 @@ ThreadMetrics DesktopThreadMonitor::DeriveMetrics(const std::string& threadId, T
     FindTurnViews(state.document, turns);
 
     const TurnView* active = nullptr;
+    const TurnView* latestWithAggregateDiff = nullptr;
     for (const TurnView& turn : turns) {
         if (IsActiveStatus(turn.status)) {
             active = &turn;
+        }
+        if (!turn.diff.empty()) {
+            latestWithAggregateDiff = &turn;
         }
     }
 
@@ -859,24 +878,28 @@ ThreadMetrics DesktopThreadMonitor::DeriveMetrics(const std::string& threadId, T
         }
 
         if (!active->diff.empty()) {
-            CountUnifiedDiff(active->diff, state.lastFiles, state.lastAdded, state.lastRemoved);
-            state.hasLastDiff = state.lastFiles > 0 || state.lastAdded > 0 || state.lastRemoved > 0;
-        } else if (active->object) {
-            // The private Desktop follower state does not guarantee that the
-            // transient turn/diff/updated notification is stored as turn.diff.
-            // Completed/in-progress fileChange items do carry per-file diffs, so
-            // use them as a read-only fallback to make the row appear reliably.
-            std::set<std::string, std::less<>> files;
-            int added = 0;
-            int removed = 0;
-            CollectFileChangeStats(*active->object, files, added, removed);
-            if (!files.empty() || added > 0 || removed > 0) {
-                state.lastFiles = static_cast<int>(files.size());
-                state.lastAdded = added;
-                state.lastRemoved = removed;
-                state.hasLastDiff = true;
-            }
+            CountUnifiedDiff(
+                active->diff,
+                state.lastFiles,
+                state.lastAdded,
+                state.lastRemoved);
+            state.hasLastDiff =
+                state.lastFiles > 0 || state.lastAdded > 0 || state.lastRemoved > 0;
         }
+    } else if (latestWithAggregateDiff) {
+        // Preserve the final turn-level net diff after the task completes, and
+        // also hydrate it if CodexTaskbar starts after the turn has finished.
+        metrics.turnId = latestWithAggregateDiff->id;
+        if (!latestWithAggregateDiff->id.empty()) {
+            state.activeTurnId = latestWithAggregateDiff->id;
+        }
+        CountUnifiedDiff(
+            latestWithAggregateDiff->diff,
+            state.lastFiles,
+            state.lastAdded,
+            state.lastRemoved);
+        state.hasLastDiff =
+            state.lastFiles > 0 || state.lastAdded > 0 || state.lastRemoved > 0;
     }
 
     if (state.hasLastDiff) {
