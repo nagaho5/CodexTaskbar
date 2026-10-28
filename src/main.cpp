@@ -1,5 +1,6 @@
 #include "AppServerClient.h"
 #include "DesktopThreadMonitor.h"
+#include "RendererActivityMonitor.h"
 
 #include <windows.h>
 #include <commctrl.h>
@@ -353,6 +354,13 @@ std::wstring Utf8ToWide(const std::string& value) {
     return result;
 }
 
+std::wstring CompactThreadId(const std::string& value) {
+    if (value.empty()) return L"暂无";
+    const std::wstring wide = Utf8ToWide(value);
+    if (wide.size() <= 18) return wide;
+    return wide.substr(0, 8) + L"…" + wide.substr(wide.size() - 6);
+}
+
 std::int64_t CurrentUnixMilliseconds() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
@@ -594,6 +602,13 @@ public:
     void OnTick() {
         ++tickCount_;
 
+        // Diagnostic-only: observe the renderer's own active-conversation log.
+        // This does not control automatic following in v0.3.1; it only lets us
+        // compare renderer activity against the current IPC-selected thread.
+        if (automaticThreadMode_ && codexRunning_) {
+            rendererActivityMonitor_.Poll();
+        }
+
         // Elapsed turn time changes even when the IPC state itself does not.
         // Refresh its taskbar/hover presentation once per second while timing
         // information is available.
@@ -629,6 +644,7 @@ public:
                 HideWidget();
                 quotaValid_ = false;
                 threadMetrics_ = {};
+                rendererActivityMonitor_.Reset();
                 InvalidateWidget();
                 UpdateTooltipText();
             }
@@ -1368,7 +1384,11 @@ public:
         contextWarningColors_ = checked(kCheckContextWarningColors);
         quotaWarningColors_ = checked(kCheckQuotaWarningColors);
         durationUnits_ = checked(kCheckDurationUnits);
+        const bool previousAutomaticMode = automaticThreadMode_;
         automaticThreadMode_ = checked(kRadioAutoThread);
+        if (previousAutomaticMode != automaticThreadMode_) {
+            rendererActivityMonitor_.Reset();
+        }
 
         wchar_t threadText[256]{};
         GetDlgItemTextW(hwnd, kEditThreadId, threadText, static_cast<int>(std::size(threadText)));
@@ -2361,6 +2381,34 @@ private:
         }
         text += automaticThreadMode_ ? L"（自动/实验）" : L"（手动）";
 
+        if (automaticThreadMode_) {
+            const RendererActivityState& renderer = rendererActivityMonitor_.State();
+            text += L"\r\nRenderer：";
+            if (!renderer.logAvailable) {
+                text += L"日志未找到";
+            } else if (!renderer.eventSeen) {
+                text += L"等待 activity 事件";
+            } else if (renderer.activeThreadId.empty()) {
+                text += L"暂无 active Thread";
+            } else {
+                text += CompactThreadId(renderer.activeThreadId);
+                if (renderer.pendingInactive) {
+                    text += L"（inactive待确认）";
+                }
+            }
+
+            text += L"\r\nIPC显示：" + CompactThreadId(threadMetrics_.threadId);
+            if (renderer.eventSeen &&
+                !renderer.activeThreadId.empty() &&
+                !threadMetrics_.threadId.empty()) {
+                text += renderer.activeThreadId == threadMetrics_.threadId
+                    ? L" · 一致"
+                    : L" · 不一致";
+            } else {
+                text += L" · 暂无法判断";
+            }
+        }
+
         wcsncpy_s(tooltipBuffer_.data(), tooltipBuffer_.size(), text.c_str(), _TRUNCATE);
 
         if (hoverPopupVisible_ && hoverWindow_ && IsWindow(hoverWindow_)) {
@@ -2393,7 +2441,7 @@ private:
         case kMenuAbout:
             MessageBoxW(
                 mainWindow_,
-                L"CodexTaskbar v0.3.0\n\n"
+                L"CodexTaskbar v0.3.1\n\n"
                 L"在 Windows 10 任务栏显示 Codex 配额、绑定会话上下文/缓存和本轮代码改动。\n"
                 L"配额来自官方 app-server；会话指标通过只读 Codex Desktop IPC follower 获取。",
                 L"关于 CodexTaskbar",
@@ -2572,6 +2620,7 @@ private:
     std::wstring manualThreadId_;
     std::array<wchar_t, 1024> tooltipBuffer_{};
     std::unique_ptr<DesktopThreadMonitor> threadMonitor_;
+    RendererActivityMonitor rendererActivityMonitor_;
 
     std::thread workerThread_;
     std::mutex workerMutex_;
