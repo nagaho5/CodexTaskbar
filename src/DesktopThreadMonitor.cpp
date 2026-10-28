@@ -361,7 +361,11 @@ void DesktopThreadMonitor::ApplyCurrentConfig(bool force) {
     lastAppliedConfigGeneration_ = generation;
 
     if (!manualThread.empty()) {
-        FollowThread(manualThread, true);
+        if (force && followed_.contains(manualThread)) {
+            SendFollowFrame(manualThread, true);
+        } else {
+            FollowThread(manualThread, true);
+        }
     }
 
     if (!automatic) {
@@ -391,15 +395,28 @@ void DesktopThreadMonitor::FollowThread(const std::string& threadId, bool follow
         states_.erase(threadId);
     }
 
-    const std::string frame =
+    if (!SendFollowFrame(threadId, following) && following) {
+        followed_.erase(threadId);
+    }
+}
+
+bool DesktopThreadMonitor::SendFollowFrame(
+    const std::string& threadId,
+    bool following,
+    const std::string& targetClientId) {
+    if (threadId.empty() || clientId_.empty() || pipe_ == INVALID_HANDLE_VALUE) return false;
+
+    std::string frame =
         "{\"type\":\"broadcast\",\"method\":\"thread-stream-following-changed\","
         "\"sourceClientId\":\"" + EscapeJson(clientId_) +
         "\",\"version\":1,\"params\":{\"conversationId\":\"" + EscapeJson(threadId) +
-        "\",\"hostId\":\"local\",\"following\":" + (following ? "true" : "false") + "}}";
+        "\",\"hostId\":\"local\",\"following\":" + (following ? "true" : "false") + "}";
 
-    if (!SendFrame(frame) && following) {
-        followed_.erase(threadId);
+    if (!targetClientId.empty()) {
+        frame += ",\"targetClientIds\":[\"" + EscapeJson(targetClientId) + "\"]";
     }
+    frame += "}";
+    return SendFrame(frame);
 }
 
 bool DesktopThreadMonitor::SendFrame(const std::string& json) {
@@ -474,14 +491,82 @@ void DesktopThreadMonitor::ProcessFrame(const std::string& json) {
     if (!root || !root->IsObject()) return;
 
     const std::string type = StringField(*root, {"type"});
-    if (type != "broadcast") return;
 
+    if (type == "client-discovery-request") {
+        const std::string requestId = StringField(*root, {"requestId"});
+        if (!requestId.empty()) {
+            SendFrame(
+                "{\"type\":\"client-discovery-response\",\"requestId\":\"" +
+                EscapeJson(requestId) +
+                "\",\"response\":{\"canHandle\":false}}");
+        }
+        return;
+    }
+
+    if (type != "broadcast") return;
     const std::string method = StringField(*root, {"method"});
+
     if (method == "thread-stream-state-changed") {
         if (!IsTargetedToUs(*root, clientId_)) return;
         ProcessStreamState(*root);
-    } else if (method == "thread-stream-following-changed") {
+        return;
+    }
+
+    if (method == "thread-stream-following-changed") {
         ProcessFollowingBroadcast(*root);
+        return;
+    }
+
+    if (method == "thread-stream-following-status-requested") {
+        if (IntegerField(*root, {"version"}, -1) != 1) return;
+        const JsonValue* params = root->Find("params");
+        if (!params || !params->IsObject() || StringField(*params, {"hostId"}) != "local") return;
+        const std::string threadId = StringField(*params, {"conversationId"});
+        const std::string requester = StringField(*root, {"sourceClientId"});
+        if (!threadId.empty() && !requester.empty() && followed_.contains(threadId)) {
+            SendFollowFrame(threadId, true, requester);
+        }
+        return;
+    }
+
+    if (method == "client-status-changed") {
+        if (IntegerField(*root, {"version"}, -1) != 0) return;
+        const JsonValue* params = root->Find("params");
+        if (!params || !params->IsObject()) return;
+
+        const std::string source = StringField(*root, {"sourceClientId"});
+        const std::string changedClient = StringField(*params, {"clientId"});
+        const std::string status = StringField(*params, {"status"});
+        if (source.empty() || source != changedClient || changedClient.empty()) return;
+
+        if (status == "connected") {
+            const JsonValue* isSelf = params->Find("isSelf");
+            if (!(isSelf && isSelf->IsBool() && isSelf->AsBool())) {
+                for (const std::string& threadId : followed_) {
+                    SendFollowFrame(threadId, true, changedClient);
+                }
+            }
+        } else if (status == "disconnected") {
+            for (auto& [_, state] : states_) {
+                if (state.ownerClientId == changedClient) {
+                    state.hasDocument = false;
+                    state.revision = -1;
+                    state.ownerClientId.clear();
+                }
+            }
+            SelectAndPublish();
+        }
+        return;
+    }
+
+    if (method == "ipc-connection-reset") {
+        if (IntegerField(*root, {"version"}, -1) != 1) return;
+        states_.clear();
+        autoSelectedThread_.clear();
+        for (const std::string& threadId : followed_) {
+            SendFollowFrame(threadId, true);
+        }
+        SelectAndPublish();
     }
 }
 
