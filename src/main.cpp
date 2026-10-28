@@ -261,7 +261,6 @@ public:
 
     ~CodexTaskbarApp() {
         ShutdownWorker();
-        RestoreTaskList();
         RemoveTrayIcon();
         if (font_) {
             DeleteObject(font_);
@@ -435,8 +434,6 @@ public:
         AddTrayIcon();
         taskbarWindow_ = nullptr;
         rebarWindow_ = nullptr;
-        taskListWindow_ = nullptr;
-        reservedTaskList_ = false;
         if (codexRunning_) {
             EnsureWidget();
             PositionWidget();
@@ -885,10 +882,6 @@ private:
             SetParent(widgetWindow_, rebarWindow_);
         }
 
-        taskListWindow_ = FindWindowExW(rebarWindow_, nullptr, L"MSTaskSwWClass", nullptr);
-        if (!taskListWindow_) {
-            taskListWindow_ = FindWindowExW(rebarWindow_, nullptr, L"MSTaskListWClass", nullptr);
-        }
     }
 
     void PositionWidget() {
@@ -945,7 +938,8 @@ private:
             const int y = std::max(static_cast<int>(rebarClient.top), anchorTop - height - 1);
             const int x = std::max(0, (static_cast<int>(rebarClient.right - rebarClient.left) - width) / 2);
 
-            ReserveTaskListTo(y);
+            // Never resize or reposition the Windows task-list region. This widget is
+            // deliberately overlay-only so a layout mistake cannot hide task buttons.
             SetWindowPos(
                 widgetWindow_,
                 HWND_TOP,
@@ -976,77 +970,11 @@ private:
         InvalidateWidget();
     }
 
-    void ReserveTaskListTo(int widgetTop) {
-        if (!taskListWindow_ || !IsWindow(taskListWindow_) || !rebarWindow_) {
-            return;
-        }
-
-        RECT current{};
-        GetWindowRect(taskListWindow_, &current);
-        current = ScreenRectToClient(rebarWindow_, current);
-
-        if (!reservedTaskList_) {
-            originalTaskListRect_ = current;
-            reservedTaskList_ = true;
-        }
-
-        const int desiredHeight = std::max(1, widgetTop - static_cast<int>(current.top) - 1);
-        if ((current.bottom - current.top) != desiredHeight) {
-            SetWindowPos(
-                taskListWindow_,
-                nullptr,
-                current.left,
-                current.top,
-                current.right - current.left,
-                desiredHeight,
-                SWP_NOZORDER | SWP_NOACTIVATE);
-        }
-    }
-
-    void RestoreTaskList() {
-        if (!reservedTaskList_ || !taskListWindow_ || !IsWindow(taskListWindow_) || !rebarWindow_) {
-            reservedTaskList_ = false;
-            return;
-        }
-
-        HWND trafficMonitor = taskbarWindow_ ? FindDescendantByTitle(taskbarWindow_, kTrafficMonitorTitle) : nullptr;
-        if (trafficMonitor) {
-            RECT current{};
-            RECT traffic{};
-            GetWindowRect(taskListWindow_, &current);
-            GetWindowRect(trafficMonitor, &traffic);
-            current = ScreenRectToClient(rebarWindow_, current);
-            traffic = ScreenRectToClient(rebarWindow_, traffic);
-
-            const int height = std::max(1, static_cast<int>(traffic.top - current.top) - 1);
-            SetWindowPos(
-                taskListWindow_,
-                nullptr,
-                current.left,
-                current.top,
-                current.right - current.left,
-                height,
-                SWP_NOZORDER | SWP_NOACTIVATE);
-        } else {
-            SetWindowPos(
-                taskListWindow_,
-                nullptr,
-                originalTaskListRect_.left,
-                originalTaskListRect_.top,
-                originalTaskListRect_.right - originalTaskListRect_.left,
-                originalTaskListRect_.bottom - originalTaskListRect_.top,
-                SWP_NOZORDER | SWP_NOACTIVATE);
-        }
-
-        reservedTaskList_ = false;
-    }
-
     void HideWidget() {
         if (widgetWindow_ && IsWindow(widgetWindow_)) {
             ShowWindow(widgetWindow_, SW_HIDE);
         }
         widgetVisible_ = false;
-        RestoreTaskList();
         UpdateTrayTip();
     }
 
@@ -1222,7 +1150,6 @@ private:
     HWND settingsWindow_{nullptr};
     HWND taskbarWindow_{nullptr};
     HWND rebarWindow_{nullptr};
-    HWND taskListWindow_{nullptr};
     HFONT font_{nullptr};
 
     UINT taskbarCreatedMessage_{0};
@@ -1233,11 +1160,9 @@ private:
     bool verticalTaskbar_{true};
     bool quotaValid_{false};
     bool autoStart_{true};
-    bool reservedTaskList_{false};
     int fontSize_{10};
     unsigned tickCount_{0};
 
-    RECT originalTaskListRect_{};
     QuotaSnapshot quota_{};
 
     std::thread workerThread_;
