@@ -1,3 +1,3 @@
-tag=v0.2.4
-source_commit=e9fc9caa4f70747b94187f20bcf969902ddffe97
-reason=runtime process visibility, stable turn diff, TrafficMonitor-style hover, dark UI, and startup DPI font fix
+tag=v0.2.5
+source_commit=c3a92bf414e36fe7d3cf5a086116f15fb44961cb
+reason=canonical entry.value diff lookup and polled custom hover popup
