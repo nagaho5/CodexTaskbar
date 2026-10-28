@@ -523,7 +523,9 @@ public:
             if (diffVisible) rows.push_back({1, {}});
 
             if (rows.empty()) rows.push_back({0, L""});
-            const int rowHeight = std::max(1, (client.bottom - client.top) / static_cast<int>(rows.size()));
+            const int rowHeight = std::max(
+                1,
+                static_cast<int>(client.bottom - client.top) / static_cast<int>(rows.size()));
 
             for (std::size_t index = 0; index < rows.size(); ++index) {
                 RECT row{
@@ -568,11 +570,13 @@ public:
         GetTextExtentPoint32W(dc, removed.c_str(), static_cast<int>(removed.size()), &removeSize);
 
         const int totalWidth = fileSize.cx + addSize.cx + removeSize.cx + spacing * 2;
-        int x = row.left + std::max(0, ((row.right - row.left) - totalWidth) / 2);
+        int x = static_cast<int>(row.left) +
+                std::max(0, (static_cast<int>(row.right - row.left) - totalWidth) / 2);
 
         TEXTMETRICW tm{};
         GetTextMetricsW(dc, &tm);
-        const int y = row.top + std::max(0, ((row.bottom - row.top) - tm.tmHeight) / 2);
+        const int y = static_cast<int>(row.top) +
+                      std::max(0, (static_cast<int>(row.bottom - row.top) - static_cast<int>(tm.tmHeight)) / 2);
 
         SetTextColor(dc, RGB(255, 255, 255));
         TextOutW(dc, x, y, files.c_str(), static_cast<int>(files.size()));
