@@ -814,6 +814,10 @@ public:
 
     void WidgetDestroyed(HWND hwnd) {
         if (widgetWindow_ == hwnd) {
+            if (tooltipWindow_ && IsWindow(tooltipWindow_)) {
+                DestroyWindow(tooltipWindow_);
+            }
+            tooltipWindow_ = nullptr;
             widgetWindow_ = nullptr;
             widgetVisible_ = false;
         }
@@ -1305,7 +1309,7 @@ private:
             nullptr,
             WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
             CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
-            widgetWindow_,
+            mainWindow_,
             nullptr,
             instance_,
             nullptr);
@@ -1322,7 +1326,7 @@ private:
         TOOLINFOW info{};
         info.cbSize = sizeof(info);
         info.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
-        info.hwnd = widgetWindow_;
+        info.hwnd = mainWindow_;
         info.uId = reinterpret_cast<UINT_PTR>(widgetWindow_);
         info.lpszText = tooltipBuffer_.data();
         SendMessageW(tooltipWindow_, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&info));
@@ -1389,7 +1393,7 @@ private:
             TOOLINFOW info{};
             info.cbSize = sizeof(info);
             info.uFlags = TTF_IDISHWND;
-            info.hwnd = widgetWindow_;
+            info.hwnd = mainWindow_;
             info.uId = reinterpret_cast<UINT_PTR>(widgetWindow_);
             info.lpszText = tooltipBuffer_.data();
             SendMessageW(tooltipWindow_, TTM_UPDATETIPTEXTW, 0, reinterpret_cast<LPARAM>(&info));
@@ -1421,7 +1425,7 @@ private:
         case kMenuAbout:
             MessageBoxW(
                 mainWindow_,
-                L"CodexTaskbar v0.2\n\n"
+                L"CodexTaskbar v0.2.1\n\n"
                 L"在 Windows 10 任务栏显示 Codex 配额、绑定会话上下文/缓存和本轮代码改动。\n"
                 L"配额来自官方 app-server；会话指标通过只读 Codex Desktop IPC follower 获取。",
                 L"关于 CodexTaskbar",
