@@ -732,7 +732,7 @@ public:
 
         CreateWindowW(L"STATIC", L"Thread ID：", WS_CHILD | WS_VISIBLE,
             24, 226, 80, 22, hwnd, nullptr, instance_, nullptr);
-        HWND threadEdit = CreateWindowExW(
+        CreateWindowExW(
             WS_EX_CLIENTEDGE, L"EDIT", manualThreadId_.c_str(),
             WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
             104, 222, 326, 26, hwnd,
