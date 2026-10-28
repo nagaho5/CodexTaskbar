@@ -888,11 +888,11 @@ private:
         int height = 0;
 
         if (verticalTaskbar_) {
-            width = std::max(40, (rebarClient.right - rebarClient.left) - 4);
+            width = std::max(40, static_cast<int>(rebarClient.right - rebarClient.left) - 4);
             height = lineHeight * 2 + 4;
         } else {
             width = std::max(150, fontSize_ * 15);
-            height = std::max(24, std::min(rebarClient.bottom - rebarClient.top, lineHeight + 6));
+            height = std::max(24, std::min(static_cast<int>(rebarClient.bottom - rebarClient.top), lineHeight + 6));
         }
 
         HWND trafficMonitor = FindDescendantByTitle(taskbarWindow_, kTrafficMonitorTitle);
@@ -909,8 +909,8 @@ private:
                 anchorTop = anchorRect.top;
             }
 
-            const int y = std::max(rebarClient.top, anchorTop - height - 1);
-            const int x = std::max(0, ((rebarClient.right - rebarClient.left) - width) / 2);
+            const int y = std::max(static_cast<int>(rebarClient.top), anchorTop - height - 1);
+            const int x = std::max(0, (static_cast<int>(rebarClient.right - rebarClient.left) - width) / 2);
 
             ReserveTaskListTo(y);
             SetWindowPos(
@@ -928,8 +928,8 @@ private:
                 trayRect = ScreenRectToClient(rebarWindow_, trayRect);
                 x = trayRect.left - width - 2;
             }
-            x = std::max(rebarClient.left, x);
-            const int y = std::max(rebarClient.top, ((rebarClient.bottom - rebarClient.top) - height) / 2);
+            x = std::max(static_cast<int>(rebarClient.left), x);
+            const int y = std::max(static_cast<int>(rebarClient.top), (static_cast<int>(rebarClient.bottom - rebarClient.top) - height) / 2);
             SetWindowPos(
                 widgetWindow_,
                 HWND_TOP,
@@ -957,7 +957,7 @@ private:
             reservedTaskList_ = true;
         }
 
-        const int desiredHeight = std::max(1, widgetTop - current.top - 1);
+        const int desiredHeight = std::max(1, widgetTop - static_cast<int>(current.top) - 1);
         if ((current.bottom - current.top) != desiredHeight) {
             SetWindowPos(
                 taskListWindow_,
@@ -985,7 +985,7 @@ private:
             current = ScreenRectToClient(rebarWindow_, current);
             traffic = ScreenRectToClient(rebarWindow_, traffic);
 
-            const int height = std::max(1, traffic.top - current.top - 1);
+            const int height = std::max(1, static_cast<int>(traffic.top - current.top) - 1);
             SetWindowPos(
                 taskListWindow_,
                 nullptr,
