@@ -1,3 +1,2 @@
-tag=v0.2.1
-source_commit=99ed31c9c0d161fb55f2f7169e9d4481e7cd6413
-reason=fix thread metrics cache diff and tooltip
+tag=v0.2.2
+reason=fix net turn diff hover window visibility and optional file count
