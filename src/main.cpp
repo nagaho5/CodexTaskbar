@@ -66,12 +66,18 @@ constexpr int kCheckShowDiffFiles = 2012;
 constexpr int kCheckShowTaskDuration = 2013;
 constexpr int kButtonWorkingColor = 2014;
 constexpr int kStaticWorkingColorPreview = 2015;
+constexpr int kCheckContextWarningColors = 2016;
+constexpr int kCheckQuotaWarningColors = 2017;
+constexpr int kCheckDurationUnits = 2018;
 
 constexpr COLORREF kDefaultWorkingColor = RGB(79, 195, 247);
+constexpr COLORREF kWarningYellow = RGB(255, 196, 64);
+constexpr COLORREF kWarningRed = RGB(242, 88, 88);
 
 struct ColoredSegment {
     std::wstring text;
     COLORREF color{RGB(255, 255, 255)};
+    bool workingUnderline{false};
 };
 
 struct QuotaPayload {
@@ -370,6 +376,48 @@ std::wstring FormatDurationVerbose(std::int64_t milliseconds) {
     return result;
 }
 
+std::wstring FormatDurationUnits(std::int64_t milliseconds) {
+    if (milliseconds < 0) return {};
+    const std::int64_t totalSeconds = milliseconds / 1000;
+    const std::int64_t hours = totalSeconds / 3600;
+    const std::int64_t minutes = (totalSeconds % 3600) / 60;
+    const std::int64_t seconds = totalSeconds % 60;
+
+    wchar_t text[32]{};
+    if (hours > 0) {
+        swprintf_s(text, L"%lldh%02lldm%02llds",
+            static_cast<long long>(hours),
+            static_cast<long long>(minutes),
+            static_cast<long long>(seconds));
+    } else {
+        swprintf_s(text, L"%lldm%02llds",
+            static_cast<long long>(minutes),
+            static_cast<long long>(seconds));
+    }
+    return text;
+}
+
+std::wstring FormatElapsedAge(std::int64_t timestampMs) {
+    if (timestampMs <= 0) return L"暂无成功记录";
+    const std::int64_t deltaMs = std::max<std::int64_t>(
+        0,
+        CurrentUnixMilliseconds() - timestampMs);
+    const std::int64_t totalSeconds = deltaMs / 1000;
+    if (totalSeconds < 60) {
+        return std::to_wstring(totalSeconds) + L"秒前";
+    }
+    const std::int64_t totalMinutes = totalSeconds / 60;
+    if (totalMinutes < 60) {
+        return std::to_wstring(totalMinutes) + L"分钟前";
+    }
+    const std::int64_t hours = totalMinutes / 60;
+    const std::int64_t minutes = totalMinutes % 60;
+    if (minutes == 0) {
+        return std::to_wstring(hours) + L"小时前";
+    }
+    return std::to_wstring(hours) + L"小时" + std::to_wstring(minutes) + L"分钟前";
+}
+
 std::wstring FormatInteger(std::int64_t value) {
     std::wstring raw = std::to_wstring(value);
     std::wstring result;
@@ -457,6 +505,9 @@ public:
         workingColor_ = static_cast<COLORREF>(
             ReadRegistryDword(L"WorkingColor", static_cast<int>(kDefaultWorkingColor))) & 0x00FFFFFF;
         pendingWorkingColor_ = workingColor_;
+        contextWarningColors_ = ReadRegistryDword(L"ContextWarningColors", 0) != 0;
+        quotaWarningColors_ = ReadRegistryDword(L"QuotaWarningColors", 0) != 0;
+        durationUnits_ = ReadRegistryDword(L"DurationUnits", 0) != 0;
         automaticThreadMode_ = ReadRegistryDword(L"AutomaticThreadMode", 0) != 0;
         manualThreadId_ = ReadRegistryString(L"ManualThreadId");
 
@@ -527,9 +578,9 @@ public:
         // information is available.
         if (threadMetrics_.hasTurnTiming && threadMetrics_.activeTurn) {
             InvalidateWidget();
-            if (hoverPopupVisible_) {
-                UpdateTooltipText();
-            }
+        }
+        if (hoverPopupVisible_) {
+            UpdateTooltipText();
         }
 
         if ((tickCount_ % 2) != 1 && codexRunningKnown_) {
@@ -568,6 +619,7 @@ public:
     void ApplyQuota(const QuotaSnapshot& snapshot) {
         quota_ = snapshot;
         quotaValid_ = true;
+        lastQuotaSuccessMs_ = CurrentUnixMilliseconds();
         InvalidateWidget();
         UpdateTooltipText();
         UpdateTrayTip();
@@ -627,22 +679,65 @@ public:
                 y,
                 segments[i].text.c_str(),
                 static_cast<int>(segments[i].text.size()));
+
+            if (segments[i].workingUnderline && sizes[i].cx > 0) {
+                const int underlineY = std::min(
+                    static_cast<int>(row.bottom) - 1,
+                    y + static_cast<int>(tm.tmHeight));
+                HPEN pen = CreatePen(PS_SOLID, 1, workingColor_);
+                HGDIOBJ oldPen = pen ? SelectObject(dc, pen) : nullptr;
+                MoveToEx(dc, x, underlineY, nullptr);
+                LineTo(dc, x + sizes[i].cx, underlineY);
+                if (oldPen) SelectObject(dc, oldPen);
+                if (pen) DeleteObject(pen);
+            }
+
             x += sizes[i].cx;
         }
         SetTextColor(dc, RGB(255, 255, 255));
+    }
+
+    bool SevenDayOnFirstLine() const {
+        return showSevenDayPercent_ && !showFiveHourTime_;
+    }
+
+    COLORREF QuotaPercentColor(int remainingPercent, bool valid, bool allowWorkingColor) const {
+        if (!valid) return RGB(255, 255, 255);
+        if (quotaWarningColors_) {
+            if (remainingPercent <= 10) return kWarningRed;
+            if (remainingPercent <= 20) return kWarningYellow;
+        }
+        if (allowWorkingColor && threadMetrics_.activeTurn) {
+            return workingColor_;
+        }
+        return RGB(255, 255, 255);
+    }
+
+    COLORREF ContextPercentColor(bool valid) const {
+        if (!valid) return RGB(255, 255, 255);
+        if (contextWarningColors_) {
+            if (threadMetrics_.contextPercent >= 90) return kWarningRed;
+            if (threadMetrics_.contextPercent >= 80) return kWarningYellow;
+        }
+        return threadMetrics_.activeTurn ? workingColor_ : RGB(255, 255, 255);
     }
 
     std::vector<ColoredSegment> FirstLineSegments() const {
         std::vector<ColoredSegment> segments;
         if (showFiveHourPercent_) {
             const bool valid = quotaValid_ && quota_.fiveHour.valid;
+            const bool quotaWarning =
+                quotaWarningColors_ && valid &&
+                quota_.fiveHour.remainingPercent <= 20;
             segments.push_back({
                 valid
                     ? std::to_wstring(quota_.fiveHour.remainingPercent) + L"%"
                     : L"--%",
-                threadMetrics_.activeTurn && valid
-                    ? workingColor_
-                    : RGB(255, 255, 255)});
+                QuotaPercentColor(
+                    quota_.fiveHour.remainingPercent,
+                    valid,
+                    true),
+                threadMetrics_.activeTurn && quotaWarning});
         }
         if (showFiveHourTime_) {
             segments.push_back({
@@ -650,6 +745,16 @@ public:
                     ? FormatResetTime(quota_.fiveHour.resetsAtUnix)
                     : L"--:--",
                 RGB(255, 255, 255)});
+        } else if (showSevenDayPercent_) {
+            const bool valid = quotaValid_ && quota_.sevenDay.valid;
+            segments.push_back({
+                valid
+                    ? std::to_wstring(quota_.sevenDay.remainingPercent) + L"%"
+                    : L"--%",
+                QuotaPercentColor(
+                    quota_.sevenDay.remainingPercent,
+                    valid,
+                    false)});
         }
         return segments;
     }
@@ -663,22 +768,31 @@ public:
             segments.push_back({std::move(text), color});
         };
 
-        if (showSevenDayPercent_) {
+        if (showSevenDayPercent_ && !SevenDayOnFirstLine()) {
+            const bool valid = quotaValid_ && quota_.sevenDay.valid;
             append(
-                quotaValid_ && quota_.sevenDay.valid
+                valid
                     ? std::to_wstring(quota_.sevenDay.remainingPercent) + L"%"
                     : L"--%",
-                RGB(255, 255, 255));
+                QuotaPercentColor(
+                    quota_.sevenDay.remainingPercent,
+                    valid,
+                    false));
         }
         if (showContext_) {
             const bool valid = threadMetrics_.hasContext;
-            append(
+            const bool contextWarning =
+                contextWarningColors_ && valid &&
+                threadMetrics_.contextPercent >= 80;
+            if (!segments.empty()) {
+                segments.push_back({L" ", RGB(255, 255, 255), false});
+            }
+            segments.push_back({
                 valid
                     ? std::to_wstring(threadMetrics_.contextPercent) + L"%"
                     : L"--%",
-                threadMetrics_.activeTurn && valid
-                    ? workingColor_
-                    : RGB(255, 255, 255));
+                ContextPercentColor(valid),
+                threadMetrics_.activeTurn && contextWarning});
         }
         if (showCache_) {
             append(
@@ -766,11 +880,11 @@ public:
                 std::vector<ColoredSegment> diffSegments;
                 if (showDiffFiles_) {
                     diffSegments.push_back({
-                        std::to_wstring(threadMetrics_.changedFiles) + L" ",
+                        std::to_wstring(threadMetrics_.changedFiles),
                         RGB(255, 255, 255)});
                 }
                 diffSegments.push_back({
-                    std::to_wstring(threadMetrics_.addedLines) + L" ",
+                    std::to_wstring(threadMetrics_.addedLines),
                     RGB(66, 214, 116)});
                 diffSegments.push_back({
                     std::to_wstring(threadMetrics_.removedLines),
@@ -793,7 +907,7 @@ public:
         const std::wstring files = std::to_wstring(threadMetrics_.changedFiles);
         const std::wstring added = std::to_wstring(threadMetrics_.addedLines);
         const std::wstring removed = std::to_wstring(threadMetrics_.removedLines);
-        const int spacing = 5;
+        const int spacing = 0;
 
         SIZE fileSize{}, addSize{}, removeSize{};
         if (showDiffFiles_) {
@@ -829,6 +943,52 @@ public:
         SetTextColor(dc, RGB(242, 88, 88));
         TextOutW(dc, x, y, removed.c_str(), static_cast<int>(removed.size()));
         SetTextColor(dc, RGB(255, 255, 255));
+    }
+
+    void ActivateCodexWindow() {
+        struct SearchState {
+            HWND window{nullptr};
+        } state;
+
+        EnumWindows(
+            [](HWND hwnd, LPARAM value) -> BOOL {
+                auto* state = reinterpret_cast<SearchState*>(value);
+                if (GetWindow(hwnd, GW_OWNER) != nullptr) return TRUE;
+
+                const LONG_PTR exStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+                if ((exStyle & WS_EX_TOOLWINDOW) != 0) return TRUE;
+
+                DWORD processId = 0;
+                GetWindowThreadProcessId(hwnd, &processId);
+                if (!IsCodexProcess(processId)) return TRUE;
+
+                // Electron can own hidden helper top-level windows. Only select
+                // a real visible/minimized Codex window with a plausible size.
+                if (!IsWindowVisible(hwnd) && !IsIconic(hwnd)) return TRUE;
+
+                RECT rect{};
+                if (!GetWindowRect(hwnd, &rect)) return TRUE;
+                if (!IsIconic(hwnd) &&
+                    (rect.right - rect.left < 120 || rect.bottom - rect.top < 80)) {
+                    return TRUE;
+                }
+
+                wchar_t title[256]{};
+                GetWindowTextW(hwnd, title, static_cast<int>(std::size(title)));
+                if (title[0] == L'\0' && !IsIconic(hwnd)) return TRUE;
+
+                state->window = hwnd;
+                return FALSE;
+            },
+            reinterpret_cast<LPARAM>(&state));
+
+        if (!state.window) return;
+        if (IsIconic(state.window)) {
+            ShowWindow(state.window, SW_RESTORE);
+        } else {
+            ShowWindow(state.window, SW_SHOW);
+        }
+        SetForegroundWindow(state.window);
     }
 
     void ShowContextMenu() {
@@ -923,8 +1083,8 @@ public:
             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            470,
-            455,
+            500,
+            520,
             mainWindow_,
             nullptr,
             instance_,
@@ -996,43 +1156,56 @@ public:
             382, 153, 48, 22, hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kStaticWorkingColorPreview)), instance_, nullptr);
 
+        checkbox(
+            kCheckContextWarningColors,
+            L"Context警告色(80/90%)",
+            24, 183, contextWarningColors_, 190);
+        checkbox(
+            kCheckQuotaWarningColors,
+            L"配额警告色(20/10%)",
+            225, 183, quotaWarningColors_, 190);
+        checkbox(
+            kCheckDurationUnits,
+            L"耗时使用 h/m/s 格式",
+            24, 208, durationUnits_, 190);
+
         CreateWindowW(L"STATIC", L"会话来源：", WS_CHILD | WS_VISIBLE,
-            24, 191, 100, 22, hwnd, nullptr, instance_, nullptr);
+            24, 241, 100, 22, hwnd, nullptr, instance_, nullptr);
 
         HWND manualRadio = CreateWindowW(
             L"BUTTON", L"手动绑定 Thread ID", WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON | WS_GROUP,
-            24, 215, 180, 22, hwnd,
+            24, 265, 180, 22, hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kRadioManualThread)), instance_, nullptr);
         HWND autoRadio = CreateWindowW(
             L"BUTTON", L"自动跟随活动任务（实验）", WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON,
-            210, 215, 220, 22, hwnd,
+            210, 265, 240, 22, hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kRadioAutoThread)), instance_, nullptr);
         SendMessageW(manualRadio, BM_SETCHECK, automaticThreadMode_ ? BST_UNCHECKED : BST_CHECKED, 0);
         SendMessageW(autoRadio, BM_SETCHECK, automaticThreadMode_ ? BST_CHECKED : BST_UNCHECKED, 0);
 
         CreateWindowW(L"STATIC", L"Thread ID：", WS_CHILD | WS_VISIBLE,
-            24, 251, 80, 22, hwnd, nullptr, instance_, nullptr);
+            24, 301, 80, 22, hwnd, nullptr, instance_, nullptr);
         CreateWindowExW(
             WS_EX_CLIENTEDGE, L"EDIT", manualThreadId_.c_str(),
             WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-            104, 247, 326, 26, hwnd,
+            104, 297, 346, 26, hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kEditThreadId)), instance_, nullptr);
 
-        checkbox(kCheckAutoStart, L"开机自动启动", 24, 293, autoStart_);
+        checkbox(kCheckAutoStart, L"开机自动启动", 24, 343, autoStart_);
 
         CreateWindowW(
             L"STATIC",
             L"提示：隐藏的项目仍会在鼠标悬浮提示中显示完整信息。",
             WS_CHILD | WS_VISIBLE,
-            24, 327, 410, 22, hwnd, nullptr, instance_, nullptr);
+            24, 377, 430, 22, hwnd, nullptr, instance_, nullptr);
 
         CreateWindowW(
             L"BUTTON", L"确定", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            270, 369, 76, 28, hwnd,
+            300, 419, 76, 28, hwnd,
             reinterpret_cast<HMENU>(IDOK), instance_, nullptr);
         CreateWindowW(
             L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            358, 369, 76, 28, hwnd,
+            388, 419, 76, 28, hwnd,
             reinterpret_cast<HMENU>(IDCANCEL), instance_, nullptr);
 
         EnumChildWindows(
@@ -1205,6 +1378,9 @@ public:
         showDiffFiles_ = checked(kCheckShowDiffFiles);
         showTaskDuration_ = checked(kCheckShowTaskDuration);
         workingColor_ = pendingWorkingColor_;
+        contextWarningColors_ = checked(kCheckContextWarningColors);
+        quotaWarningColors_ = checked(kCheckQuotaWarningColors);
+        durationUnits_ = checked(kCheckDurationUnits);
         automaticThreadMode_ = checked(kRadioAutoThread);
 
         wchar_t threadText[256]{};
@@ -1224,6 +1400,9 @@ public:
         WriteRegistryDword(L"ShowDiffFiles", showDiffFiles_ ? 1u : 0u);
         WriteRegistryDword(L"ShowTaskDuration", showTaskDuration_ ? 1u : 0u);
         WriteRegistryDword(L"WorkingColor", static_cast<DWORD>(workingColor_));
+        WriteRegistryDword(L"ContextWarningColors", contextWarningColors_ ? 1u : 0u);
+        WriteRegistryDword(L"QuotaWarningColors", quotaWarningColors_ ? 1u : 0u);
+        WriteRegistryDword(L"DurationUnits", durationUnits_ ? 1u : 0u);
         WriteRegistryDword(L"AutomaticThreadMode", automaticThreadMode_ ? 1u : 0u);
         WriteRegistryString(L"ManualThreadId", manualThreadId_);
         SetAutoStartRegistry(autoStart_);
@@ -1383,6 +1562,14 @@ private:
         case WM_RBUTTONDOWN:
             if (app) {
                 app->ResetHoverState();
+            }
+            break;
+
+        case WM_LBUTTONUP:
+            if (app) {
+                app->ResetHoverState();
+                app->ActivateCodexWindow();
+                return 0;
             }
             break;
 
@@ -1825,6 +2012,10 @@ private:
             line += quotaValid_ && quota_.fiveHour.valid
                 ? FormatResetTime(quota_.fiveHour.resetsAtUnix)
                 : L"--:--";
+        } else if (showSevenDayPercent_) {
+            line += quotaValid_ && quota_.sevenDay.valid
+                ? std::to_wstring(quota_.sevenDay.remainingPercent) + L"%"
+                : L"--%";
         }
         return line;
     }
@@ -1832,7 +2023,7 @@ private:
     std::wstring SecondLine() const {
         std::vector<std::wstring> values;
 
-        if (showSevenDayPercent_) {
+        if (showSevenDayPercent_ && !SevenDayOnFirstLine()) {
             values.push_back(
                 quotaValid_ && quota_.sevenDay.valid
                     ? std::to_wstring(quota_.sevenDay.remainingPercent) + L"%"
@@ -1876,7 +2067,10 @@ private:
 
     std::wstring TaskDurationLine() const {
         if (!showTaskDuration_ || !threadMetrics_.activeTurn) return {};
-        return FormatDurationCompact(CurrentTaskDurationMs());
+        const std::int64_t durationMs = CurrentTaskDurationMs();
+        return durationUnits_
+            ? FormatDurationUnits(durationMs)
+            : FormatDurationCompact(durationMs);
     }
 
     bool IsDiffRowVisible() const {
@@ -2138,6 +2332,18 @@ private:
         }
 
         text += L"\r\n";
+        if (quotaValid_) {
+            text += L"配额连接：正常 · " + FormatElapsedAge(lastQuotaSuccessMs_) + L"更新";
+        } else {
+            text += L"配额连接：异常";
+            if (lastQuotaSuccessMs_ > 0) {
+                text += L" · 上次成功 " + FormatElapsedAge(lastQuotaSuccessMs_);
+            }
+        }
+        text += L"\r\n会话连接：";
+        text += threadMetrics_.connected ? L"已连接" : L"未连接";
+
+        text += L"\r\n";
         const std::int64_t taskDurationMs = CurrentTaskDurationMs();
         if (taskDurationMs >= 0) {
             text += L"任务耗时：" + FormatDurationVerbose(taskDurationMs);
@@ -2200,7 +2406,7 @@ private:
         case kMenuAbout:
             MessageBoxW(
                 mainWindow_,
-                L"CodexTaskbar v0.2.7\n\n"
+                L"CodexTaskbar v0.2.8\n\n"
                 L"在 Windows 10 任务栏显示 Codex 配额、绑定会话上下文/缓存和本轮代码改动。\n"
                 L"配额来自官方 app-server；会话指标通过只读 Codex Desktop IPC follower 获取。",
                 L"关于 CodexTaskbar",
@@ -2354,6 +2560,7 @@ private:
     ULONGLONG hoverStartTick_{0};
     bool verticalTaskbar_{true};
     bool quotaValid_{false};
+    std::int64_t lastQuotaSuccessMs_{0};
     bool autoStart_{true};
     bool showFiveHourPercent_{true};
     bool showFiveHourTime_{true};
@@ -2366,6 +2573,9 @@ private:
     COLORREF workingColor_{kDefaultWorkingColor};
     COLORREF pendingWorkingColor_{kDefaultWorkingColor};
     std::array<COLORREF, 16> customColors_{};
+    bool contextWarningColors_{false};
+    bool quotaWarningColors_{false};
+    bool durationUnits_{false};
     bool automaticThreadMode_{false};
     int fontSize_{10};
     unsigned tickCount_{0};
