@@ -1,6 +1,7 @@
 #include "DesktopThreadMonitor.h"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -426,12 +427,14 @@ bool DesktopThreadMonitor::PumpPipe(DWORD timeoutMs) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
 
     for (;;) {
+        bool configChanged = false;
         {
             std::lock_guard lock(mutex_);
             if (stop_ || !active_) return true;
-            if (configGeneration_ != lastAppliedConfigGeneration_) {
-                ApplyCurrentConfig(true);
-            }
+            configChanged = configGeneration_ != lastAppliedConfigGeneration_;
+        }
+        if (configChanged) {
+            ApplyCurrentConfig(true);
         }
 
         DWORD available = 0;
