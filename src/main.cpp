@@ -840,6 +840,7 @@ public:
                 DestroyWindow(tooltipWindow_);
             }
             tooltipWindow_ = nullptr;
+            tooltipActive_ = false;
             widgetWindow_ = nullptr;
             widgetVisible_ = false;
         }
@@ -931,14 +932,16 @@ private:
             break;
 
         case WM_MOUSEMOVE:
-        case WM_LBUTTONDOWN:
-        case WM_LBUTTONUP:
-        case WM_MBUTTONDOWN:
-        case WM_MBUTTONUP:
             if (app) {
-                app->RelayTooltipEvent(hwnd, message, wParam, lParam);
+                app->ArmTooltipHover(hwnd);
             }
             break;
+
+        case WM_MOUSEHOVER:
+            if (app) {
+                app->ShowTooltip(hwnd);
+            }
+            return 0;
 
         case WM_MOUSELEAVE:
             if (app) {
@@ -946,9 +949,10 @@ private:
             }
             return 0;
 
+        case WM_LBUTTONDOWN:
+        case WM_MBUTTONDOWN:
         case WM_RBUTTONDOWN:
             if (app) {
-                app->RelayTooltipEvent(hwnd, message, wParam, lParam);
                 app->HideTooltip();
             }
             break;
@@ -1256,7 +1260,6 @@ private:
                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
         }
 
-        UpdateTooltipRect();
         InvalidateWidget();
     }
 
@@ -1351,11 +1354,11 @@ private:
 
     void EnsureTooltip() {
         if (!widgetWindow_ || !IsWindow(widgetWindow_)) return;
-        if (tooltipWindow_ && IsWindow(tooltipWindow_)) {
-            UpdateTooltipRect();
-            return;
-        }
+        if (tooltipWindow_ && IsWindow(tooltipWindow_)) return;
 
+        // TrafficMonitor uses the standard Win32 tooltip control for its whole
+        // taskbar window. We do the same, but use a TRACK tool so Explorer's
+        // cross-process taskbar parenting cannot interfere with hit testing.
         tooltipWindow_ = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_NOACTIVATE,
             TOOLTIPS_CLASSW,
@@ -1368,76 +1371,96 @@ private:
             nullptr);
         if (!tooltipWindow_) return;
 
+        TOOLINFOW info{};
+        info.cbSize = sizeof(info);
+        info.uFlags = TTF_TRACK | TTF_ABSOLUTE;
+        info.hwnd = widgetWindow_;
+        info.uId = 1;
+        info.lpszText = tooltipBuffer_.data();
+        if (!SendMessageW(
+                tooltipWindow_,
+                TTM_ADDTOOLW,
+                0,
+                reinterpret_cast<LPARAM>(&info))) {
+            DestroyWindow(tooltipWindow_);
+            tooltipWindow_ = nullptr;
+            return;
+        }
+
+        SendMessageW(tooltipWindow_, TTM_SETMAXTIPWIDTH, 0, 520);
+        SendMessageW(tooltipWindow_, TTM_SETDELAYTIME, TTDT_AUTOPOP, 20000);
         SetWindowPos(
             tooltipWindow_,
             HWND_TOPMOST,
             0, 0, 0, 0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+
+    void ArmTooltipHover(HWND hwnd) {
+        EnsureTooltip();
+        if (!tooltipWindow_ || !IsWindow(tooltipWindow_)) return;
+
+        TRACKMOUSEEVENT tracking{};
+        tracking.cbSize = sizeof(tracking);
+        tracking.dwFlags = TME_HOVER | TME_LEAVE;
+        tracking.hwndTrack = hwnd;
+        tracking.dwHoverTime = 250;
+        TrackMouseEvent(&tracking);
+    }
+
+    void ShowTooltip(HWND hwnd) {
+        EnsureTooltip();
+        if (!tooltipWindow_ || !IsWindow(tooltipWindow_) ||
+            !hwnd || !IsWindow(hwnd)) {
+            return;
+        }
 
         UpdateTooltipText();
 
+        POINT cursor{};
+        GetCursorPos(&cursor);
+
+        // On the user's left vertical taskbar, open the info box to the right
+        // of the pointer so it never covers the compact numbers being hovered.
+        const int x = cursor.x + 14;
+        const int y = cursor.y + 14;
+        SendMessageW(
+            tooltipWindow_,
+            TTM_TRACKPOSITION,
+            0,
+            MAKELPARAM(x, y));
+
         TOOLINFOW info{};
         info.cbSize = sizeof(info);
+        info.uFlags = TTF_TRACK | TTF_ABSOLUTE;
         info.hwnd = widgetWindow_;
         info.uId = 1;
-        GetClientRect(widgetWindow_, &info.rect);
         info.lpszText = tooltipBuffer_.data();
-        SendMessageW(tooltipWindow_, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&info));
-        SendMessageW(tooltipWindow_, TTM_SETMAXTIPWIDTH, 0, 520);
-        SendMessageW(tooltipWindow_, TTM_SETDELAYTIME, TTDT_INITIAL, 250);
-        SendMessageW(tooltipWindow_, TTM_SETDELAYTIME, TTDT_RESHOW, 100);
-        SendMessageW(tooltipWindow_, TTM_SETDELAYTIME, TTDT_AUTOPOP, 20000);
-        SendMessageW(tooltipWindow_, TTM_ACTIVATE, TRUE, 0);
+        SendMessageW(
+            tooltipWindow_,
+            TTM_TRACKACTIVATE,
+            TRUE,
+            reinterpret_cast<LPARAM>(&info));
+        tooltipActive_ = true;
     }
 
-    void UpdateTooltipRect() {
-        if (!tooltipWindow_ || !IsWindow(tooltipWindow_) ||
-            !widgetWindow_ || !IsWindow(widgetWindow_)) {
+    void HideTooltip() {
+        if (!tooltipWindow_ || !IsWindow(tooltipWindow_)) {
+            tooltipActive_ = false;
             return;
         }
 
         TOOLINFOW info{};
         info.cbSize = sizeof(info);
+        info.uFlags = TTF_TRACK | TTF_ABSOLUTE;
         info.hwnd = widgetWindow_;
         info.uId = 1;
-        GetClientRect(widgetWindow_, &info.rect);
         SendMessageW(
             tooltipWindow_,
-            TTM_NEWTOOLRECTW,
-            0,
+            TTM_TRACKACTIVATE,
+            FALSE,
             reinterpret_cast<LPARAM>(&info));
-    }
-
-    void RelayTooltipEvent(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
-        EnsureTooltip();
-        if (!tooltipWindow_ || !IsWindow(tooltipWindow_)) return;
-
-        if (message == WM_MOUSEMOVE) {
-            TRACKMOUSEEVENT tracking{};
-            tracking.cbSize = sizeof(tracking);
-            tracking.dwFlags = TME_LEAVE;
-            tracking.hwndTrack = hwnd;
-            TrackMouseEvent(&tracking);
-        }
-
-        MSG relay{};
-        relay.hwnd = hwnd;
-        relay.message = message;
-        relay.wParam = wParam;
-        relay.lParam = lParam;
-        relay.time = static_cast<DWORD>(GetMessageTime());
-        GetCursorPos(&relay.pt);
-        SendMessageW(
-            tooltipWindow_,
-            TTM_RELAYEVENT,
-            0,
-            reinterpret_cast<LPARAM>(&relay));
-    }
-
-    void HideTooltip() {
-        if (tooltipWindow_ && IsWindow(tooltipWindow_)) {
-            SendMessageW(tooltipWindow_, TTM_POP, 0, 0);
-        }
+        tooltipActive_ = false;
     }
 
     void UpdateTooltipText() {
@@ -1500,6 +1523,7 @@ private:
             widgetWindow_ && IsWindow(widgetWindow_)) {
             TOOLINFOW info{};
             info.cbSize = sizeof(info);
+            info.uFlags = TTF_TRACK | TTF_ABSOLUTE;
             info.hwnd = widgetWindow_;
             info.uId = 1;
             info.lpszText = tooltipBuffer_.data();
@@ -1536,7 +1560,7 @@ private:
         case kMenuAbout:
             MessageBoxW(
                 mainWindow_,
-                L"CodexTaskbar v0.2.2\n\n"
+                L"CodexTaskbar v0.2.3\n\n"
                 L"在 Windows 10 任务栏显示 Codex 配额、绑定会话上下文/缓存和本轮代码改动。\n"
                 L"配额来自官方 app-server；会话指标通过只读 Codex Desktop IPC follower 获取。",
                 L"关于 CodexTaskbar",
@@ -1674,6 +1698,7 @@ private:
     bool codexRunning_{false};
     bool codexRunningKnown_{false};
     bool widgetVisible_{false};
+    bool tooltipActive_{false};
     bool verticalTaskbar_{true};
     bool quotaValid_{false};
     bool autoStart_{true};
