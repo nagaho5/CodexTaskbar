@@ -1,3 +1,3 @@
-tag=v0.2.3
-source_commit=ea5b18d143a09c97de9ace475bd492e2acc1bfca
-reason=exact canonical turn diff and reliable tracked hover tooltip
+tag=v0.2.4
+source_commit=e9fc9caa4f70747b94187f20bcf969902ddffe97
+reason=runtime process visibility, stable turn diff, TrafficMonitor-style hover, dark UI, and startup DPI font fix
