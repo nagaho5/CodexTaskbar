@@ -61,6 +61,7 @@ constexpr int kRadioManualThread = 2009;
 constexpr int kRadioAutoThread = 2010;
 constexpr int kEditThreadId = 2011;
 constexpr int kCheckShowDiffFiles = 2012;
+constexpr int kCheckShowTaskDuration = 2013;
 
 struct QuotaPayload {
     QuotaSnapshot snapshot;
@@ -314,6 +315,50 @@ std::wstring Utf8ToWide(const std::string& value) {
     return result;
 }
 
+std::int64_t CurrentUnixMilliseconds() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+std::wstring FormatDurationCompact(std::int64_t milliseconds) {
+    if (milliseconds < 0) return {};
+    const std::int64_t totalSeconds = milliseconds / 1000;
+    const std::int64_t hours = totalSeconds / 3600;
+    const std::int64_t minutes = (totalSeconds % 3600) / 60;
+    const std::int64_t seconds = totalSeconds % 60;
+
+    wchar_t text[32]{};
+    if (hours > 0) {
+        swprintf_s(text, L"%lld:%02lld:%02lld",
+            static_cast<long long>(hours),
+            static_cast<long long>(minutes),
+            static_cast<long long>(seconds));
+    } else {
+        swprintf_s(text, L"%02lld:%02lld",
+            static_cast<long long>(minutes),
+            static_cast<long long>(seconds));
+    }
+    return text;
+}
+
+std::wstring FormatDurationVerbose(std::int64_t milliseconds) {
+    if (milliseconds < 0) return {};
+    const std::int64_t totalSeconds = milliseconds / 1000;
+    const std::int64_t hours = totalSeconds / 3600;
+    const std::int64_t minutes = (totalSeconds % 3600) / 60;
+    const std::int64_t seconds = totalSeconds % 60;
+
+    std::wstring result;
+    if (hours > 0) {
+        result += std::to_wstring(hours) + L"小时";
+    }
+    if (minutes > 0 || hours > 0) {
+        result += std::to_wstring(minutes) + L"分";
+    }
+    result += std::to_wstring(seconds) + L"秒";
+    return result;
+}
+
 std::wstring FormatInteger(std::int64_t value) {
     std::wstring raw = std::to_wstring(value);
     std::wstring result;
@@ -397,6 +442,7 @@ public:
         showCache_ = ReadRegistryDword(L"ShowCache", 0) != 0;
         showDiff_ = ReadRegistryDword(L"ShowDiff", 1) != 0;
         showDiffFiles_ = ReadRegistryDword(L"ShowDiffFiles", 1) != 0;
+        showTaskDuration_ = ReadRegistryDword(L"ShowTaskDuration", 0) != 0;
         automaticThreadMode_ = ReadRegistryDword(L"AutomaticThreadMode", 0) != 0;
         manualThreadId_ = ReadRegistryString(L"ManualThreadId");
 
@@ -446,7 +492,7 @@ public:
         StartWorker();
         OnTick();
         SetTimer(mainWindow_, kTickTimer, 1000, nullptr);
-        SetTimer(mainWindow_, kHoverTimer, 100, nullptr);
+        SetTimer(mainWindow_, kHoverTimer, 200, nullptr);
         return true;
     }
 
@@ -461,6 +507,17 @@ public:
 
     void OnTick() {
         ++tickCount_;
+
+        // Elapsed turn time changes even when the IPC state itself does not.
+        // Refresh its taskbar/hover presentation once per second while timing
+        // information is available.
+        if (threadMetrics_.hasTurnTiming && threadMetrics_.activeTurn) {
+            InvalidateWidget();
+            if (hoverPopupVisible_) {
+                UpdateTooltipText();
+            }
+        }
+
         if ((tickCount_ % 2) != 1 && codexRunningKnown_) {
             if (widgetVisible_) {
                 PositionWidget();
@@ -535,6 +592,7 @@ public:
         if (verticalTaskbar_) {
             const std::wstring first = FirstLine();
             const std::wstring second = SecondLine();
+            const std::wstring duration = TaskDurationLine();
             const bool diffVisible = IsDiffRowVisible();
 
             struct Row {
@@ -544,6 +602,7 @@ public:
             std::vector<Row> rows;
             if (!first.empty()) rows.push_back({0, first});
             if (!second.empty()) rows.push_back({0, second});
+            if (!duration.empty()) rows.push_back({0, duration});
             if (diffVisible) rows.push_back({1, {}});
 
             if (rows.empty()) rows.push_back({0, L""});
@@ -715,7 +774,7 @@ public:
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             470,
-            430,
+            455,
             mainWindow_,
             nullptr,
             instance_,
@@ -773,44 +832,45 @@ public:
         checkbox(kCheckShowCache, L"Cache命中率", 24, 128, showCache_);
         checkbox(kCheckShowDiff, L"代码改动", 210, 128, showDiff_, 100);
         checkbox(kCheckShowDiffFiles, L"显示文件数", 318, 128, showDiffFiles_, 112);
+        checkbox(kCheckShowTaskDuration, L"任务耗时", 24, 153, showTaskDuration_);
 
         CreateWindowW(L"STATIC", L"会话来源：", WS_CHILD | WS_VISIBLE,
-            24, 166, 100, 22, hwnd, nullptr, instance_, nullptr);
+            24, 191, 100, 22, hwnd, nullptr, instance_, nullptr);
 
         HWND manualRadio = CreateWindowW(
             L"BUTTON", L"手动绑定 Thread ID", WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON | WS_GROUP,
-            24, 190, 180, 22, hwnd,
+            24, 215, 180, 22, hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kRadioManualThread)), instance_, nullptr);
         HWND autoRadio = CreateWindowW(
             L"BUTTON", L"自动跟随活动任务（实验）", WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON,
-            210, 190, 220, 22, hwnd,
+            210, 215, 220, 22, hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kRadioAutoThread)), instance_, nullptr);
         SendMessageW(manualRadio, BM_SETCHECK, automaticThreadMode_ ? BST_UNCHECKED : BST_CHECKED, 0);
         SendMessageW(autoRadio, BM_SETCHECK, automaticThreadMode_ ? BST_CHECKED : BST_UNCHECKED, 0);
 
         CreateWindowW(L"STATIC", L"Thread ID：", WS_CHILD | WS_VISIBLE,
-            24, 226, 80, 22, hwnd, nullptr, instance_, nullptr);
+            24, 251, 80, 22, hwnd, nullptr, instance_, nullptr);
         CreateWindowExW(
             WS_EX_CLIENTEDGE, L"EDIT", manualThreadId_.c_str(),
             WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-            104, 222, 326, 26, hwnd,
+            104, 247, 326, 26, hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kEditThreadId)), instance_, nullptr);
 
-        checkbox(kCheckAutoStart, L"开机自动启动", 24, 268, autoStart_);
+        checkbox(kCheckAutoStart, L"开机自动启动", 24, 293, autoStart_);
 
         CreateWindowW(
             L"STATIC",
             L"提示：隐藏的项目仍会在鼠标悬浮提示中显示完整信息。",
             WS_CHILD | WS_VISIBLE,
-            24, 302, 410, 22, hwnd, nullptr, instance_, nullptr);
+            24, 327, 410, 22, hwnd, nullptr, instance_, nullptr);
 
         CreateWindowW(
             L"BUTTON", L"确定", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            270, 344, 76, 28, hwnd,
+            270, 369, 76, 28, hwnd,
             reinterpret_cast<HMENU>(IDOK), instance_, nullptr);
         CreateWindowW(
             L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            358, 344, 76, 28, hwnd,
+            358, 369, 76, 28, hwnd,
             reinterpret_cast<HMENU>(IDCANCEL), instance_, nullptr);
 
         EnumChildWindows(
@@ -960,6 +1020,7 @@ public:
         showCache_ = checked(kCheckShowCache);
         showDiff_ = checked(kCheckShowDiff);
         showDiffFiles_ = checked(kCheckShowDiffFiles);
+        showTaskDuration_ = checked(kCheckShowTaskDuration);
         automaticThreadMode_ = checked(kRadioAutoThread);
 
         wchar_t threadText[256]{};
@@ -977,6 +1038,7 @@ public:
         WriteRegistryDword(L"ShowCache", showCache_ ? 1u : 0u);
         WriteRegistryDword(L"ShowDiff", showDiff_ ? 1u : 0u);
         WriteRegistryDword(L"ShowDiffFiles", showDiffFiles_ ? 1u : 0u);
+        WriteRegistryDword(L"ShowTaskDuration", showTaskDuration_ ? 1u : 0u);
         WriteRegistryDword(L"AutomaticThreadMode", automaticThreadMode_ ? 1u : 0u);
         WriteRegistryString(L"ManualThreadId", manualThreadId_);
         SetAutoStartRegistry(autoStart_);
@@ -1595,6 +1657,26 @@ private:
         return line;
     }
 
+    std::int64_t CurrentTaskDurationMs() const {
+        if (!threadMetrics_.hasTurnTiming) return -1;
+
+        if (threadMetrics_.activeTurn && threadMetrics_.turnStartedAtMs > 0) {
+            return std::max<std::int64_t>(
+                0,
+                CurrentUnixMilliseconds() - threadMetrics_.turnStartedAtMs);
+        }
+
+        if (threadMetrics_.turnDurationMs >= 0) {
+            return threadMetrics_.turnDurationMs;
+        }
+        return -1;
+    }
+
+    std::wstring TaskDurationLine() const {
+        if (!showTaskDuration_) return {};
+        return FormatDurationCompact(CurrentTaskDurationMs());
+    }
+
     bool IsDiffRowVisible() const {
         return showDiff_ && threadMetrics_.hasDiff &&
             (threadMetrics_.changedFiles > 0 ||
@@ -1606,6 +1688,7 @@ private:
         int rows = 0;
         if (!FirstLine().empty()) ++rows;
         if (!SecondLine().empty()) ++rows;
+        if (!TaskDurationLine().empty()) ++rows;
         if (IsDiffRowVisible()) ++rows;
         return rows;
     }
@@ -1618,6 +1701,11 @@ private:
         if (!second.empty()) {
             if (!result.empty()) result += L"  ";
             result += second;
+        }
+        const std::wstring duration = TaskDurationLine();
+        if (!duration.empty()) {
+            if (!result.empty()) result += L"  ";
+            result += duration;
         }
         if (IsDiffRowVisible()) {
             if (!result.empty()) result += L"  ";
@@ -1848,8 +1936,20 @@ private:
         }
 
         text += L"\r\n";
+        const std::int64_t taskDurationMs = CurrentTaskDurationMs();
+        if (taskDurationMs >= 0) {
+            text += L"任务耗时：" + FormatDurationVerbose(taskDurationMs);
+            if (threadMetrics_.activeTurn) {
+                text += L"（进行中）";
+            }
+        } else {
+            text += L"任务耗时：暂无";
+        }
+
+        text += L"\r\n";
         if (threadMetrics_.hasDiff) {
-            text += L"代码改动：" + std::to_wstring(threadMetrics_.changedFiles) +
+            text += threadMetrics_.diffExact ? L"代码改动：" : L"代码改动（实时估算）：";
+            text += std::to_wstring(threadMetrics_.changedFiles) +
                     L" 个文件 · +" + FormatInteger(threadMetrics_.addedLines) +
                     L" · -" + FormatInteger(threadMetrics_.removedLines);
         } else {
@@ -1898,7 +1998,7 @@ private:
         case kMenuAbout:
             MessageBoxW(
                 mainWindow_,
-                L"CodexTaskbar v0.2.5\n\n"
+                L"CodexTaskbar v0.2.6\n\n"
                 L"在 Windows 10 任务栏显示 Codex 配额、绑定会话上下文/缓存和本轮代码改动。\n"
                 L"配额来自官方 app-server；会话指标通过只读 Codex Desktop IPC follower 获取。",
                 L"关于 CodexTaskbar",
@@ -1957,7 +2057,9 @@ private:
                 }
 
                 QuotaSnapshot snapshot{};
+                bool quotaReadSucceeded = false;
                 if (client.ReadQuota(snapshot)) {
+                    quotaReadSucceeded = true;
                     auto* payload = new QuotaPayload{snapshot};
                     if (!PostMessageW(
                             mainWindow_,
@@ -1971,8 +2073,14 @@ private:
                     PostMessageW(mainWindow_, kQuotaErrorMessage, 0, 0);
                 }
 
+                // Normal refresh stays conservative at 60 s. Once a quota read
+                // fails, keep the visible "--" offline signal but retry every
+                // 5 s until a successful read restores the normal cadence.
+                const auto retryDelay = quotaReadSucceeded
+                    ? std::chrono::seconds(60)
+                    : std::chrono::seconds(5);
                 std::unique_lock lock(workerMutex_);
-                workerCv_.wait_for(lock, std::chrono::seconds(60), [this] {
+                workerCv_.wait_for(lock, retryDelay, [this] {
                     return workerStop_ || !workerActive_ || reconnectRequested_;
                 });
                 if (!workerActive_) {
@@ -2052,6 +2160,7 @@ private:
     bool showCache_{false};
     bool showDiff_{true};
     bool showDiffFiles_{true};
+    bool showTaskDuration_{false};
     bool automaticThreadMode_{false};
     int fontSize_{10};
     unsigned tickCount_{0};
