@@ -962,6 +962,17 @@ public:
                 GetWindowThreadProcessId(hwnd, &processId);
                 if (!IsCodexProcess(processId)) return TRUE;
 
+                // Electron can own hidden helper top-level windows. Only select
+                // a real visible/minimized Codex window with a plausible size.
+                if (!IsWindowVisible(hwnd) && !IsIconic(hwnd)) return TRUE;
+
+                RECT rect{};
+                if (!GetWindowRect(hwnd, &rect)) return TRUE;
+                if (!IsIconic(hwnd) &&
+                    (rect.right - rect.left < 120 || rect.bottom - rect.top < 80)) {
+                    return TRUE;
+                }
+
                 wchar_t title[256]{};
                 GetWindowTextW(hwnd, title, static_cast<int>(std::size(title)));
                 if (title[0] == L'\0' && !IsIconic(hwnd)) return TRUE;
