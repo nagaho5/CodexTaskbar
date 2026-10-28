@@ -1,3 +1,3 @@
-CodexTaskbar v0.1.2 release trigger
-source_commit=a7a611e560481c4b29d15b12ab86d359c1987e17
-reason=fix Codex Desktop detection
+CodexTaskbar v0.1.3 release trigger
+source_commit=758f98933097ce4118b6ed4e31e35d0618f0bfd3
+reason=overlay-only taskbar layout
