@@ -109,9 +109,28 @@ std::string ReadExactTurnDiff(const JsonValue& turn) {
     return {};
 }
 
+bool LooksLikeTurnEntity(const JsonValue& value) {
+    if (!value.IsObject()) return false;
+
+    const std::string id = StringField(value, {"turnId", "turn_id", "id"});
+    const std::string status = StringField(value, {"status", "state"});
+    if (id.empty() || status.empty()) return false;
+
+    // Thread items also have id/status fields. Require a field unique to the
+    // actual Turn shape so a trailing message/fileChange entity cannot be
+    // mistaken for a new turn and wipe the exact diff we just received.
+    return value.Find("items") != nullptr ||
+           value.Find("rootTurnId") != nullptr ||
+           value.Find("root_turn_id") != nullptr ||
+           value.Find("startedAt") != nullptr ||
+           value.Find("started_at") != nullptr ||
+           value.Find("completedAt") != nullptr ||
+           value.Find("completed_at") != nullptr;
+}
+
 const JsonValue* FindCanonicalLatestTurn(const JsonValue& conversation) {
-    // Current Codex Desktop stores the canonical ordered history here:
-    // turnHistory.history.islands[].entries[] -> entitiesByKey[entry.key].
+    // Current Codex Desktop stores ordered history here. entries[] can point to
+    // several entity types, so walk backward until an entity is actually a Turn.
     const JsonValue* turnHistory = conversation.Find("turnHistory");
     const JsonValue* history =
         turnHistory && turnHistory->IsObject() ? turnHistory->Find("history") : nullptr;
@@ -136,7 +155,7 @@ const JsonValue* FindCanonicalLatestTurn(const JsonValue& conversation) {
 
                 const auto& object = entities->AsObject();
                 const auto found = object.find(key);
-                if (found != object.end() && found->second.IsObject()) {
+                if (found != object.end() && LooksLikeTurnEntity(found->second)) {
                     return &found->second;
                 }
             }
@@ -147,7 +166,7 @@ const JsonValue* FindCanonicalLatestTurn(const JsonValue& conversation) {
     const JsonValue* turns = conversation.Find("turns");
     if (turns && turns->IsArray() && !turns->AsArray().empty()) {
         for (auto it = turns->AsArray().rbegin(); it != turns->AsArray().rend(); ++it) {
-            if (it->IsObject()) return &*it;
+            if (LooksLikeTurnEntity(*it)) return &*it;
         }
     }
 
@@ -560,6 +579,52 @@ void DesktopThreadMonitor::ProcessFrame(const std::string& json) {
     if (type != "broadcast") return;
     const std::string method = StringField(*root, {"method"});
 
+    if (method == "turn/started") {
+        const JsonValue* params = root->Find("params");
+        if (!params || !params->IsObject()) return;
+
+        const std::string threadId = StringField(*params, {"threadId", "conversationId"});
+        const JsonValue* turn = params->Find("turn");
+        const std::string turnId =
+            turn && turn->IsObject() ? StringField(*turn, {"id", "turnId", "turn_id"}) : std::string();
+        if (threadId.empty() || !followed_.contains(threadId)) return;
+
+        ThreadState& state = states_[threadId];
+        if (!turnId.empty() && turnId != state.activeTurnId) {
+            state.activeTurnId = turnId;
+            state.hasLastDiff = false;
+            state.lastFiles = state.lastAdded = state.lastRemoved = 0;
+        }
+        state.hasTurnActivity = true;
+        state.turnActive = true;
+        state.updateSequence = ++updateSequence_;
+        SelectAndPublish();
+        return;
+    }
+
+    if (method == "turn/completed") {
+        const JsonValue* params = root->Find("params");
+        if (!params || !params->IsObject()) return;
+
+        const std::string threadId = StringField(*params, {"threadId", "conversationId"});
+        const JsonValue* turn = params->Find("turn");
+        const std::string turnId =
+            turn && turn->IsObject() ? StringField(*turn, {"id", "turnId", "turn_id"}) : std::string();
+        if (threadId.empty() || !followed_.contains(threadId)) return;
+
+        ThreadState& state = states_[threadId];
+        if (state.activeTurnId.empty() && !turnId.empty()) {
+            state.activeTurnId = turnId;
+        }
+        if (turnId.empty() || state.activeTurnId.empty() || turnId == state.activeTurnId) {
+            state.hasTurnActivity = true;
+            state.turnActive = false;
+        }
+        state.updateSequence = ++updateSequence_;
+        SelectAndPublish();
+        return;
+    }
+
     if (method == "turn/diff/updated") {
         const JsonValue* params = root->Find("params");
         if (!params || !params->IsObject()) return;
@@ -579,6 +644,8 @@ void DesktopThreadMonitor::ProcessFrame(const std::string& json) {
             state.lastFiles = state.lastAdded = state.lastRemoved = 0;
         }
         if (!turnId.empty()) state.activeTurnId = turnId;
+        state.hasTurnActivity = true;
+        state.turnActive = true;
 
         CountUnifiedDiff(
             diffValue->AsString(),
@@ -850,30 +917,44 @@ ThreadMetrics DesktopThreadMonitor::DeriveMetrics(const std::string& threadId, T
     if (latestTurn) {
         const std::string turnId = StringField(*latestTurn, {"turnId", "turn_id", "id"});
         const std::string status = StringField(*latestTurn, {"status", "state"});
+        const bool snapshotActive = IsActiveStatus(status);
 
-        metrics.turnId = turnId;
-        metrics.activeTurn = IsActiveStatus(status);
-
-        // A new turn must never inherit the previous turn's diff.
-        if (!turnId.empty() && turnId != state.activeTurnId) {
+        // Live turn/* notifications are authoritative once observed. A follower
+        // snapshot may briefly lag behind them; never let a stale history entity
+        // erase the exact aggregate received from turn/diff/updated.
+        if (state.activeTurnId.empty() && !turnId.empty()) {
+            state.activeTurnId = turnId;
+        } else if (!turnId.empty() && turnId != state.activeTurnId &&
+                   snapshotActive && (!state.hasTurnActivity || !state.turnActive)) {
+            // Recovery path when CodexTaskbar attached after turn/started.
             state.activeTurnId = turnId;
             state.hasLastDiff = false;
             state.lastFiles = state.lastAdded = state.lastRemoved = 0;
+            state.hasTurnActivity = false;
         }
 
-        const std::string exactDiff = ReadExactTurnDiff(*latestTurn);
-        if (!exactDiff.empty()) {
-            CountUnifiedDiff(
-                exactDiff,
-                state.lastFiles,
-                state.lastAdded,
-                state.lastRemoved);
-            state.hasLastDiff =
-                state.lastFiles > 0 || state.lastAdded > 0 || state.lastRemoved > 0;
+        metrics.turnId = state.activeTurnId.empty() ? turnId : state.activeTurnId;
+        metrics.activeTurn = state.hasTurnActivity
+            ? state.turnActive
+            : (turnId == state.activeTurnId && snapshotActive);
+
+        // Snapshot hydration is useful when the taskbar starts mid-turn or after
+        // completion, but only for the same confirmed Turn.
+        if (state.activeTurnId.empty() || turnId == state.activeTurnId) {
+            const std::string exactDiff = ReadExactTurnDiff(*latestTurn);
+            if (!exactDiff.empty()) {
+                CountUnifiedDiff(
+                    exactDiff,
+                    state.lastFiles,
+                    state.lastAdded,
+                    state.lastRemoved);
+                state.hasLastDiff =
+                    state.lastFiles > 0 || state.lastAdded > 0 || state.lastRemoved > 0;
+            }
         }
-        // If the same turn temporarily omits diff during a patch transition,
-        // retain the last exact turn-level aggregate. We never substitute
-        // per-file patch fragments.
+    } else if (state.hasTurnActivity) {
+        metrics.turnId = state.activeTurnId;
+        metrics.activeTurn = state.turnActive;
     }
 
     if (state.hasLastDiff) {
