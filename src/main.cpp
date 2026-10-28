@@ -9,7 +9,9 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <ctime>
 #include <cwchar>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -776,8 +778,9 @@ private:
         data.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
         wcscpy_s(data.szTip, L"CodexTaskbar");
         Shell_NotifyIconW(NIM_ADD, &data);
-        data.uVersion = NOTIFYICON_VERSION_4;
-        Shell_NotifyIconW(NIM_SETVERSION, &data);
+        // Keep the legacy callback contract: lParam is the mouse message itself.
+        // NOTIFYICON_VERSION_4 repacks the event into LOWORD/HIWORD and adds no
+        // value for this deliberately tiny context-menu-only tray icon.
         trayAdded_ = true;
     }
 
