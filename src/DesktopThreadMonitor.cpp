@@ -957,6 +957,18 @@ ThreadMetrics DesktopThreadMonitor::DeriveMetrics(const std::string& threadId, T
             ? state.turnActive
             : (turnId == state.activeTurnId && snapshotActive);
 
+        const std::int64_t turnStartedAtMs =
+            IntegerField(*latestTurn, {"turnStartedAtMs", "turn_started_at_ms"}, 0);
+        const std::int64_t firstWorkItemStartedAtMs =
+            IntegerField(*latestTurn, {"firstTurnWorkItemStartedAtMs", "first_turn_work_item_started_at_ms"}, 0);
+        const std::int64_t durationMs =
+            IntegerField(*latestTurn, {"durationMs", "duration_ms"}, -1);
+        metrics.turnStartedAtMs =
+            turnStartedAtMs > 0 ? turnStartedAtMs : firstWorkItemStartedAtMs;
+        metrics.turnDurationMs = durationMs;
+        metrics.hasTurnTiming =
+            metrics.turnStartedAtMs > 0 || metrics.turnDurationMs >= 0;
+
         // Snapshot hydration is useful when the taskbar starts mid-turn or after
         // completion, but only for the same confirmed Turn.
         if (state.activeTurnId.empty() || turnId == state.activeTurnId) {
