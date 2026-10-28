@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <ctime>
 #include <cwchar>
+#include <cwctype>
 #include <iterator>
 #include <memory>
 #include <mutex>
@@ -89,7 +90,7 @@ bool IsCodexDesktopRunning() {
             DWORD length = static_cast<DWORD>(std::size(imagePath));
             if (QueryFullProcessImageNameW(process, 0, imagePath, &length) && length > 0) {
                 std::wstring path(imagePath, length);
-                std::transform(path.begin(), path.end(), path.begin(), towlower);
+                std::transform(path.begin(), path.end(), path.begin(), [](wchar_t ch) { return static_cast<wchar_t>(std::towlower(ch)); });
 
                 if (path.find(L"\\windowsapps\\openai.codex_") != std::wstring::npos ||
                     path.find(L"\\openai\\codex\\") != std::wstring::npos) {
