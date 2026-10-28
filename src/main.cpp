@@ -67,59 +67,67 @@ std::wstring ModulePath() {
     return len > 0 ? std::wstring(buffer, len) : std::wstring();
 }
 
-bool IsCodexDesktopRunning() {
-    // Fast path: Codex Desktop exposes this pipe while its app-server bridge is alive.
-    // WaitNamedPipe does not connect to or consume the pipe; it only checks availability.
-    if (WaitNamedPipeW(L"\\\\.\\pipe\\codex-ipc", 0)) {
-        return true;
-    }
+bool IsCodexProcess(DWORD processId) {
+    if (processId == 0) return false;
 
-    // Windows Store/MSIX Codex currently runs its Electron shell as ChatGPT.exe
-    // inside ...\\WindowsApps\\OpenAI.Codex_<version>_...\\app\\ChatGPT.exe.
-    // Older/dev builds may use Codex.exe, so keep that candidate too.
-    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snapshot == INVALID_HANDLE_VALUE) {
-        return false;
-    }
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
+    if (!process) return false;
 
-    PROCESSENTRY32W entry{};
-    entry.dwSize = sizeof(entry);
-    bool found = false;
+    wchar_t imagePath[32768]{};
+    DWORD length = static_cast<DWORD>(std::size(imagePath));
+    const bool queried =
+        QueryFullProcessImageNameW(process, 0, imagePath, &length) && length > 0;
+    CloseHandle(process);
+    if (!queried) return false;
 
-    if (Process32FirstW(snapshot, &entry)) {
-        do {
-            const bool candidate =
-                _wcsicmp(entry.szExeFile, L"ChatGPT.exe") == 0 ||
-                _wcsicmp(entry.szExeFile, L"Codex.exe") == 0;
-            if (!candidate) {
-                continue;
+    std::wstring path(imagePath, length);
+    std::transform(path.begin(), path.end(), path.begin(), [](wchar_t ch) {
+        return static_cast<wchar_t>(std::towlower(ch));
+    });
+
+    return path.find(L"\\windowsapps\\openai.codex_") != std::wstring::npos ||
+           path.find(L"\\openai\\codex\\") != std::wstring::npos;
+}
+
+bool IsCodexDesktopWindowOpen() {
+    // The Codex MSIX package can leave background processes and codex-ipc alive
+    // after the user closes the Desktop window. Visibility therefore follows an
+    // actual top-level Codex window rather than process/pipe lifetime.
+    struct SearchState {
+        bool found{false};
+    } state;
+
+    EnumWindows(
+        [](HWND hwnd, LPARAM value) -> BOOL {
+            auto* state = reinterpret_cast<SearchState*>(value);
+            if (!IsWindowVisible(hwnd) || GetWindow(hwnd, GW_OWNER) != nullptr) {
+                return TRUE;
             }
 
-            HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ProcessID);
-            if (!process) {
-                continue;
+            const LONG_PTR exStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            if ((exStyle & WS_EX_TOOLWINDOW) != 0) {
+                return TRUE;
             }
 
-            wchar_t imagePath[32768]{};
-            DWORD length = static_cast<DWORD>(std::size(imagePath));
-            if (QueryFullProcessImageNameW(process, 0, imagePath, &length) && length > 0) {
-                std::wstring path(imagePath, length);
-                std::transform(path.begin(), path.end(), path.begin(), [](wchar_t ch) { return static_cast<wchar_t>(std::towlower(ch)); });
-
-                if (path.find(L"\\windowsapps\\openai.codex_") != std::wstring::npos ||
-                    path.find(L"\\openai\\codex\\") != std::wstring::npos) {
-                    found = true;
-                    CloseHandle(process);
-                    break;
-                }
+            RECT rect{};
+            if (!GetWindowRect(hwnd, &rect) ||
+                rect.right - rect.left < 120 ||
+                rect.bottom - rect.top < 80) {
+                return TRUE;
             }
 
-            CloseHandle(process);
-        } while (Process32NextW(snapshot, &entry));
-    }
+            DWORD processId = 0;
+            GetWindowThreadProcessId(hwnd, &processId);
+            if (!IsCodexProcess(processId)) {
+                return TRUE;
+            }
 
-    CloseHandle(snapshot);
-    return found;
+            state->found = true;
+            return FALSE;
+        },
+        reinterpret_cast<LPARAM>(&state));
+
+    return state.found;
 }
 
 HWND FindDescendantByTitle(HWND root, const wchar_t* title) {
@@ -444,7 +452,7 @@ public:
             return;
         }
 
-        const bool running = IsCodexDesktopRunning();
+        const bool running = IsCodexDesktopWindowOpen();
         codexRunningKnown_ = true;
         if (running != codexRunning_) {
             codexRunning_ = running;
@@ -908,9 +916,33 @@ private:
             }
             break;
 
+        case WM_MOUSEMOVE:
+        case WM_LBUTTONDOWN:
+        case WM_LBUTTONUP:
+        case WM_MBUTTONDOWN:
+        case WM_MBUTTONUP:
+            if (app) {
+                app->RelayTooltipEvent(hwnd, message, wParam, lParam);
+            }
+            break;
+
+        case WM_MOUSELEAVE:
+            if (app) {
+                app->HideTooltip();
+            }
+            return 0;
+
+        case WM_RBUTTONDOWN:
+            if (app) {
+                app->RelayTooltipEvent(hwnd, message, wParam, lParam);
+                app->HideTooltip();
+            }
+            break;
+
         case WM_RBUTTONUP:
         case WM_CONTEXTMENU:
             if (app) {
+                app->HideTooltip();
                 app->ShowContextMenu();
                 return 0;
             }
@@ -1210,10 +1242,12 @@ private:
                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
         }
 
+        UpdateTooltipRect();
         InvalidateWidget();
     }
 
     void HideWidget() {
+        HideTooltip();
         if (widgetWindow_ && IsWindow(widgetWindow_)) {
             ShowWindow(widgetWindow_, SW_HIDE);
         }
@@ -1301,15 +1335,18 @@ private:
 
     void EnsureTooltip() {
         if (!widgetWindow_ || !IsWindow(widgetWindow_)) return;
-        if (tooltipWindow_ && IsWindow(tooltipWindow_)) return;
+        if (tooltipWindow_ && IsWindow(tooltipWindow_)) {
+            UpdateTooltipRect();
+            return;
+        }
 
         tooltipWindow_ = CreateWindowExW(
-            WS_EX_TOPMOST,
+            WS_EX_TOPMOST | WS_EX_NOACTIVATE,
             TOOLTIPS_CLASSW,
             nullptr,
             WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
             CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
-            mainWindow_,
+            widgetWindow_,
             nullptr,
             instance_,
             nullptr);
@@ -1325,12 +1362,66 @@ private:
 
         TOOLINFOW info{};
         info.cbSize = sizeof(info);
-        info.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
-        info.hwnd = GetParent(widgetWindow_);
-        info.uId = reinterpret_cast<UINT_PTR>(widgetWindow_);
+        info.hwnd = widgetWindow_;
+        info.uId = 1;
+        GetClientRect(widgetWindow_, &info.rect);
         info.lpszText = tooltipBuffer_.data();
         SendMessageW(tooltipWindow_, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&info));
-        SendMessageW(tooltipWindow_, TTM_SETMAXTIPWIDTH, 0, 480);
+        SendMessageW(tooltipWindow_, TTM_SETMAXTIPWIDTH, 0, 520);
+        SendMessageW(tooltipWindow_, TTM_SETDELAYTIME, TTDT_INITIAL, 250);
+        SendMessageW(tooltipWindow_, TTM_SETDELAYTIME, TTDT_RESHOW, 100);
+        SendMessageW(tooltipWindow_, TTM_SETDELAYTIME, TTDT_AUTOPOP, 20000);
+        SendMessageW(tooltipWindow_, TTM_ACTIVATE, TRUE, 0);
+    }
+
+    void UpdateTooltipRect() {
+        if (!tooltipWindow_ || !IsWindow(tooltipWindow_) ||
+            !widgetWindow_ || !IsWindow(widgetWindow_)) {
+            return;
+        }
+
+        TOOLINFOW info{};
+        info.cbSize = sizeof(info);
+        info.hwnd = widgetWindow_;
+        info.uId = 1;
+        GetClientRect(widgetWindow_, &info.rect);
+        SendMessageW(
+            tooltipWindow_,
+            TTM_NEWTOOLRECTW,
+            0,
+            reinterpret_cast<LPARAM>(&info));
+    }
+
+    void RelayTooltipEvent(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
+        EnsureTooltip();
+        if (!tooltipWindow_ || !IsWindow(tooltipWindow_)) return;
+
+        if (message == WM_MOUSEMOVE) {
+            TRACKMOUSEEVENT tracking{};
+            tracking.cbSize = sizeof(tracking);
+            tracking.dwFlags = TME_LEAVE;
+            tracking.hwndTrack = hwnd;
+            TrackMouseEvent(&tracking);
+        }
+
+        MSG relay{};
+        relay.hwnd = hwnd;
+        relay.message = message;
+        relay.wParam = wParam;
+        relay.lParam = lParam;
+        relay.time = static_cast<DWORD>(GetMessageTime());
+        GetCursorPos(&relay.pt);
+        SendMessageW(
+            tooltipWindow_,
+            TTM_RELAYEVENT,
+            0,
+            reinterpret_cast<LPARAM>(&relay));
+    }
+
+    void HideTooltip() {
+        if (tooltipWindow_ && IsWindow(tooltipWindow_)) {
+            SendMessageW(tooltipWindow_, TTM_POP, 0, 0);
+        }
     }
 
     void UpdateTooltipText() {
@@ -1389,14 +1480,18 @@ private:
 
         wcsncpy_s(tooltipBuffer_.data(), tooltipBuffer_.size(), text.c_str(), _TRUNCATE);
 
-        if (tooltipWindow_ && IsWindow(tooltipWindow_) && widgetWindow_ && IsWindow(widgetWindow_)) {
+        if (tooltipWindow_ && IsWindow(tooltipWindow_) &&
+            widgetWindow_ && IsWindow(widgetWindow_)) {
             TOOLINFOW info{};
             info.cbSize = sizeof(info);
-            info.uFlags = TTF_IDISHWND;
-            info.hwnd = GetParent(widgetWindow_);
-            info.uId = reinterpret_cast<UINT_PTR>(widgetWindow_);
+            info.hwnd = widgetWindow_;
+            info.uId = 1;
             info.lpszText = tooltipBuffer_.data();
-            SendMessageW(tooltipWindow_, TTM_UPDATETIPTEXTW, 0, reinterpret_cast<LPARAM>(&info));
+            SendMessageW(
+                tooltipWindow_,
+                TTM_UPDATETIPTEXTW,
+                0,
+                reinterpret_cast<LPARAM>(&info));
         }
     }
 
@@ -1425,7 +1520,7 @@ private:
         case kMenuAbout:
             MessageBoxW(
                 mainWindow_,
-                L"CodexTaskbar v0.2.1\n\n"
+                L"CodexTaskbar v0.2.2\n\n"
                 L"在 Windows 10 任务栏显示 Codex 配额、绑定会话上下文/缓存和本轮代码改动。\n"
                 L"配额来自官方 app-server；会话指标通过只读 Codex Desktop IPC follower 获取。",
                 L"关于 CodexTaskbar",
