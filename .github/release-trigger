@@ -1,3 +1,3 @@
-tag=v0.3.1
-source_commit=bfd363d4c88383a93a0423c6260676aba470f370
-reason=diagnostic-only renderer activity watcher comparing Codex UI active thread against IPC-selected thread
+tag=v0.3.2
+source_commit=57ce8819ad478ea291a8bbe797e632431366fa6a
+reason=fix Windows renderer diagnostic log discovery for dated codex-desktop session logs
