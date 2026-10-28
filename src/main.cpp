@@ -112,35 +112,56 @@ bool IsCodexProcess(DWORD processId) {
            path.find(L"\\openai\\codex\\") != std::wstring::npos;
 }
 
-bool IsCodexDesktopRunning() {
-    // The Store/MSIX build currently uses ChatGPT.exe as its Electron shell.
-    // Keep the taskbar widget visible while that Codex package process exists,
-    // including when its window is minimized. Do not use codex-ipc lifetime:
-    // the pipe may outlive the UI after Codex has actually exited.
-    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snapshot == INVALID_HANDLE_VALUE) {
-        return false;
-    }
+HWND FindCodexMainWindow() {
+    struct SearchState {
+        HWND window{nullptr};
+    } state;
 
-    PROCESSENTRY32W entry{};
-    entry.dwSize = sizeof(entry);
-    bool found = false;
+    EnumWindows(
+        [](HWND hwnd, LPARAM value) -> BOOL {
+            auto* state = reinterpret_cast<SearchState*>(value);
 
-    if (Process32FirstW(snapshot, &entry)) {
-        do {
-            const bool candidate =
-                _wcsicmp(entry.szExeFile, L"ChatGPT.exe") == 0 ||
-                _wcsicmp(entry.szExeFile, L"Codex.exe") == 0 ||
-                _wcsicmp(entry.szExeFile, L"OpenAI.Codex.exe") == 0;
-            if (candidate && IsCodexProcess(entry.th32ProcessID)) {
-                found = true;
-                break;
+            // Only consider real top-level application windows. Electron may
+            // leave helper/background processes and hidden utility windows alive
+            // after the user closes the Codex Desktop window.
+            if (GetWindow(hwnd, GW_OWNER) != nullptr) return TRUE;
+
+            const LONG_PTR exStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            if ((exStyle & WS_EX_TOOLWINDOW) != 0) return TRUE;
+
+            DWORD processId = 0;
+            GetWindowThreadProcessId(hwnd, &processId);
+            if (!IsCodexProcess(processId)) return TRUE;
+
+            // A minimized main window still counts as open. A fully hidden
+            // non-minimized helper window does not.
+            if (!IsWindowVisible(hwnd) && !IsIconic(hwnd)) return TRUE;
+
+            RECT rect{};
+            if (!GetWindowRect(hwnd, &rect)) return TRUE;
+            if (!IsIconic(hwnd) &&
+                (rect.right - rect.left < 120 || rect.bottom - rect.top < 80)) {
+                return TRUE;
             }
-        } while (Process32NextW(snapshot, &entry));
-    }
 
-    CloseHandle(snapshot);
-    return found;
+            wchar_t title[256]{};
+            GetWindowTextW(hwnd, title, static_cast<int>(std::size(title)));
+            if (title[0] == L'\0' && !IsIconic(hwnd)) return TRUE;
+
+            state->window = hwnd;
+            return FALSE;
+        },
+        reinterpret_cast<LPARAM>(&state));
+
+    return state.window;
+}
+
+bool IsCodexDesktopRunning() {
+    // Visibility follows the lifetime of the real Codex Desktop window, not
+    // package-process lifetime. This keeps the widget visible when Codex is
+    // minimized, while still hiding it when the window is closed even if
+    // ChatGPT.exe/Codex.exe background processes remain alive.
+    return FindCodexMainWindow() != nullptr;
 }
 
 HWND FindDescendantByTitle(HWND root, const wchar_t* title) {
@@ -946,49 +967,15 @@ public:
     }
 
     void ActivateCodexWindow() {
-        struct SearchState {
-            HWND window{nullptr};
-        } state;
+        HWND window = FindCodexMainWindow();
+        if (!window) return;
 
-        EnumWindows(
-            [](HWND hwnd, LPARAM value) -> BOOL {
-                auto* state = reinterpret_cast<SearchState*>(value);
-                if (GetWindow(hwnd, GW_OWNER) != nullptr) return TRUE;
-
-                const LONG_PTR exStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-                if ((exStyle & WS_EX_TOOLWINDOW) != 0) return TRUE;
-
-                DWORD processId = 0;
-                GetWindowThreadProcessId(hwnd, &processId);
-                if (!IsCodexProcess(processId)) return TRUE;
-
-                // Electron can own hidden helper top-level windows. Only select
-                // a real visible/minimized Codex window with a plausible size.
-                if (!IsWindowVisible(hwnd) && !IsIconic(hwnd)) return TRUE;
-
-                RECT rect{};
-                if (!GetWindowRect(hwnd, &rect)) return TRUE;
-                if (!IsIconic(hwnd) &&
-                    (rect.right - rect.left < 120 || rect.bottom - rect.top < 80)) {
-                    return TRUE;
-                }
-
-                wchar_t title[256]{};
-                GetWindowTextW(hwnd, title, static_cast<int>(std::size(title)));
-                if (title[0] == L'\0' && !IsIconic(hwnd)) return TRUE;
-
-                state->window = hwnd;
-                return FALSE;
-            },
-            reinterpret_cast<LPARAM>(&state));
-
-        if (!state.window) return;
-        if (IsIconic(state.window)) {
-            ShowWindow(state.window, SW_RESTORE);
+        if (IsIconic(window)) {
+            ShowWindow(window, SW_RESTORE);
         } else {
-            ShowWindow(state.window, SW_SHOW);
+            ShowWindow(window, SW_SHOW);
         }
-        SetForegroundWindow(state.window);
+        SetForegroundWindow(window);
     }
 
     void ShowContextMenu() {
@@ -2406,7 +2393,7 @@ private:
         case kMenuAbout:
             MessageBoxW(
                 mainWindow_,
-                L"CodexTaskbar v0.2.8\n\n"
+                L"CodexTaskbar v0.2.9\n\n"
                 L"在 Windows 10 任务栏显示 Codex 配额、绑定会话上下文/缓存和本轮代码改动。\n"
                 L"配额来自官方 app-server；会话指标通过只读 Codex Desktop IPC follower 获取。",
                 L"关于 CodexTaskbar",
