@@ -134,6 +134,37 @@ std::string ExtractLatestAggregatedDiff(const JsonValue* value, int depth = 0) {
     return {};
 }
 
+std::string FindTurnDiffItemUnifiedDiff(const JsonValue& turnObject) {
+    const JsonValue* items = turnObject.Find("items");
+    if (!items || !items->IsArray()) return {};
+
+    for (auto it = items->AsArray().rbegin(); it != items->AsArray().rend(); ++it) {
+        if (!it->IsObject()) continue;
+        std::string type = StringField(*it, {"type"});
+        type.erase(
+            std::remove_if(type.begin(), type.end(), [](char ch) {
+                return ch == '-' || ch == '_' || ch == '/' || ch == ' ';
+            }),
+            type.end());
+        std::transform(type.begin(), type.end(), type.begin(), [](unsigned char ch) {
+            return static_cast<char>(std::tolower(ch));
+        });
+        if (type != "turndiff") continue;
+
+        if (const JsonValue* unified = it->Find("unifiedDiff"); unified && unified->IsString()) {
+            return unified->AsString();
+        }
+        if (const JsonValue* unified = it->Find("unified_diff"); unified && unified->IsString()) {
+            return unified->AsString();
+        }
+        if (const JsonValue* diff = it->Find("diff"); diff && diff->IsString()) {
+            return diff->AsString();
+        }
+    }
+
+    return {};
+}
+
 void FindTurnViews(const JsonValue& value, std::vector<TurnView>& output, int depth = 0) {
     if (depth > 18) return;
     if (value.IsObject()) {
@@ -148,6 +179,9 @@ void FindTurnViews(const JsonValue& value, std::vector<TurnView>& output, int de
             turn.id = id;
             turn.status = status;
             turn.diff = ExtractLatestAggregatedDiff(diffValue);
+            if (turn.diff.empty()) {
+                turn.diff = FindTurnDiffItemUnifiedDiff(value);
+            }
             output.push_back(std::move(turn));
         }
 
