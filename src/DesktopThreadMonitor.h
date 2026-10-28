@@ -36,6 +36,7 @@ struct ThreadMetrics {
     std::int64_t turnDurationMs{-1};
 
     bool hasDiff{false};
+    bool diffExact{false};
     int changedFiles{0};
     int addedLines{0};
     int removedLines{0};
