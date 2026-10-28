@@ -1326,7 +1326,7 @@ private:
         TOOLINFOW info{};
         info.cbSize = sizeof(info);
         info.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
-        info.hwnd = mainWindow_;
+        info.hwnd = GetParent(widgetWindow_);
         info.uId = reinterpret_cast<UINT_PTR>(widgetWindow_);
         info.lpszText = tooltipBuffer_.data();
         SendMessageW(tooltipWindow_, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&info));
@@ -1393,7 +1393,7 @@ private:
             TOOLINFOW info{};
             info.cbSize = sizeof(info);
             info.uFlags = TTF_IDISHWND;
-            info.hwnd = mainWindow_;
+            info.hwnd = GetParent(widgetWindow_);
             info.uId = reinterpret_cast<UINT_PTR>(widgetWindow_);
             info.lpszText = tooltipBuffer_.data();
             SendMessageW(tooltipWindow_, TTM_UPDATETIPTEXTW, 0, reinterpret_cast<LPARAM>(&info));
