@@ -91,7 +91,14 @@ bool LooksLikeThreadId(std::string_view value) {
 } // namespace
 
 void RendererActivityMonitor::Poll() {
-    const std::filesystem::path candidate = FindLogFile();
+    std::filesystem::path candidate = logPath_;
+
+    std::error_code existenceEc;
+    if (candidate.empty() ||
+        !std::filesystem::is_regular_file(candidate, existenceEc)) {
+        candidate = FindLogFile();
+    }
+
     if (candidate.empty()) {
         state_.logAvailable = false;
         ApplyPendingInactive();
