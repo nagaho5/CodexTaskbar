@@ -474,12 +474,14 @@ public:
         quota_ = snapshot;
         quotaValid_ = true;
         InvalidateWidget();
+        UpdateTooltipText();
         UpdateTrayTip();
     }
 
     void MarkQuotaUnavailable() {
         quotaValid_ = false;
         InvalidateWidget();
+        UpdateTooltipText();
         UpdateTrayTip();
     }
 
