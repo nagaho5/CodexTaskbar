@@ -1948,7 +1948,8 @@ private:
 
         text += L"\r\n";
         if (threadMetrics_.hasDiff) {
-            text += L"代码改动：" + std::to_wstring(threadMetrics_.changedFiles) +
+            text += threadMetrics_.diffExact ? L"代码改动：" : L"代码改动（实时估算）：";
+            text += std::to_wstring(threadMetrics_.changedFiles) +
                     L" 个文件 · +" + FormatInteger(threadMetrics_.addedLines) +
                     L" · -" + FormatInteger(threadMetrics_.removedLines);
         } else {
