@@ -77,6 +77,7 @@ constexpr COLORREF kWarningRed = RGB(242, 88, 88);
 struct ColoredSegment {
     std::wstring text;
     COLORREF color{RGB(255, 255, 255)};
+    bool workingUnderline{false};
 };
 
 struct QuotaPayload {
@@ -678,6 +679,19 @@ public:
                 y,
                 segments[i].text.c_str(),
                 static_cast<int>(segments[i].text.size()));
+
+            if (segments[i].workingUnderline && sizes[i].cx > 0) {
+                const int underlineY = std::min(
+                    static_cast<int>(row.bottom) - 1,
+                    y + static_cast<int>(tm.tmHeight));
+                HPEN pen = CreatePen(PS_SOLID, 1, workingColor_);
+                HGDIOBJ oldPen = pen ? SelectObject(dc, pen) : nullptr;
+                MoveToEx(dc, x, underlineY, nullptr);
+                LineTo(dc, x + sizes[i].cx, underlineY);
+                if (oldPen) SelectObject(dc, oldPen);
+                if (pen) DeleteObject(pen);
+            }
+
             x += sizes[i].cx;
         }
         SetTextColor(dc, RGB(255, 255, 255));
@@ -712,6 +726,9 @@ public:
         std::vector<ColoredSegment> segments;
         if (showFiveHourPercent_) {
             const bool valid = quotaValid_ && quota_.fiveHour.valid;
+            const bool quotaWarning =
+                quotaWarningColors_ && valid &&
+                quota_.fiveHour.remainingPercent <= 20;
             segments.push_back({
                 valid
                     ? std::to_wstring(quota_.fiveHour.remainingPercent) + L"%"
@@ -719,7 +736,8 @@ public:
                 QuotaPercentColor(
                     quota_.fiveHour.remainingPercent,
                     valid,
-                    true)});
+                    true),
+                threadMetrics_.activeTurn && quotaWarning});
         }
         if (showFiveHourTime_) {
             segments.push_back({
@@ -763,11 +781,18 @@ public:
         }
         if (showContext_) {
             const bool valid = threadMetrics_.hasContext;
-            append(
+            const bool contextWarning =
+                contextWarningColors_ && valid &&
+                threadMetrics_.contextPercent >= 80;
+            if (!segments.empty()) {
+                segments.push_back({L" ", RGB(255, 255, 255), false});
+            }
+            segments.push_back({
                 valid
                     ? std::to_wstring(threadMetrics_.contextPercent) + L"%"
                     : L"--%",
-                ContextPercentColor(valid));
+                ContextPercentColor(valid),
+                threadMetrics_.activeTurn && contextWarning});
         }
         if (showCache_) {
             append(
