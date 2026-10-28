@@ -31,6 +31,10 @@ struct ThreadMetrics {
     std::int64_t inputTokens{0};
     std::int64_t cachedInputTokens{0};
 
+    bool hasTurnTiming{false};
+    std::int64_t turnStartedAtMs{0};
+    std::int64_t turnDurationMs{-1};
+
     bool hasDiff{false};
     int changedFiles{0};
     int addedLines{0};
