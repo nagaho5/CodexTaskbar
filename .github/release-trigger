@@ -1,2 +1,3 @@
-tag=v0.2.2
-reason=fix net turn diff hover window visibility and optional file count
+tag=v0.2.3
+source_commit=ea5b18d143a09c97de9ace475bd492e2acc1bfca
+reason=exact canonical turn diff and reliable tracked hover tooltip
