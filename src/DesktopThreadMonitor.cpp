@@ -86,47 +86,22 @@ const JsonValue* FindUsageObject(const JsonValue& value, int depth = 0) {
     return nullptr;
 }
 
-struct TurnView {
-    const JsonValue* object{nullptr};
-    std::string id;
-    std::string status;
-    std::string diff;
-};
+std::string ReadExactTurnDiff(const JsonValue& turn) {
+    const JsonValue* diff = turn.Find("diff");
+    if (!diff) return {};
 
-std::string ExtractLatestAggregatedDiff(const JsonValue* value, int depth = 0) {
-    if (!value || depth > 8) return {};
-
-    if (value->IsString()) {
-        return value->AsString();
+    // This is the field Codex Desktop itself updates from turn/diff/updated.
+    // Accept only a direct turn-level aggregate. Never recurse into fileChange
+    // fragments because those are intermediate edits, not the net turn diff.
+    if (diff->IsString()) {
+        return diff->AsString();
     }
 
-    if (value->IsArray()) {
-        const auto& array = value->AsArray();
-        for (auto it = array.rbegin(); it != array.rend(); ++it) {
-            std::string candidate = ExtractLatestAggregatedDiff(&*it, depth + 1);
-            if (!candidate.empty()) return candidate;
-        }
-        return {};
-    }
-
-    if (value->IsObject()) {
-        // Desktop's private turn.diff shape has changed across releases.
-        // Only inspect fields that can represent a turn-level aggregate; do NOT
-        // descend into per-file "changes", because summing those patch fragments
-        // does not equal Codex's net turn diff.
-        for (std::string_view key : {
-                 "unifiedDiff",
-                 "unified_diff",
-                 "latestUnifiedDiff",
-                 "latest_unified_diff",
-                 "outputDiff",
-                 "output_diff",
-                 "diff",
-                 "content",
-             }) {
-            if (const JsonValue* child = value->Find(key)) {
-                std::string candidate = ExtractLatestAggregatedDiff(child, depth + 1);
-                if (!candidate.empty()) return candidate;
+    if (diff->IsObject()) {
+        for (std::string_view key : {"unifiedDiff", "unified_diff"}) {
+            const JsonValue* unified = diff->Find(key);
+            if (unified && unified->IsString()) {
+                return unified->AsString();
             }
         }
     }
@@ -134,65 +109,49 @@ std::string ExtractLatestAggregatedDiff(const JsonValue* value, int depth = 0) {
     return {};
 }
 
-std::string FindTurnDiffItemUnifiedDiff(const JsonValue& turnObject) {
-    const JsonValue* items = turnObject.Find("items");
-    if (!items || !items->IsArray()) return {};
+const JsonValue* FindCanonicalLatestTurn(const JsonValue& conversation) {
+    // Current Codex Desktop stores the canonical ordered history here:
+    // turnHistory.history.islands[].entries[] -> entitiesByKey[entry.key].
+    const JsonValue* turnHistory = conversation.Find("turnHistory");
+    const JsonValue* history =
+        turnHistory && turnHistory->IsObject() ? turnHistory->Find("history") : nullptr;
+    const JsonValue* entities =
+        history && history->IsObject() ? history->Find("entitiesByKey") : nullptr;
+    const JsonValue* islands =
+        history && history->IsObject() ? history->Find("islands") : nullptr;
 
-    for (auto it = items->AsArray().rbegin(); it != items->AsArray().rend(); ++it) {
-        if (!it->IsObject()) continue;
-        std::string type = StringField(*it, {"type"});
-        type.erase(
-            std::remove_if(type.begin(), type.end(), [](char ch) {
-                return ch == '-' || ch == '_' || ch == '/' || ch == ' ';
-            }),
-            type.end());
-        std::transform(type.begin(), type.end(), type.begin(), [](unsigned char ch) {
-            return static_cast<char>(std::tolower(ch));
-        });
-        if (type != "turndiff") continue;
+    if (entities && entities->IsObject() && islands && islands->IsArray()) {
+        const auto& islandArray = islands->AsArray();
+        for (auto islandIt = islandArray.rbegin(); islandIt != islandArray.rend(); ++islandIt) {
+            if (!islandIt->IsObject()) continue;
+            const JsonValue* entries = islandIt->Find("entries");
+            if (!entries || !entries->IsArray()) continue;
 
-        if (const JsonValue* unified = it->Find("unifiedDiff"); unified && unified->IsString()) {
-            return unified->AsString();
-        }
-        if (const JsonValue* unified = it->Find("unified_diff"); unified && unified->IsString()) {
-            return unified->AsString();
-        }
-        if (const JsonValue* diff = it->Find("diff"); diff && diff->IsString()) {
-            return diff->AsString();
-        }
-    }
+            const auto& entryArray = entries->AsArray();
+            for (auto entryIt = entryArray.rbegin(); entryIt != entryArray.rend(); ++entryIt) {
+                if (!entryIt->IsObject()) continue;
+                std::string key = StringField(*entryIt, {"key"});
+                if (key.empty()) key = StringField(*entryIt, {"value"});
+                if (key.empty()) continue;
 
-    return {};
-}
-
-void FindTurnViews(const JsonValue& value, std::vector<TurnView>& output, int depth = 0) {
-    if (depth > 18) return;
-    if (value.IsObject()) {
-        const std::string status = StringField(value, {"status", "state"});
-        const std::string id = StringField(value, {"turnId", "turn_id", "id"});
-        const JsonValue* diffValue = value.Find("diff");
-
-        if ((!id.empty() || !status.empty()) &&
-            (diffValue || value.Find("items") || value.Find("params"))) {
-            TurnView turn;
-            turn.object = &value;
-            turn.id = id;
-            turn.status = status;
-            turn.diff = ExtractLatestAggregatedDiff(diffValue);
-            if (turn.diff.empty()) {
-                turn.diff = FindTurnDiffItemUnifiedDiff(value);
+                const auto& object = entities->AsObject();
+                const auto found = object.find(key);
+                if (found != object.end() && found->second.IsObject()) {
+                    return &found->second;
+                }
             }
-            output.push_back(std::move(turn));
-        }
-
-        for (const auto& [_, child] : value.AsObject()) {
-            FindTurnViews(child, output, depth + 1);
-        }
-    } else if (value.IsArray()) {
-        for (const JsonValue& child : value.AsArray()) {
-            FindTurnViews(child, output, depth + 1);
         }
     }
+
+    // Legacy Desktop state keeps ordered turns directly in an array.
+    const JsonValue* turns = conversation.Find("turns");
+    if (turns && turns->IsArray() && !turns->AsArray().empty()) {
+        for (auto it = turns->AsArray().rbegin(); it != turns->AsArray().rend(); ++it) {
+            if (it->IsObject()) return &*it;
+        }
+    }
+
+    return nullptr;
 }
 
 void CountUnifiedDiff(const std::string& diff, int& files, int& added, int& removed) {
@@ -887,53 +846,34 @@ ThreadMetrics DesktopThreadMonitor::DeriveMetrics(const std::string& threadId, T
         }
     }
 
-    std::vector<TurnView> turns;
-    FindTurnViews(state.document, turns);
+    const JsonValue* latestTurn = FindCanonicalLatestTurn(state.document);
+    if (latestTurn) {
+        const std::string turnId = StringField(*latestTurn, {"turnId", "turn_id", "id"});
+        const std::string status = StringField(*latestTurn, {"status", "state"});
 
-    const TurnView* active = nullptr;
-    const TurnView* latestWithAggregateDiff = nullptr;
-    for (const TurnView& turn : turns) {
-        if (IsActiveStatus(turn.status)) {
-            active = &turn;
-        }
-        if (!turn.diff.empty()) {
-            latestWithAggregateDiff = &turn;
-        }
-    }
+        metrics.turnId = turnId;
+        metrics.activeTurn = IsActiveStatus(status);
 
-    if (active) {
-        metrics.activeTurn = true;
-        metrics.turnId = active->id;
-
-        if (!active->id.empty() && active->id != state.activeTurnId) {
-            state.activeTurnId = active->id;
+        // A new turn must never inherit the previous turn's diff.
+        if (!turnId.empty() && turnId != state.activeTurnId) {
+            state.activeTurnId = turnId;
             state.hasLastDiff = false;
             state.lastFiles = state.lastAdded = state.lastRemoved = 0;
         }
 
-        if (!active->diff.empty()) {
+        const std::string exactDiff = ReadExactTurnDiff(*latestTurn);
+        if (!exactDiff.empty()) {
             CountUnifiedDiff(
-                active->diff,
+                exactDiff,
                 state.lastFiles,
                 state.lastAdded,
                 state.lastRemoved);
             state.hasLastDiff =
                 state.lastFiles > 0 || state.lastAdded > 0 || state.lastRemoved > 0;
         }
-    } else if (latestWithAggregateDiff) {
-        // Preserve the final turn-level net diff after the task completes, and
-        // also hydrate it if CodexTaskbar starts after the turn has finished.
-        metrics.turnId = latestWithAggregateDiff->id;
-        if (!latestWithAggregateDiff->id.empty()) {
-            state.activeTurnId = latestWithAggregateDiff->id;
-        }
-        CountUnifiedDiff(
-            latestWithAggregateDiff->diff,
-            state.lastFiles,
-            state.lastAdded,
-            state.lastRemoved);
-        state.hasLastDiff =
-            state.lastFiles > 0 || state.lastAdded > 0 || state.lastRemoved > 0;
+        // If the same turn temporarily omits diff during a patch transition,
+        // retain the last exact turn-level aggregate. We never substitute
+        // per-file patch fragments.
     }
 
     if (state.hasLastDiff) {
