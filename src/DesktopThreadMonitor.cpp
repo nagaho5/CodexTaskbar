@@ -50,15 +50,29 @@ bool IsActiveStatus(std::string value) {
            value == "writing";
 }
 
+const JsonValue* NormalizeUsageRoot(const JsonValue* candidate) {
+    if (!candidate || !candidate->IsObject()) return nullptr;
+
+    // Some Desktop builds keep the canonical ThreadTokenUsage under an "info"
+    // wrapper. Other builds expose it directly as latestTokenUsageInfo.
+    if (const JsonValue* info = candidate->Find("info"); info && info->IsObject()) {
+        candidate = info;
+    }
+
+    if (FindAny(*candidate, {"modelContextWindow", "model_context_window", "contextWindow", "context_window"}) ||
+        FindAny(*candidate, {"last", "lastTokenUsage", "last_token_usage"}) ||
+        FindAny(*candidate, {"total", "totalTokenUsage", "total_token_usage"})) {
+        return candidate;
+    }
+    return nullptr;
+}
+
 const JsonValue* FindUsageObject(const JsonValue& value, int depth = 0) {
     if (depth > 12) return nullptr;
     if (value.IsObject()) {
         for (std::string_view key : {"latestTokenUsageInfo", "tokenUsage", "token_usage"}) {
-            if (const JsonValue* candidate = value.Find(key); candidate && candidate->IsObject()) {
-                if (FindAny(*candidate, {"modelContextWindow", "model_context_window", "contextWindow", "context_window"}) ||
-                    FindAny(*candidate, {"last", "lastTokenUsage", "last_token_usage"})) {
-                    return candidate;
-                }
+            if (const JsonValue* normalized = NormalizeUsageRoot(value.Find(key))) {
+                return normalized;
             }
         }
         for (const auto& [_, child] : value.AsObject()) {
@@ -129,6 +143,70 @@ void CountUnifiedDiff(const std::string& diff, int& files, int& added, int& remo
 
         if (end == std::string::npos) break;
         start = end + 1;
+    }
+}
+
+
+void CountDiffLinesOnly(const std::string& diff, int& added, int& removed) {
+    std::size_t start = 0;
+    while (start <= diff.size()) {
+        const std::size_t end = diff.find('\n', start);
+        const std::string_view line(
+            diff.data() + start,
+            (end == std::string::npos ? diff.size() : end) - start);
+
+        if (line.starts_with("+") && !line.starts_with("+++")) {
+            ++added;
+        } else if (line.starts_with("-") && !line.starts_with("---")) {
+            ++removed;
+        }
+
+        if (end == std::string::npos) break;
+        start = end + 1;
+    }
+}
+
+void CollectFileChangeStats(
+    const JsonValue& value,
+    std::set<std::string, std::less<>>& files,
+    int& added,
+    int& removed,
+    int depth = 0) {
+    if (depth > 18) return;
+
+    if (value.IsObject()) {
+        std::string type = StringField(value, {"type", "kind"});
+        type.erase(
+            std::remove_if(type.begin(), type.end(), [](char ch) {
+                return ch == '-' || ch == '_' || ch == '/' || ch == ' ';
+            }),
+            type.end());
+        std::transform(type.begin(), type.end(), type.begin(), [](unsigned char ch) {
+            return static_cast<char>(std::tolower(ch));
+        });
+
+        if (type == "filechange") {
+            if (const JsonValue* changes = value.Find("changes"); changes && changes->IsArray()) {
+                for (const JsonValue& change : changes->AsArray()) {
+                    if (!change.IsObject()) continue;
+                    const std::string path = StringField(change, {"path"});
+                    if (!path.empty()) files.insert(path);
+                    const JsonValue* diff = change.Find("diff");
+                    if (diff && diff->IsString()) {
+                        CountDiffLinesOnly(diff->AsString(), added, removed);
+                    }
+                }
+            }
+            return;
+        }
+
+        for (const auto& [_, child] : value.AsObject()) {
+            CollectFileChangeStats(child, files, added, removed, depth + 1);
+        }
+    } else if (value.IsArray()) {
+        for (const JsonValue& child : value.AsArray()) {
+            CollectFileChangeStats(child, files, added, removed, depth + 1);
+        }
     }
 }
 
@@ -726,28 +804,37 @@ ThreadMetrics DesktopThreadMonitor::DeriveMetrics(const std::string& threadId, T
 
     if (const JsonValue* usage = FindUsageObject(state.document)) {
         const JsonValue* last = FindAny(*usage, {"last", "lastTokenUsage", "last_token_usage"});
-        if (!last || !last->IsObject()) last = usage;
+        const JsonValue* cumulative = FindAny(*usage, {"total", "totalTokenUsage", "total_token_usage"});
 
-        const std::int64_t window =
-            IntegerField(*usage, {"modelContextWindow", "model_context_window", "contextWindow", "context_window"}, 0);
-        const std::int64_t total =
-            IntegerField(*last, {"totalTokens", "total_tokens"}, 0);
-        if (window > 0 && total >= 0) {
-            metrics.hasContext = true;
-            metrics.contextUsedTokens = total;
-            metrics.contextWindowTokens = window;
-            metrics.contextPercent = Percent(total, window);
+        // Context load must use the latest request's active-context usage. Using
+        // lifetime cumulative tokens here can exceed the model context window.
+        if (last && last->IsObject()) {
+            const std::int64_t window =
+                IntegerField(*usage, {"modelContextWindow", "model_context_window", "contextWindow", "context_window"}, 0);
+            const std::int64_t activeContext =
+                IntegerField(*last, {"totalTokens", "total_tokens"}, 0);
+            if (window > 0 && activeContext >= 0) {
+                metrics.hasContext = true;
+                metrics.contextUsedTokens = activeContext;
+                metrics.contextWindowTokens = window;
+                metrics.contextPercent = Percent(activeContext, window);
+            }
         }
 
-        const std::int64_t input =
-            IntegerField(*last, {"inputTokens", "input_tokens"}, 0);
-        const std::int64_t cached =
-            IntegerField(*last, {"cachedInputTokens", "cached_input_tokens"}, 0);
-        if (input > 0 && cached >= 0) {
-            metrics.hasCache = true;
-            metrics.inputTokens = input;
-            metrics.cachedInputTokens = cached;
-            metrics.cachePercent = Percent(cached, input);
+        // Cache hit rate is intentionally cumulative for the bound conversation.
+        // A single newest request can legitimately be ~100% cached and is much
+        // noisier than the stable conversation-wide ratio shown by status tools.
+        if (cumulative && cumulative->IsObject()) {
+            const std::int64_t input =
+                IntegerField(*cumulative, {"inputTokens", "input_tokens"}, 0);
+            const std::int64_t cached =
+                IntegerField(*cumulative, {"cachedInputTokens", "cached_input_tokens"}, 0);
+            if (input > 0 && cached >= 0) {
+                metrics.hasCache = true;
+                metrics.inputTokens = input;
+                metrics.cachedInputTokens = cached;
+                metrics.cachePercent = Percent(cached, input);
+            }
         }
     }
 
@@ -774,6 +861,21 @@ ThreadMetrics DesktopThreadMonitor::DeriveMetrics(const std::string& threadId, T
         if (!active->diff.empty()) {
             CountUnifiedDiff(active->diff, state.lastFiles, state.lastAdded, state.lastRemoved);
             state.hasLastDiff = state.lastFiles > 0 || state.lastAdded > 0 || state.lastRemoved > 0;
+        } else if (active->object) {
+            // The private Desktop follower state does not guarantee that the
+            // transient turn/diff/updated notification is stored as turn.diff.
+            // Completed/in-progress fileChange items do carry per-file diffs, so
+            // use them as a read-only fallback to make the row appear reliably.
+            std::set<std::string, std::less<>> files;
+            int added = 0;
+            int removed = 0;
+            CollectFileChangeStats(*active->object, files, added, removed);
+            if (!files.empty() || added > 0 || removed > 0) {
+                state.lastFiles = static_cast<int>(files.size());
+                state.lastAdded = added;
+                state.lastRemoved = removed;
+                state.hasLastDiff = true;
+            }
         }
     }
 
