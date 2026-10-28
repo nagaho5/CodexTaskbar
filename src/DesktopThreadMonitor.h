@@ -68,6 +68,7 @@ private:
         int lastAdded{0};
         int lastRemoved{0};
         bool hasLastDiff{false};
+        bool lastDiffExact{false};
         std::uint64_t updateSequence{0};
     };
 
