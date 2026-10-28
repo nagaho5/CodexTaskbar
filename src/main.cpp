@@ -511,7 +511,7 @@ public:
         // Elapsed turn time changes even when the IPC state itself does not.
         // Refresh its taskbar/hover presentation once per second while timing
         // information is available.
-        if (threadMetrics_.hasTurnTiming) {
+        if (threadMetrics_.hasTurnTiming && threadMetrics_.activeTurn) {
             InvalidateWidget();
             if (hoverPopupVisible_) {
                 UpdateTooltipText();
