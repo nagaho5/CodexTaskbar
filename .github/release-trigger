@@ -1,3 +1,3 @@
-tag=v0.2.0
-source_commit=1f92ff96ccb1860e8d88b6ee78713ac8d17f71fd
-reason=v0.2 thread metrics and configurable display
+tag=v0.2.1
+source_commit=99ed31c9c0d161fb55f2f7169e9d4481e7cd6413
+reason=fix thread metrics cache diff and tooltip
