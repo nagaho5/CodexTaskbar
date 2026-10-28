@@ -3,6 +3,7 @@
 
 #include <windows.h>
 #include <commctrl.h>
+#include <commdlg.h>
 #include <dwmapi.h>
 #include <shellapi.h>
 #include <tlhelp32.h>
@@ -62,6 +63,15 @@ constexpr int kRadioAutoThread = 2010;
 constexpr int kEditThreadId = 2011;
 constexpr int kCheckShowDiffFiles = 2012;
 constexpr int kCheckShowTaskDuration = 2013;
+constexpr int kButtonWorkingColor = 2014;
+constexpr int kStaticWorkingColorPreview = 2015;
+
+constexpr COLORREF kDefaultWorkingColor = RGB(79, 195, 247);
+
+struct ColoredSegment {
+    std::wstring text;
+    COLORREF color{RGB(255, 255, 255)};
+};
 
 struct QuotaPayload {
     QuotaSnapshot snapshot;
@@ -443,6 +453,9 @@ public:
         showDiff_ = ReadRegistryDword(L"ShowDiff", 1) != 0;
         showDiffFiles_ = ReadRegistryDword(L"ShowDiffFiles", 1) != 0;
         showTaskDuration_ = ReadRegistryDword(L"ShowTaskDuration", 0) != 0;
+        workingColor_ = static_cast<COLORREF>(
+            ReadRegistryDword(L"WorkingColor", static_cast<int>(kDefaultWorkingColor))) & 0x00FFFFFF;
+        pendingWorkingColor_ = workingColor_;
         automaticThreadMode_ = ReadRegistryDword(L"AutomaticThreadMode", 0) != 0;
         manualThreadId_ = ReadRegistryString(L"ManualThreadId");
 
@@ -576,6 +589,106 @@ public:
         UpdateTrayTip();
     }
 
+    void DrawCenteredSegments(
+        HDC dc,
+        const RECT& row,
+        const std::vector<ColoredSegment>& segments) const {
+        int totalWidth = 0;
+        std::vector<SIZE> sizes;
+        sizes.reserve(segments.size());
+
+        for (const auto& segment : segments) {
+            SIZE size{};
+            if (!segment.text.empty()) {
+                GetTextExtentPoint32W(
+                    dc,
+                    segment.text.c_str(),
+                    static_cast<int>(segment.text.size()),
+                    &size);
+            }
+            sizes.push_back(size);
+            totalWidth += size.cx;
+        }
+
+        TEXTMETRICW tm{};
+        GetTextMetricsW(dc, &tm);
+        int x = static_cast<int>(row.left) +
+            std::max(0, (static_cast<int>(row.right - row.left) - totalWidth) / 2);
+        const int y = static_cast<int>(row.top) +
+            std::max(0, (static_cast<int>(row.bottom - row.top) - static_cast<int>(tm.tmHeight)) / 2);
+
+        for (std::size_t i = 0; i < segments.size(); ++i) {
+            if (segments[i].text.empty()) continue;
+            SetTextColor(dc, segments[i].color);
+            TextOutW(
+                dc,
+                x,
+                y,
+                segments[i].text.c_str(),
+                static_cast<int>(segments[i].text.size()));
+            x += sizes[i].cx;
+        }
+        SetTextColor(dc, RGB(255, 255, 255));
+    }
+
+    std::vector<ColoredSegment> FirstLineSegments() const {
+        std::vector<ColoredSegment> segments;
+        if (showFiveHourPercent_) {
+            const bool valid = quotaValid_ && quota_.fiveHour.valid;
+            segments.push_back({
+                valid
+                    ? std::to_wstring(quota_.fiveHour.remainingPercent) + L"%"
+                    : L"--%",
+                threadMetrics_.activeTurn && valid
+                    ? workingColor_
+                    : RGB(255, 255, 255)});
+        }
+        if (showFiveHourTime_) {
+            segments.push_back({
+                quotaValid_ && quota_.fiveHour.valid
+                    ? FormatResetTime(quota_.fiveHour.resetsAtUnix)
+                    : L"--:--",
+                RGB(255, 255, 255)});
+        }
+        return segments;
+    }
+
+    std::vector<ColoredSegment> SecondLineSegments() const {
+        std::vector<ColoredSegment> segments;
+        auto append = [&](std::wstring text, COLORREF color) {
+            if (!segments.empty()) {
+                segments.push_back({L" ", RGB(255, 255, 255)});
+            }
+            segments.push_back({std::move(text), color});
+        };
+
+        if (showSevenDayPercent_) {
+            append(
+                quotaValid_ && quota_.sevenDay.valid
+                    ? std::to_wstring(quota_.sevenDay.remainingPercent) + L"%"
+                    : L"--%",
+                RGB(255, 255, 255));
+        }
+        if (showContext_) {
+            const bool valid = threadMetrics_.hasContext;
+            append(
+                valid
+                    ? std::to_wstring(threadMetrics_.contextPercent) + L"%"
+                    : L"--%",
+                threadMetrics_.activeTurn && valid
+                    ? workingColor_
+                    : RGB(255, 255, 255));
+        }
+        if (showCache_) {
+            append(
+                threadMetrics_.hasCache
+                    ? std::to_wstring(threadMetrics_.cachePercent) + L"%"
+                    : L"--%",
+                RGB(255, 255, 255));
+        }
+        return segments;
+    }
+
     void PaintWidget(HWND hwnd) {
         PAINTSTRUCT ps{};
         HDC dc = BeginPaint(hwnd, &ps);
@@ -600,10 +713,10 @@ public:
                 std::wstring text;
             };
             std::vector<Row> rows;
-            if (!first.empty()) rows.push_back({0, first});
-            if (!second.empty()) rows.push_back({0, second});
-            if (!duration.empty()) rows.push_back({0, duration});
+            if (!first.empty()) rows.push_back({2, first});
+            if (!second.empty()) rows.push_back({3, second});
             if (diffVisible) rows.push_back({1, {}});
+            if (!duration.empty()) rows.push_back({0, duration});
 
             if (rows.empty()) rows.push_back({0, L""});
             const int rowHeight = std::max(
@@ -619,7 +732,13 @@ public:
                         ? client.bottom
                         : client.top + static_cast<LONG>((index + 1) * rowHeight)};
 
-                if (rows[index].kind == 0) {
+                if (rows[index].kind == 1) {
+                    DrawDiffRow(dc, row);
+                } else if (rows[index].kind == 2) {
+                    DrawCenteredSegments(dc, row, FirstLineSegments());
+                } else if (rows[index].kind == 3) {
+                    DrawCenteredSegments(dc, row, SecondLineSegments());
+                } else {
                     SetTextColor(dc, RGB(255, 255, 255));
                     DrawTextW(
                         dc,
@@ -627,14 +746,42 @@ public:
                         -1,
                         &row,
                         DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-                } else {
-                    DrawDiffRow(dc, row);
                 }
             }
         } else {
-            const std::wstring line = HorizontalLine();
-            SetTextColor(dc, RGB(255, 255, 255));
-            DrawTextW(dc, line.c_str(), -1, &client, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            std::vector<ColoredSegment> segments;
+            auto appendGroup = [&](const std::vector<ColoredSegment>& group) {
+                if (group.empty()) return;
+                if (!segments.empty()) {
+                    segments.push_back({L"  ", RGB(255, 255, 255)});
+                }
+                segments.insert(segments.end(), group.begin(), group.end());
+            };
+
+            appendGroup(FirstLineSegments());
+            appendGroup(SecondLineSegments());
+
+            if (IsDiffRowVisible()) {
+                std::vector<ColoredSegment> diffSegments;
+                if (showDiffFiles_) {
+                    diffSegments.push_back({
+                        std::to_wstring(threadMetrics_.changedFiles) + L" ",
+                        RGB(255, 255, 255)});
+                }
+                diffSegments.push_back({
+                    std::to_wstring(threadMetrics_.addedLines) + L" ",
+                    RGB(66, 214, 116)});
+                diffSegments.push_back({
+                    std::to_wstring(threadMetrics_.removedLines),
+                    RGB(242, 88, 88)});
+                appendGroup(diffSegments);
+            }
+
+            const std::wstring duration = TaskDurationLine();
+            if (!duration.empty()) {
+                appendGroup({{duration, RGB(255, 255, 255)}});
+            }
+            DrawCenteredSegments(dc, client, segments);
         }
 
         SelectObject(dc, oldFont);
@@ -766,6 +913,8 @@ public:
             return;
         }
 
+        pendingWorkingColor_ = workingColor_;
+
         settingsWindow_ = CreateWindowExW(
             WS_EX_DLGMODALFRAME | WS_EX_TOOLWINDOW,
             kSettingsClass,
@@ -834,6 +983,18 @@ public:
         checkbox(kCheckShowDiffFiles, L"显示文件数", 318, 128, showDiffFiles_, 112);
         checkbox(kCheckShowTaskDuration, L"任务耗时", 24, 153, showTaskDuration_);
 
+        CreateWindowW(
+            L"STATIC", L"运行中颜色：", WS_CHILD | WS_VISIBLE,
+            210, 153, 88, 22, hwnd, nullptr, instance_, nullptr);
+        CreateWindowW(
+            L"BUTTON", L"选择...", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+            298, 149, 76, 26, hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kButtonWorkingColor)), instance_, nullptr);
+        CreateWindowW(
+            L"STATIC", L"76%", WS_CHILD | WS_VISIBLE | SS_CENTER,
+            382, 153, 48, 22, hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kStaticWorkingColorPreview)), instance_, nullptr);
+
         CreateWindowW(L"STATIC", L"会话来源：", WS_CHILD | WS_VISIBLE,
             24, 191, 100, 22, hwnd, nullptr, instance_, nullptr);
 
@@ -882,6 +1043,27 @@ public:
                 return TRUE;
             },
             0);
+    }
+
+    void ChooseWorkingColor(HWND owner) {
+        CHOOSECOLORW choose{};
+        choose.lStructSize = sizeof(choose);
+        choose.hwndOwner = owner;
+        choose.rgbResult = pendingWorkingColor_;
+        choose.lpCustColors = customColors_.data();
+        choose.Flags = CC_FULLOPEN | CC_RGBINIT;
+
+        if (ChooseColorW(&choose)) {
+            pendingWorkingColor_ = choose.rgbResult & 0x00FFFFFF;
+            HWND preview = GetDlgItem(owner, kStaticWorkingColorPreview);
+            if (preview) {
+                InvalidateRect(preview, nullptr, TRUE);
+            }
+        }
+    }
+
+    COLORREF PendingWorkingColor() const {
+        return pendingWorkingColor_;
     }
 
     void ApplyDarkWindowTheme(HWND hwnd) {
@@ -1021,6 +1203,7 @@ public:
         showDiff_ = checked(kCheckShowDiff);
         showDiffFiles_ = checked(kCheckShowDiffFiles);
         showTaskDuration_ = checked(kCheckShowTaskDuration);
+        workingColor_ = pendingWorkingColor_;
         automaticThreadMode_ = checked(kRadioAutoThread);
 
         wchar_t threadText[256]{};
@@ -1039,6 +1222,7 @@ public:
         WriteRegistryDword(L"ShowDiff", showDiff_ ? 1u : 0u);
         WriteRegistryDword(L"ShowDiffFiles", showDiffFiles_ ? 1u : 0u);
         WriteRegistryDword(L"ShowTaskDuration", showTaskDuration_ ? 1u : 0u);
+        WriteRegistryDword(L"WorkingColor", static_cast<DWORD>(workingColor_));
         WriteRegistryDword(L"AutomaticThreadMode", automaticThreadMode_ ? 1u : 0u);
         WriteRegistryString(L"ManualThreadId", manualThreadId_);
         SetAutoStartRegistry(autoStart_);
@@ -1277,11 +1461,24 @@ private:
             break;
 
         case WM_CTLCOLORDLG:
-        case WM_CTLCOLORSTATIC:
         case WM_CTLCOLORBTN:
             if (app && app->DarkBackgroundBrush()) {
                 HDC dc = reinterpret_cast<HDC>(wParam);
                 SetTextColor(dc, RGB(242, 242, 242));
+                SetBkColor(dc, RGB(24, 24, 24));
+                return reinterpret_cast<LRESULT>(app->DarkBackgroundBrush());
+            }
+            break;
+
+        case WM_CTLCOLORSTATIC:
+            if (app && app->DarkBackgroundBrush()) {
+                HDC dc = reinterpret_cast<HDC>(wParam);
+                const HWND control = reinterpret_cast<HWND>(lParam);
+                const bool preview =
+                    control && GetDlgCtrlID(control) == kStaticWorkingColorPreview;
+                SetTextColor(
+                    dc,
+                    preview ? app->PendingWorkingColor() : RGB(242, 242, 242));
                 SetBkColor(dc, RGB(24, 24, 24));
                 return reinterpret_cast<LRESULT>(app->DarkBackgroundBrush());
             }
@@ -1306,6 +1503,10 @@ private:
         case WM_COMMAND:
             if (!app) {
                 break;
+            }
+            if (LOWORD(wParam) == kButtonWorkingColor) {
+                app->ChooseWorkingColor(hwnd);
+                return 0;
             }
             if (LOWORD(wParam) == IDOK) {
                 app->SaveSettingsFromWindow(hwnd);
@@ -1673,12 +1874,12 @@ private:
     }
 
     std::wstring TaskDurationLine() const {
-        if (!showTaskDuration_) return {};
+        if (!showTaskDuration_ || !threadMetrics_.activeTurn) return {};
         return FormatDurationCompact(CurrentTaskDurationMs());
     }
 
     bool IsDiffRowVisible() const {
-        return showDiff_ && threadMetrics_.hasDiff &&
+        return threadMetrics_.activeTurn && showDiff_ && threadMetrics_.hasDiff &&
             (threadMetrics_.changedFiles > 0 ||
              threadMetrics_.addedLines > 0 ||
              threadMetrics_.removedLines > 0);
@@ -1702,11 +1903,6 @@ private:
             if (!result.empty()) result += L"  ";
             result += second;
         }
-        const std::wstring duration = TaskDurationLine();
-        if (!duration.empty()) {
-            if (!result.empty()) result += L"  ";
-            result += duration;
-        }
         if (IsDiffRowVisible()) {
             if (!result.empty()) result += L"  ";
             if (showDiffFiles_) {
@@ -1714,6 +1910,11 @@ private:
             }
             result += std::to_wstring(threadMetrics_.addedLines) + L" " +
                       std::to_wstring(threadMetrics_.removedLines);
+        }
+        const std::wstring duration = TaskDurationLine();
+        if (!duration.empty()) {
+            if (!result.empty()) result += L"  ";
+            result += duration;
         }
         return result;
     }
@@ -1998,7 +2199,7 @@ private:
         case kMenuAbout:
             MessageBoxW(
                 mainWindow_,
-                L"CodexTaskbar v0.2.6\n\n"
+                L"CodexTaskbar v0.2.7\n\n"
                 L"在 Windows 10 任务栏显示 Codex 配额、绑定会话上下文/缓存和本轮代码改动。\n"
                 L"配额来自官方 app-server；会话指标通过只读 Codex Desktop IPC follower 获取。",
                 L"关于 CodexTaskbar",
@@ -2161,6 +2362,9 @@ private:
     bool showDiff_{true};
     bool showDiffFiles_{true};
     bool showTaskDuration_{false};
+    COLORREF workingColor_{kDefaultWorkingColor};
+    COLORREF pendingWorkingColor_{kDefaultWorkingColor};
+    std::array<COLORREF, 16> customColors_{};
     bool automaticThreadMode_{false};
     int fontSize_{10};
     unsigned tickCount_{0};
