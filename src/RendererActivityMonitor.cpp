@@ -6,6 +6,7 @@
 #include <fstream>
 #include <string_view>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -160,11 +161,18 @@ std::filesystem::path RendererActivityMonitor::FindLogFile() const {
     // Non-MSIX fallback for future/alternate desktop packaging.
     logDirs.push_back(localAppData / L"Codex" / L"Logs");
 
-    std::filesystem::path best;
-    std::filesystem::file_time_type bestTime{};
-    bool haveBest = false;
+    std::filesystem::path bestNamed;
+    std::filesystem::file_time_type bestNamedTime{};
+    bool haveNamed = false;
+    std::filesystem::path bestFallback;
+    std::filesystem::file_time_type bestFallbackTime{};
+    bool haveFallback = false;
 
-    auto consider = [&](const std::filesystem::path& path) {
+    auto consider = [](
+        const std::filesystem::path& path,
+        std::filesystem::path& best,
+        std::filesystem::file_time_type& bestTime,
+        bool& haveBest) {
         std::error_code localEc;
         if (!std::filesystem::is_regular_file(path, localEc)) return;
         const auto time = std::filesystem::last_write_time(path, localEc);
@@ -180,18 +188,27 @@ std::filesystem::path RendererActivityMonitor::FindLogFile() const {
         std::error_code localEc;
         if (!std::filesystem::is_directory(dir, localEc)) continue;
 
-        // Prefer the normal Desktop process log when present.
-        consider(dir / L"Codex.log");
+        // The Desktop process normally writes renderer activity to Codex.log.
+        // Prefer that file across all candidate package roots.
+        consider(
+            dir / L"Codex.log",
+            bestNamed,
+            bestNamedTime,
+            haveNamed);
 
         for (std::filesystem::directory_iterator it(dir, localEc), end;
              !localEc && it != end;
              it.increment(localEc)) {
             if (!it->is_regular_file(localEc)) continue;
-            consider(it->path());
+            consider(
+                it->path(),
+                bestFallback,
+                bestFallbackTime,
+                haveFallback);
         }
     }
 
-    return best;
+    return haveNamed ? bestNamed : bestFallback;
 }
 
 void RendererActivityMonitor::SwitchLog(const std::filesystem::path& path) {
