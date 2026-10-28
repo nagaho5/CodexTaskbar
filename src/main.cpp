@@ -3,8 +3,10 @@
 
 #include <windows.h>
 #include <commctrl.h>
+#include <dwmapi.h>
 #include <shellapi.h>
 #include <tlhelp32.h>
+#include <uxtheme.h>
 
 #include <algorithm>
 #include <array>
@@ -90,45 +92,35 @@ bool IsCodexProcess(DWORD processId) {
            path.find(L"\\openai\\codex\\") != std::wstring::npos;
 }
 
-bool IsCodexDesktopWindowOpen() {
-    // The Codex MSIX package can leave background processes and codex-ipc alive
-    // after the user closes the Desktop window. Visibility therefore follows an
-    // actual top-level Codex window rather than process/pipe lifetime.
-    struct SearchState {
-        bool found{false};
-    } state;
+bool IsCodexDesktopRunning() {
+    // The Store/MSIX build currently uses ChatGPT.exe as its Electron shell.
+    // Keep the taskbar widget visible while that Codex package process exists,
+    // including when its window is minimized. Do not use codex-ipc lifetime:
+    // the pipe may outlive the UI after Codex has actually exited.
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        return false;
+    }
 
-    EnumWindows(
-        [](HWND hwnd, LPARAM value) -> BOOL {
-            auto* state = reinterpret_cast<SearchState*>(value);
-            if (!IsWindowVisible(hwnd) || GetWindow(hwnd, GW_OWNER) != nullptr) {
-                return TRUE;
+    PROCESSENTRY32W entry{};
+    entry.dwSize = sizeof(entry);
+    bool found = false;
+
+    if (Process32FirstW(snapshot, &entry)) {
+        do {
+            const bool candidate =
+                _wcsicmp(entry.szExeFile, L"ChatGPT.exe") == 0 ||
+                _wcsicmp(entry.szExeFile, L"Codex.exe") == 0 ||
+                _wcsicmp(entry.szExeFile, L"OpenAI.Codex.exe") == 0;
+            if (candidate && IsCodexProcess(entry.th32ProcessID)) {
+                found = true;
+                break;
             }
+        } while (Process32NextW(snapshot, &entry));
+    }
 
-            const LONG_PTR exStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-            if ((exStyle & WS_EX_TOOLWINDOW) != 0) {
-                return TRUE;
-            }
-
-            RECT rect{};
-            if (!GetWindowRect(hwnd, &rect) ||
-                rect.right - rect.left < 120 ||
-                rect.bottom - rect.top < 80) {
-                return TRUE;
-            }
-
-            DWORD processId = 0;
-            GetWindowThreadProcessId(hwnd, &processId);
-            if (!IsCodexProcess(processId)) {
-                return TRUE;
-            }
-
-            state->found = true;
-            return FALSE;
-        },
-        reinterpret_cast<LPARAM>(&state));
-
-    return state.found;
+    CloseHandle(snapshot);
+    return found;
 }
 
 HWND FindDescendantByTitle(HWND root, const wchar_t* title) {
@@ -379,6 +371,15 @@ public:
         if (font_) {
             DeleteObject(font_);
         }
+        if (darkBackgroundBrush_) {
+            DeleteObject(darkBackgroundBrush_);
+        }
+        if (darkControlBrush_) {
+            DeleteObject(darkControlBrush_);
+        }
+        if (darkMenuBrush_) {
+            DeleteObject(darkMenuBrush_);
+        }
     }
 
     bool Initialize() {
@@ -396,6 +397,13 @@ public:
 
         INITCOMMONCONTROLSEX commonControls{sizeof(commonControls), ICC_WIN95_CLASSES};
         InitCommonControlsEx(&commonControls);
+
+        darkBackgroundBrush_ = CreateSolidBrush(RGB(24, 24, 24));
+        darkControlBrush_ = CreateSolidBrush(RGB(36, 36, 36));
+        darkMenuBrush_ = CreateSolidBrush(RGB(24, 24, 24));
+        if (!darkBackgroundBrush_ || !darkControlBrush_ || !darkMenuBrush_) {
+            return false;
+        }
 
         if (!RegisterWindowClasses()) {
             return false;
@@ -439,6 +447,7 @@ public:
     int Run() {
         MSG msg{};
         while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+            RelayTooltipMessage(msg);
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -454,7 +463,7 @@ public:
             return;
         }
 
-        const bool running = IsCodexDesktopWindowOpen();
+        const bool running = IsCodexDesktopRunning();
         codexRunningKnown_ = true;
         if (running != codexRunning_) {
             codexRunning_ = running;
@@ -616,16 +625,38 @@ public:
             return;
         }
 
-        AppendMenuW(menu, MF_STRING, kMenuSettings, L"设置...");
+        MENUINFO menuInfo{};
+        menuInfo.cbSize = sizeof(menuInfo);
+        menuInfo.fMask = MIM_BACKGROUND;
+        menuInfo.hbrBack = darkMenuBrush_;
+        SetMenuInfo(menu, &menuInfo);
+
         AppendMenuW(
             menu,
-            MF_STRING | (autoStart_ ? MF_CHECKED : MF_UNCHECKED),
+            MF_OWNERDRAW,
+            kMenuSettings,
+            reinterpret_cast<LPCWSTR>(L"设置..."));
+        AppendMenuW(
+            menu,
+            MF_OWNERDRAW | (autoStart_ ? MF_CHECKED : MF_UNCHECKED),
             kMenuAutoStart,
-            L"开机自动启动");
-        AppendMenuW(menu, MF_STRING, kMenuReconnect, L"重新连接");
+            reinterpret_cast<LPCWSTR>(L"开机自动启动"));
+        AppendMenuW(
+            menu,
+            MF_OWNERDRAW,
+            kMenuReconnect,
+            reinterpret_cast<LPCWSTR>(L"重新连接"));
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(menu, MF_STRING, kMenuAbout, L"关于");
-        AppendMenuW(menu, MF_STRING, kMenuExit, L"退出");
+        AppendMenuW(
+            menu,
+            MF_OWNERDRAW,
+            kMenuAbout,
+            reinterpret_cast<LPCWSTR>(L"关于"));
+        AppendMenuW(
+            menu,
+            MF_OWNERDRAW,
+            kMenuExit,
+            reinterpret_cast<LPCWSTR>(L"退出"));
 
         POINT point{};
         GetCursorPos(&point);
@@ -687,6 +718,8 @@ public:
         if (!settingsWindow_) {
             return;
         }
+
+        ApplyDarkWindowTheme(settingsWindow_);
 
         RECT rect{};
         GetWindowRect(settingsWindow_, &rect);
@@ -767,13 +800,141 @@ public:
             24, 302, 410, 22, hwnd, nullptr, instance_, nullptr);
 
         CreateWindowW(
-            L"BUTTON", L"确定", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
+            L"BUTTON", L"确定", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
             270, 344, 76, 28, hwnd,
             reinterpret_cast<HMENU>(IDOK), instance_, nullptr);
         CreateWindowW(
-            L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE,
+            L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
             358, 344, 76, 28, hwnd,
             reinterpret_cast<HMENU>(IDCANCEL), instance_, nullptr);
+
+        EnumChildWindows(
+            hwnd,
+            [](HWND child, LPARAM) -> BOOL {
+                // DarkMode_Explorer is available on supported Windows 10 builds;
+                // WM_CTLCOLOR below is the fallback for controls that ignore it.
+                SetWindowTheme(child, L"DarkMode_Explorer", nullptr);
+                return TRUE;
+            },
+            0);
+    }
+
+    void ApplyDarkWindowTheme(HWND hwnd) {
+        if (!hwnd || !IsWindow(hwnd)) return;
+        BOOL enabled = TRUE;
+        if (FAILED(DwmSetWindowAttribute(
+                hwnd,
+                static_cast<DWMWINDOWATTRIBUTE>(20),
+                &enabled,
+                sizeof(enabled)))) {
+            DwmSetWindowAttribute(
+                hwnd,
+                static_cast<DWMWINDOWATTRIBUTE>(19),
+                &enabled,
+                sizeof(enabled));
+        }
+        SetWindowTheme(hwnd, L"DarkMode_Explorer", nullptr);
+    }
+
+    bool MeasureContextMenuItem(MEASUREITEMSTRUCT* item) const {
+        if (!item || item->CtlType != ODT_MENU) return false;
+        UINT dpi = mainWindow_ && IsWindow(mainWindow_) ? GetDpiForWindow(mainWindow_) : 96;
+        if (dpi == 0) dpi = 96;
+        item->itemWidth = static_cast<UINT>(MulDiv(176, static_cast<int>(dpi), 96));
+        item->itemHeight = static_cast<UINT>(MulDiv(28, static_cast<int>(dpi), 96));
+        return true;
+    }
+
+    bool DrawContextMenuItem(DRAWITEMSTRUCT* item) const {
+        if (!item || item->CtlType != ODT_MENU) return false;
+
+        const bool selected = (item->itemState & ODS_SELECTED) != 0;
+        const bool disabled = (item->itemState & ODS_DISABLED) != 0;
+        const COLORREF background = selected ? RGB(58, 58, 58) : RGB(24, 24, 24);
+        HBRUSH brush = CreateSolidBrush(background);
+        if (brush) {
+            FillRect(item->hDC, &item->rcItem, brush);
+            DeleteObject(brush);
+        }
+
+        SetBkMode(item->hDC, TRANSPARENT);
+        SetTextColor(item->hDC, disabled ? RGB(145, 145, 145) : RGB(242, 242, 242));
+
+        UINT dpi = mainWindow_ && IsWindow(mainWindow_) ? GetDpiForWindow(mainWindow_) : 96;
+        if (dpi == 0) dpi = 96;
+        const int leftPadding = MulDiv(30, static_cast<int>(dpi), 96);
+        const int checkPadding = MulDiv(8, static_cast<int>(dpi), 96);
+        const int checkWidth = MulDiv(16, static_cast<int>(dpi), 96);
+
+        RECT textRect = item->rcItem;
+        textRect.left += leftPadding;
+        const auto* text = reinterpret_cast<const wchar_t*>(item->itemData);
+        if (text) {
+            DrawTextW(
+                item->hDC,
+                text,
+                -1,
+                &textRect,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        }
+
+        if ((item->itemState & ODS_CHECKED) != 0) {
+            RECT checkRect = item->rcItem;
+            checkRect.left += checkPadding;
+            checkRect.right = checkRect.left + checkWidth;
+            DrawTextW(
+                item->hDC,
+                L"✓",
+                -1,
+                &checkRect,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        }
+        return true;
+    }
+
+    bool DrawSettingsButton(DRAWITEMSTRUCT* item) const {
+        if (!item || item->CtlType != ODT_BUTTON) return false;
+
+        const bool pressed = (item->itemState & ODS_SELECTED) != 0;
+        const bool disabled = (item->itemState & ODS_DISABLED) != 0;
+        const COLORREF background = pressed ? RGB(62, 62, 62) : RGB(42, 42, 42);
+        HBRUSH backgroundBrush = CreateSolidBrush(background);
+        if (backgroundBrush) {
+            FillRect(item->hDC, &item->rcItem, backgroundBrush);
+            DeleteObject(backgroundBrush);
+        }
+
+        HPEN borderPen = CreatePen(PS_SOLID, 1, RGB(92, 92, 92));
+        HGDIOBJ oldPen = borderPen ? SelectObject(item->hDC, borderPen) : nullptr;
+        HGDIOBJ oldBrush = SelectObject(item->hDC, GetStockObject(NULL_BRUSH));
+        Rectangle(
+            item->hDC,
+            item->rcItem.left,
+            item->rcItem.top,
+            item->rcItem.right,
+            item->rcItem.bottom);
+        SelectObject(item->hDC, oldBrush);
+        if (oldPen) SelectObject(item->hDC, oldPen);
+        if (borderPen) DeleteObject(borderPen);
+
+        wchar_t label[64]{};
+        GetWindowTextW(item->hwndItem, label, static_cast<int>(std::size(label)));
+        SetBkMode(item->hDC, TRANSPARENT);
+        SetTextColor(item->hDC, disabled ? RGB(145, 145, 145) : RGB(242, 242, 242));
+        RECT textRect = item->rcItem;
+        DrawTextW(
+            item->hDC,
+            label,
+            -1,
+            &textRect,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+        if ((item->itemState & ODS_FOCUS) != 0) {
+            RECT focus = item->rcItem;
+            InflateRect(&focus, -3, -3);
+            DrawFocusRect(item->hDC, &focus);
+        }
+        return true;
     }
 
     void SaveSettingsFromWindow(HWND hwnd) {
@@ -850,6 +1011,14 @@ public:
         return taskbarCreatedMessage_;
     }
 
+    HBRUSH DarkBackgroundBrush() const {
+        return darkBackgroundBrush_;
+    }
+
+    HBRUSH DarkControlBrush() const {
+        return darkControlBrush_;
+    }
+
 private:
     static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
         auto* app = reinterpret_cast<CodexTaskbarApp*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
@@ -902,6 +1071,20 @@ private:
             }
             return 0;
 
+        case WM_MEASUREITEM:
+            if (app && app->MeasureContextMenuItem(
+                    reinterpret_cast<MEASUREITEMSTRUCT*>(lParam))) {
+                return TRUE;
+            }
+            break;
+
+        case WM_DRAWITEM:
+            if (app && app->DrawContextMenuItem(
+                    reinterpret_cast<DRAWITEMSTRUCT*>(lParam))) {
+                return TRUE;
+            }
+            break;
+
         case WM_DESTROY:
             KillTimer(hwnd, kTickTimer);
             PostQuitMessage(0);
@@ -933,15 +1116,17 @@ private:
 
         case WM_MOUSEMOVE:
             if (app) {
-                app->ArmTooltipHover(hwnd);
+                app->ArmTooltipLeave(hwnd);
             }
             break;
 
-        case WM_MOUSEHOVER:
+        case WM_DPICHANGED_AFTERPARENT:
             if (app) {
-                app->ShowTooltip(hwnd);
+                app->RecreateFont();
+                app->PositionWidget();
+                return 0;
             }
-            return 0;
+            break;
 
         case WM_MOUSELEAVE:
             if (app) {
@@ -988,9 +1173,46 @@ private:
         switch (message) {
         case WM_CREATE:
             if (app) {
+                app->ApplyDarkWindowTheme(hwnd);
                 app->CreateSettingsControls(hwnd);
             }
             return 0;
+
+        case WM_ERASEBKGND:
+            if (app && app->DarkBackgroundBrush()) {
+                RECT rect{};
+                GetClientRect(hwnd, &rect);
+                FillRect(reinterpret_cast<HDC>(wParam), &rect, app->DarkBackgroundBrush());
+                return 1;
+            }
+            break;
+
+        case WM_CTLCOLORDLG:
+        case WM_CTLCOLORSTATIC:
+        case WM_CTLCOLORBTN:
+            if (app && app->DarkBackgroundBrush()) {
+                HDC dc = reinterpret_cast<HDC>(wParam);
+                SetTextColor(dc, RGB(242, 242, 242));
+                SetBkColor(dc, RGB(24, 24, 24));
+                return reinterpret_cast<LRESULT>(app->DarkBackgroundBrush());
+            }
+            break;
+
+        case WM_CTLCOLOREDIT:
+            if (app && app->DarkControlBrush()) {
+                HDC dc = reinterpret_cast<HDC>(wParam);
+                SetTextColor(dc, RGB(242, 242, 242));
+                SetBkColor(dc, RGB(36, 36, 36));
+                return reinterpret_cast<LRESULT>(app->DarkControlBrush());
+            }
+            break;
+
+        case WM_DRAWITEM:
+            if (app && app->DrawSettingsButton(
+                    reinterpret_cast<DRAWITEMSTRUCT*>(lParam))) {
+                return TRUE;
+            }
+            break;
 
         case WM_COMMAND:
             if (!app) {
@@ -1048,7 +1270,7 @@ private:
         settingsClass.lpfnWndProc = SettingsWndProc;
         settingsClass.lpszClassName = kSettingsClass;
         settingsClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-        settingsClass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+        settingsClass.hbrBackground = darkBackgroundBrush_;
         if (!RegisterClassExW(&settingsClass) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
             return false;
         }
@@ -1062,13 +1284,23 @@ private:
             font_ = nullptr;
         }
 
-        HDC dc = GetDC(nullptr);
-        const int dpi = dc ? GetDeviceCaps(dc, LOGPIXELSY) : 96;
-        if (dc) {
-            ReleaseDC(nullptr, dc);
+        UINT dpi = 96;
+        HWND dpiWindow = nullptr;
+        if (widgetWindow_ && IsWindow(widgetWindow_)) {
+            dpiWindow = widgetWindow_;
+        } else if (taskbarWindow_ && IsWindow(taskbarWindow_)) {
+            dpiWindow = taskbarWindow_;
+        } else if (mainWindow_ && IsWindow(mainWindow_)) {
+            dpiWindow = mainWindow_;
+        }
+        if (dpiWindow) {
+            const UINT windowDpi = GetDpiForWindow(dpiWindow);
+            if (windowDpi > 0) {
+                dpi = windowDpi;
+            }
         }
 
-        const int height = -MulDiv(fontSize_, dpi, 72);
+        const int height = -MulDiv(fontSize_, static_cast<int>(dpi), 72);
         font_ = CreateFontW(
             height,
             0,
@@ -1156,6 +1388,7 @@ private:
             rebarWindow_ = taskbarWindow_;
         }
 
+        bool dpiContextChanged = false;
         if (!widgetWindow_ || !IsWindow(widgetWindow_)) {
             widgetWindow_ = CreateWindowExW(
                 WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
@@ -1170,8 +1403,16 @@ private:
                 nullptr,
                 instance_,
                 this);
+            dpiContextChanged = widgetWindow_ != nullptr;
         } else if (GetParent(widgetWindow_) != rebarWindow_) {
             SetParent(widgetWindow_, rebarWindow_);
+            dpiContextChanged = true;
+        }
+
+        // SetParent can move a PerMonitorV2 child into Explorer's DPI context.
+        // Rebuild the font only after the widget has its final taskbar parent.
+        if (dpiContextChanged) {
+            RecreateFont();
         }
 
         EnsureTooltip();
@@ -1260,6 +1501,7 @@ private:
                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
         }
 
+        UpdateTooltipRect();
         InvalidateWidget();
     }
 
@@ -1354,11 +1596,13 @@ private:
 
     void EnsureTooltip() {
         if (!widgetWindow_ || !IsWindow(widgetWindow_)) return;
-        if (tooltipWindow_ && IsWindow(tooltipWindow_)) return;
+        if (tooltipWindow_ && IsWindow(tooltipWindow_)) {
+            UpdateTooltipRect();
+            return;
+        }
 
-        // TrafficMonitor uses the standard Win32 tooltip control for its whole
-        // taskbar window. We do the same, but use a TRACK tool so Explorer's
-        // cross-process taskbar parenting cannot interfere with hit testing.
+        // Match TrafficMonitor's proven model: one standard tooltip tool covering
+        // the whole taskbar widget, with the real mouse MSG relayed before dispatch.
         tooltipWindow_ = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_NOACTIVATE,
             TOOLTIPS_CLASSW,
@@ -1373,9 +1617,9 @@ private:
 
         TOOLINFOW info{};
         info.cbSize = sizeof(info);
-        info.uFlags = TTF_TRACK | TTF_ABSOLUTE;
         info.hwnd = widgetWindow_;
         info.uId = 1;
+        GetClientRect(widgetWindow_, &info.rect);
         info.lpszText = tooltipBuffer_.data();
         if (!SendMessageW(
                 tooltipWindow_,
@@ -1388,6 +1632,8 @@ private:
         }
 
         SendMessageW(tooltipWindow_, TTM_SETMAXTIPWIDTH, 0, 520);
+        SendMessageW(tooltipWindow_, TTM_SETDELAYTIME, TTDT_INITIAL, 250);
+        SendMessageW(tooltipWindow_, TTM_SETDELAYTIME, TTDT_RESHOW, 100);
         SendMessageW(tooltipWindow_, TTM_SETDELAYTIME, TTDT_AUTOPOP, 20000);
         SetWindowPos(
             tooltipWindow_,
@@ -1396,70 +1642,58 @@ private:
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     }
 
-    void ArmTooltipHover(HWND hwnd) {
+    void UpdateTooltipRect() {
+        if (!tooltipWindow_ || !IsWindow(tooltipWindow_) ||
+            !widgetWindow_ || !IsWindow(widgetWindow_)) {
+            return;
+        }
+
+        TOOLINFOW info{};
+        info.cbSize = sizeof(info);
+        info.hwnd = widgetWindow_;
+        info.uId = 1;
+        GetClientRect(widgetWindow_, &info.rect);
+        SendMessageW(
+            tooltipWindow_,
+            TTM_NEWTOOLRECTW,
+            0,
+            reinterpret_cast<LPARAM>(&info));
+    }
+
+    void RelayTooltipMessage(const MSG& message) {
+        if (!widgetWindow_ || message.hwnd != widgetWindow_) return;
+        if (message.message != WM_MOUSEMOVE &&
+            message.message != WM_LBUTTONDOWN &&
+            message.message != WM_LBUTTONUP &&
+            message.message != WM_MBUTTONDOWN &&
+            message.message != WM_MBUTTONUP) {
+            return;
+        }
+
         EnsureTooltip();
         if (!tooltipWindow_ || !IsWindow(tooltipWindow_)) return;
+        UpdateTooltipText();
 
+        MSG relay = message;
+        SendMessageW(
+            tooltipWindow_,
+            TTM_RELAYEVENT,
+            0,
+            reinterpret_cast<LPARAM>(&relay));
+    }
+
+    void ArmTooltipLeave(HWND hwnd) {
         TRACKMOUSEEVENT tracking{};
         tracking.cbSize = sizeof(tracking);
-        tracking.dwFlags = TME_HOVER | TME_LEAVE;
+        tracking.dwFlags = TME_LEAVE;
         tracking.hwndTrack = hwnd;
-        tracking.dwHoverTime = 250;
         TrackMouseEvent(&tracking);
     }
 
-    void ShowTooltip(HWND hwnd) {
-        EnsureTooltip();
-        if (!tooltipWindow_ || !IsWindow(tooltipWindow_) ||
-            !hwnd || !IsWindow(hwnd)) {
-            return;
-        }
-
-        UpdateTooltipText();
-
-        POINT cursor{};
-        GetCursorPos(&cursor);
-
-        // On the user's left vertical taskbar, open the info box to the right
-        // of the pointer so it never covers the compact numbers being hovered.
-        const int x = cursor.x + 14;
-        const int y = cursor.y + 14;
-        SendMessageW(
-            tooltipWindow_,
-            TTM_TRACKPOSITION,
-            0,
-            MAKELPARAM(x, y));
-
-        TOOLINFOW info{};
-        info.cbSize = sizeof(info);
-        info.uFlags = TTF_TRACK | TTF_ABSOLUTE;
-        info.hwnd = widgetWindow_;
-        info.uId = 1;
-        info.lpszText = tooltipBuffer_.data();
-        SendMessageW(
-            tooltipWindow_,
-            TTM_TRACKACTIVATE,
-            TRUE,
-            reinterpret_cast<LPARAM>(&info));
-        tooltipActive_ = true;
-    }
-
     void HideTooltip() {
-        if (!tooltipWindow_ || !IsWindow(tooltipWindow_)) {
-            tooltipActive_ = false;
-            return;
+        if (tooltipWindow_ && IsWindow(tooltipWindow_)) {
+            SendMessageW(tooltipWindow_, TTM_POP, 0, 0);
         }
-
-        TOOLINFOW info{};
-        info.cbSize = sizeof(info);
-        info.uFlags = TTF_TRACK | TTF_ABSOLUTE;
-        info.hwnd = widgetWindow_;
-        info.uId = 1;
-        SendMessageW(
-            tooltipWindow_,
-            TTM_TRACKACTIVATE,
-            FALSE,
-            reinterpret_cast<LPARAM>(&info));
         tooltipActive_ = false;
     }
 
@@ -1523,7 +1757,6 @@ private:
             widgetWindow_ && IsWindow(widgetWindow_)) {
             TOOLINFOW info{};
             info.cbSize = sizeof(info);
-            info.uFlags = TTF_TRACK | TTF_ABSOLUTE;
             info.hwnd = widgetWindow_;
             info.uId = 1;
             info.lpszText = tooltipBuffer_.data();
@@ -1560,7 +1793,7 @@ private:
         case kMenuAbout:
             MessageBoxW(
                 mainWindow_,
-                L"CodexTaskbar v0.2.3\n\n"
+                L"CodexTaskbar v0.2.4\n\n"
                 L"在 Windows 10 任务栏显示 Codex 配额、绑定会话上下文/缓存和本轮代码改动。\n"
                 L"配额来自官方 app-server；会话指标通过只读 Codex Desktop IPC follower 获取。",
                 L"关于 CodexTaskbar",
@@ -1692,6 +1925,9 @@ private:
     HWND rebarWindow_{nullptr};
     HWND tooltipWindow_{nullptr};
     HFONT font_{nullptr};
+    HBRUSH darkBackgroundBrush_{nullptr};
+    HBRUSH darkControlBrush_{nullptr};
+    HBRUSH darkMenuBrush_{nullptr};
 
     UINT taskbarCreatedMessage_{0};
     bool trayAdded_{false};
