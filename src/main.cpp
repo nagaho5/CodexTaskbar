@@ -914,6 +914,53 @@ public:
         return std::nullopt;
     }
 
+    std::int64_t GenerationGapThresholdMs() const {
+        if (generationSpeedRecent_.size() < 3) {
+            return 5000;
+        }
+
+        std::vector<std::int64_t> intervals;
+        intervals.reserve(generationSpeedRecent_.size());
+        for (const auto& sample : generationSpeedRecent_) {
+            if (sample.intervalMs > 0) {
+                intervals.push_back(sample.intervalMs);
+            }
+        }
+        if (intervals.size() < 3) return 5000;
+
+        std::sort(intervals.begin(), intervals.end());
+        const std::int64_t median =
+            intervals[intervals.size() / 2];
+        return std::max<std::int64_t>(3000, median * 4);
+    }
+
+    std::optional<double> RecentGenerationAverage() const {
+        if (generationSpeedRecent_.size() < 5) {
+            return std::nullopt;
+        }
+
+        std::vector<double> speeds;
+        speeds.reserve(generationSpeedRecent_.size());
+        for (const auto& sample : generationSpeedRecent_) {
+            speeds.push_back(sample.speed);
+        }
+        std::sort(speeds.begin(), speeds.end());
+
+        std::size_t begin = 0;
+        std::size_t end = speeds.size();
+        if (speeds.size() >= 5) {
+            begin = 1;
+            end = speeds.size() - 1;
+        }
+        if (begin >= end) return std::nullopt;
+
+        double sum = 0.0;
+        for (std::size_t i = begin; i < end; ++i) {
+            sum += speeds[i];
+        }
+        return sum / static_cast<double>(end - begin);
+    }
+
     void ApplyThreadMetrics(const ThreadMetrics& metrics) {
         const int oldRows = VisibleRowCount();
         const std::int64_t nowMs = CurrentUnixMilliseconds();
@@ -949,8 +996,6 @@ public:
             generationSpeedTurnId_ = metrics.turnId;
             generationSpeedValid_ = false;
             generationSpeed_ = 0.0;
-            generationSpeedSampleSum_ = 0.0;
-            generationSpeedSampleCount_ = 0;
             generationSpeedRecent_.clear();
             generationSpeedLastOutputTokens_ =
                 metrics.hasTokenUsage ? metrics.outputTokens : 0;
@@ -958,6 +1003,7 @@ public:
         } else if (metrics.activeTurn && metrics.hasTokenUsage) {
             if (metrics.outputTokens < generationSpeedLastOutputTokens_) {
                 generationSpeedValid_ = false;
+                generationSpeedRecent_.clear();
                 generationSpeedLastOutputTokens_ = metrics.outputTokens;
                 generationSpeedLastSampleMs_ = nowMs;
             } else if (metrics.outputTokens > generationSpeedLastOutputTokens_) {
@@ -965,20 +1011,31 @@ public:
                     metrics.outputTokens - generationSpeedLastOutputTokens_;
                 const std::int64_t deltaMs =
                     nowMs - generationSpeedLastSampleMs_;
-                if (deltaMs > 0) {
+                const std::int64_t longGapThreshold =
+                    GenerationGapThresholdMs();
+
+                // Buffered IPC frames can arrive almost back-to-back and create
+                // absurd multi-thousand token/s spikes. Tool/network pauses do
+                // the opposite. Both are baseline-only events.
+                const bool timingValid =
+                    deltaMs >= 250 &&
+                    deltaMs <= longGapThreshold;
+
+                if (timingValid && deltaTokens > 0) {
                     generationSpeed_ =
                         static_cast<double>(deltaTokens) * 1000.0 /
                         static_cast<double>(deltaMs);
                     generationSpeedValid_ = true;
 
-                    generationSpeedSampleSum_ += generationSpeed_;
-                    ++generationSpeedSampleCount_;
-                    generationSpeedRecent_.push_back(generationSpeed_);
-                    if (generationSpeedRecent_.size() > 5) {
+                    generationSpeedRecent_.push_back({
+                        generationSpeed_,
+                        deltaMs});
+                    if (generationSpeedRecent_.size() > 8) {
                         generationSpeedRecent_.erase(
                             generationSpeedRecent_.begin());
                     }
                 }
+
                 generationSpeedLastOutputTokens_ = metrics.outputTokens;
                 generationSpeedLastSampleMs_ = nowMs;
             }
@@ -2977,8 +3034,16 @@ private:
 
     std::wstring GenerationSpeedText() const {
         if (!generationSpeedValid_) return L"--";
+
+        double value = generationSpeed_;
+        if (generationSpeedMode_ == 1) {
+            if (const auto average = RecentGenerationAverage()) {
+                value = *average;
+            }
+        }
+
         wchar_t text[32]{};
-        swprintf_s(text, L"%.1f", generationSpeed_);
+        swprintf_s(text, L"%.1f", value);
         return text;
     }
 
@@ -3321,17 +3386,16 @@ private:
             text += L"暂无";
         }
 
-        text += L"\r\n本轮平均：";
-        if (generationSpeedSampleCount_ > 0) {
+        text += L"\r\n最近平均：";
+        if (const auto averageValue = RecentGenerationAverage()) {
             wchar_t average[32]{};
             swprintf_s(
                 average,
                 L"%.1f token/s",
-                generationSpeedSampleSum_ /
-                    static_cast<double>(generationSpeedSampleCount_));
+                *averageValue);
             text += average;
         } else {
-            text += L"暂无";
+            text += L"样本不足";
         }
 
         text += L"\r\n最近速度：";
@@ -3339,7 +3403,10 @@ private:
             for (std::size_t i = 0; i < generationSpeedRecent_.size(); ++i) {
                 if (i > 0) text += L" / ";
                 wchar_t sample[24]{};
-                swprintf_s(sample, L"%.1f", generationSpeedRecent_[i]);
+                swprintf_s(
+                    sample,
+                    L"%.1f",
+                    generationSpeedRecent_[i].speed);
                 text += sample;
             }
         } else {
