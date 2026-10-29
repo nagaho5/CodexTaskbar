@@ -1017,14 +1017,17 @@ public:
                 const std::int64_t longGapThreshold =
                     GenerationGapThresholdMs();
 
-                // Buffered IPC frames can arrive almost back-to-back and create
-                // absurd multi-thousand token/s spikes. Tool/network pauses do
-                // the opposite. Both are baseline-only events.
-                const bool timingValid =
-                    deltaMs >= 250 &&
-                    deltaMs <= longGapThreshold;
-
-                if (timingValid && deltaTokens > 0) {
+                // Very short IPC updates are common. Keep the previous
+                // baseline so several short updates accumulate into one
+                // measurable interval instead of being rejected forever.
+                if (deltaMs < 250) {
+                    // Intentionally do not advance token/time baseline.
+                } else if (deltaMs > longGapThreshold) {
+                    // Tool/network/approval pause: start a new generation
+                    // burst without counting the long idle gap.
+                    generationSpeedLastOutputTokens_ = metrics.outputTokens;
+                    generationSpeedLastSampleMs_ = nowMs;
+                } else if (deltaTokens > 0) {
                     generationSpeed_ =
                         static_cast<double>(deltaTokens) * 1000.0 /
                         static_cast<double>(deltaMs);
@@ -1037,10 +1040,11 @@ public:
                         generationSpeedRecent_.erase(
                             generationSpeedRecent_.begin());
                     }
-                }
 
-                generationSpeedLastOutputTokens_ = metrics.outputTokens;
-                generationSpeedLastSampleMs_ = nowMs;
+                    // Advance only after accepting a real sample.
+                    generationSpeedLastOutputTokens_ = metrics.outputTokens;
+                    generationSpeedLastSampleMs_ = nowMs;
+                }
             }
         }
 
@@ -3249,31 +3253,67 @@ private:
 
         RECT client{};
         GetClientRect(hwnd, &client);
-        FillRect(dc, &client, darkBackgroundBrush_);
+        const int width =
+            std::max(1, static_cast<int>(client.right - client.left));
+        const int height =
+            std::max(1, static_cast<int>(client.bottom - client.top));
+
+        HDC memoryDc = CreateCompatibleDC(dc);
+        HBITMAP bitmap = CreateCompatibleBitmap(dc, width, height);
+        HGDIOBJ oldBitmap =
+            (memoryDc && bitmap) ? SelectObject(memoryDc, bitmap) : nullptr;
+        HDC target = (memoryDc && bitmap) ? memoryDc : dc;
+
+        FillRect(target, &client, darkBackgroundBrush_);
 
         HPEN border = CreatePen(PS_SOLID, 1, RGB(82, 82, 82));
-        HGDIOBJ oldPen = border ? SelectObject(dc, border) : nullptr;
-        HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
-        Rectangle(dc, client.left, client.top, client.right, client.bottom);
-        SelectObject(dc, oldBrush);
-        if (oldPen) SelectObject(dc, oldPen);
+        HGDIOBJ oldPen = border ? SelectObject(target, border) : nullptr;
+        HGDIOBJ oldBrush =
+            SelectObject(target, GetStockObject(NULL_BRUSH));
+        Rectangle(
+            target,
+            client.left,
+            client.top,
+            client.right,
+            client.bottom);
+        SelectObject(target, oldBrush);
+        if (oldPen) SelectObject(target, oldPen);
         if (border) DeleteObject(border);
 
-        SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, RGB(242, 242, 242));
-        HFONT oldFont = font_ ? static_cast<HFONT>(SelectObject(dc, font_)) : nullptr;
+        SetBkMode(target, TRANSPARENT);
+        SetTextColor(target, RGB(242, 242, 242));
+        HFONT oldFont = font_
+            ? static_cast<HFONT>(SelectObject(target, font_))
+            : nullptr;
 
         RECT textRect = client;
         const int padding = 10;
         InflateRect(&textRect, -padding, -padding);
         DrawTextW(
-            dc,
+            target,
             tooltipBuffer_.data(),
             -1,
             &textRect,
             DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX);
 
-        if (oldFont) SelectObject(dc, oldFont);
+        if (oldFont) SelectObject(target, oldFont);
+
+        if (memoryDc && bitmap) {
+            BitBlt(
+                dc,
+                0,
+                0,
+                width,
+                height,
+                memoryDc,
+                0,
+                0,
+                SRCCOPY);
+            SelectObject(memoryDc, oldBitmap);
+        }
+        if (bitmap) DeleteObject(bitmap);
+        if (memoryDc) DeleteDC(memoryDc);
+
         EndPaint(hwnd, &ps);
     }
 
@@ -3359,7 +3399,7 @@ private:
             height,
             SWP_NOACTIVATE | SWP_SHOWWINDOW);
         hoverPopupVisible_ = true;
-        InvalidateRect(hoverWindow_, nullptr, TRUE);
+        InvalidateRect(hoverWindow_, nullptr, FALSE);
     }
 
     void HideHoverPopup() {
@@ -3609,7 +3649,7 @@ private:
         wcsncpy_s(tooltipBuffer_.data(), tooltipBuffer_.size(), text.c_str(), _TRUNCATE);
 
         if (hoverPopupVisible_ && hoverWindow_ && IsWindow(hoverWindow_)) {
-            InvalidateRect(hoverWindow_, nullptr, TRUE);
+            InvalidateRect(hoverWindow_, nullptr, FALSE);
         }
     }
 
@@ -3653,7 +3693,7 @@ private:
         case kMenuAbout:
             MessageBoxW(
                 mainWindow_,
-                L"CodexTaskbar v0.3.8\n\n"
+                L"CodexTaskbar v0.3.9\n\n"
                 L"在 Windows 10 任务栏显示 Codex 配额、绑定会话上下文/缓存和本轮代码改动。\n"
                 L"配额来自官方 app-server；会话指标通过只读 Codex Desktop IPC follower 获取。",
                 L"关于 CodexTaskbar",
