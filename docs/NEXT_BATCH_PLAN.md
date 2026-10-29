@@ -90,10 +90,14 @@ Recommended recent-average algorithm:
 Interruption filtering:
 
 - Long gaps caused by tool calls, network waits, approval waits, or other non-generation work should not be counted as slow generation.
-- If the interval since the previous output-token increase exceeds a conservative interruption threshold, treat it as a new generation burst:
+- If the interval since the previous output-token increase is clearly longer than normal generation cadence, treat it as a new generation burst:
   - update the baseline timestamp/token count;
   - do not add that long-gap interval to the rolling average.
-- Initial proposed threshold: 3 seconds, subject to real-device validation against the actual Codex IPC token-update cadence.
+- Use an adaptive threshold rather than a hard 3-second cutoff:
+  - absolute floor: 3 seconds;
+  - once enough normal intervals exist, threshold = max(3 seconds, 4 × median of recent valid interval durations).
+- Before enough history exists, use a conservative 5-second startup threshold.
+- This avoids misclassifying a naturally slower IPC token-update cadence while still excluding obvious tool/network/approval pauses.
 - This fixes the current weakness where the first token update after a long tool call can inherit the entire pause in deltaTime.
 
 Runtime cost:
