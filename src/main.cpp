@@ -451,7 +451,7 @@ std::wstring FormatDurationCompact(std::int64_t milliseconds) {
             static_cast<long long>(minutes),
             static_cast<long long>(seconds));
     } else {
-        swprintf_s(text, L"%02lld:%02lld",
+        swprintf_s(text, L"%lld:%02lld",
             static_cast<long long>(minutes),
             static_cast<long long>(seconds));
     }
@@ -731,6 +731,7 @@ public:
                     quotaValid_ = false;
                     threadMetrics_ = {};
                     generationSpeedValid_ = false;
+                    fiveHourRateBaselineValid_ = false;
                     rendererActivityMonitor_.Reset();
                     UpdateBlinkTimer();
                     InvalidateWidget();
@@ -748,9 +749,25 @@ public:
     }
 
     void ApplyQuota(const QuotaSnapshot& snapshot) {
+        const std::int64_t nowMs = CurrentUnixMilliseconds();
+
+        if (fiveHourRateBaselineValid_ &&
+            snapshot.fiveHour.valid &&
+            snapshot.fiveHour.resetsAtUnix != fiveHourRateResetAtUnix_) {
+            // The 5h window rolled over while the task was still running.
+            // Restart the rate baseline at the new window instead of mixing
+            // percentages from two different windows.
+            fiveHourRateBaselineValid_ = false;
+        }
+
         quota_ = snapshot;
         quotaValid_ = true;
-        lastQuotaSuccessMs_ = CurrentUnixMilliseconds();
+        lastQuotaSuccessMs_ = nowMs;
+
+        if (threadMetrics_.activeTurn && !fiveHourRateBaselineValid_) {
+            StartFiveHourRateBaseline(threadMetrics_, nowMs);
+        }
+
         InvalidateWidget();
         UpdateTooltipText();
         UpdateTrayTip();
@@ -763,6 +780,48 @@ public:
         UpdateTrayTip();
     }
 
+    void StartFiveHourRateBaseline(
+        const ThreadMetrics& metrics,
+        std::int64_t nowMs) {
+        if (!metrics.activeTurn ||
+            !quotaValid_ ||
+            !quota_.fiveHour.valid) {
+            return;
+        }
+
+        fiveHourRateBaselineValid_ = true;
+        fiveHourRateStartRemaining_ = quota_.fiveHour.remainingPercent;
+        fiveHourRateResetAtUnix_ = quota_.fiveHour.resetsAtUnix;
+        fiveHourRateStartMs_ =
+            metrics.turnStartedAtMs > 0 ? metrics.turnStartedAtMs : nowMs;
+        fiveHourRateThreadId_ = metrics.threadId;
+        fiveHourRateTurnId_ = metrics.turnId;
+    }
+
+    std::optional<double> CurrentFiveHourConsumptionRate() const {
+        if (!fiveHourRateBaselineValid_ ||
+            !threadMetrics_.activeTurn ||
+            !quotaValid_ ||
+            !quota_.fiveHour.valid ||
+            quota_.fiveHour.resetsAtUnix != fiveHourRateResetAtUnix_ ||
+            fiveHourRateStartMs_ <= 0) {
+            return std::nullopt;
+        }
+
+        const int consumed =
+            fiveHourRateStartRemaining_ - quota_.fiveHour.remainingPercent;
+        if (consumed < 0) return std::nullopt;
+
+        const std::int64_t elapsedMs =
+            CurrentUnixMilliseconds() - fiveHourRateStartMs_;
+        if (elapsedMs <= 0) return std::nullopt;
+
+        const double elapsedMinutes =
+            static_cast<double>(elapsedMs) / 60000.0;
+        return static_cast<double>(consumed) /
+            std::max(0.001, elapsedMinutes);
+    }
+
     void ApplyThreadMetrics(const ThreadMetrics& metrics) {
         const int oldRows = VisibleRowCount();
         const std::int64_t nowMs = CurrentUnixMilliseconds();
@@ -770,11 +829,29 @@ public:
         const bool identityChanged =
             metrics.threadId != generationSpeedThreadId_ ||
             metrics.turnId != generationSpeedTurnId_;
+        const bool rateIdentityChanged =
+            metrics.threadId != fiveHourRateThreadId_ ||
+            metrics.turnId != fiveHourRateTurnId_;
+
+        if (rateIdentityChanged) {
+            fiveHourRateBaselineValid_ = false;
+            fiveHourRateThreadId_ = metrics.threadId;
+            fiveHourRateTurnId_ = metrics.turnId;
+            if (metrics.activeTurn) {
+                StartFiveHourRateBaseline(metrics, nowMs);
+            }
+        } else if (metrics.activeTurn && !fiveHourRateBaselineValid_) {
+            StartFiveHourRateBaseline(metrics, nowMs);
+        }
+
         if (identityChanged) {
             generationSpeedThreadId_ = metrics.threadId;
             generationSpeedTurnId_ = metrics.turnId;
             generationSpeedValid_ = false;
             generationSpeed_ = 0.0;
+            generationSpeedSampleSum_ = 0.0;
+            generationSpeedSampleCount_ = 0;
+            generationSpeedRecent_.clear();
             generationSpeedLastOutputTokens_ =
                 metrics.hasTokenUsage ? metrics.outputTokens : 0;
             generationSpeedLastSampleMs_ = nowMs;
@@ -793,6 +870,14 @@ public:
                         static_cast<double>(deltaTokens) * 1000.0 /
                         static_cast<double>(deltaMs);
                     generationSpeedValid_ = true;
+
+                    generationSpeedSampleSum_ += generationSpeed_;
+                    ++generationSpeedSampleCount_;
+                    generationSpeedRecent_.push_back(generationSpeed_);
+                    if (generationSpeedRecent_.size() > 5) {
+                        generationSpeedRecent_.erase(
+                            generationSpeedRecent_.begin());
+                    }
                 }
                 generationSpeedLastOutputTokens_ = metrics.outputTokens;
                 generationSpeedLastSampleMs_ = nowMs;
@@ -1244,8 +1329,14 @@ public:
 
         generationSpeedValid_ = false;
         generationSpeed_ = 0.0;
+        generationSpeedSampleSum_ = 0.0;
+        generationSpeedSampleCount_ = 0;
+        generationSpeedRecent_.clear();
         generationSpeedThreadId_.clear();
         generationSpeedTurnId_.clear();
+        fiveHourRateBaselineValid_ = false;
+        fiveHourRateThreadId_.clear();
+        fiveHourRateTurnId_.clear();
 
         WriteRegistryDword(L"AutomaticThreadMode", 0);
         WriteRegistryString(L"ManualThreadId", manualThreadId_);
@@ -1270,18 +1361,30 @@ public:
         menuInfo.hbrBack = darkMenuBrush_;
         SetMenuInfo(menu, &menuInfo);
 
-        if (!savedThreads_.empty()) {
-            HMENU threadsMenu = CreatePopupMenu();
-            if (threadsMenu) {
-                MENUINFO childInfo{};
-                childInfo.cbSize = sizeof(childInfo);
-                childInfo.fMask = MIM_BACKGROUND;
-                childInfo.hbrBack = darkMenuBrush_;
-                SetMenuInfo(threadsMenu, &childInfo);
+        AppendMenuW(
+            menu,
+            MF_OWNERDRAW,
+            kMenuSettings,
+            reinterpret_cast<LPCWSTR>(L"设置..."));
 
-                const std::size_t count = std::min<std::size_t>(
-                    savedThreads_.size(),
-                    kMenuThreadLimit);
+        HMENU threadsMenu = CreatePopupMenu();
+        if (threadsMenu) {
+            MENUINFO childInfo{};
+            childInfo.cbSize = sizeof(childInfo);
+            childInfo.fMask = MIM_BACKGROUND;
+            childInfo.hbrBack = darkMenuBrush_;
+            SetMenuInfo(threadsMenu, &childInfo);
+
+            const std::size_t count = std::min<std::size_t>(
+                savedThreads_.size(),
+                kMenuThreadLimit);
+            if (count == 0) {
+                AppendMenuW(
+                    threadsMenu,
+                    MF_OWNERDRAW | MF_GRAYED,
+                    0,
+                    reinterpret_cast<LPCWSTR>(L"暂无已保存对话"));
+            } else {
                 for (std::size_t i = 0; i < count; ++i) {
                     UINT flags = MF_OWNERDRAW;
                     if (!automaticThreadMode_ &&
@@ -1294,21 +1397,17 @@ public:
                         kMenuThreadBase + static_cast<UINT>(i),
                         reinterpret_cast<LPCWSTR>(savedThreads_[i].name.c_str()));
                 }
-
-                AppendMenuW(
-                    menu,
-                    MF_POPUP | MF_OWNERDRAW,
-                    reinterpret_cast<UINT_PTR>(threadsMenu),
-                    reinterpret_cast<LPCWSTR>(L"对话"));
-                AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
             }
+
+            AppendMenuW(
+                menu,
+                MF_POPUP | MF_OWNERDRAW,
+                reinterpret_cast<UINT_PTR>(threadsMenu),
+                reinterpret_cast<LPCWSTR>(L"选择对话  ▶"));
+            AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         }
 
-        AppendMenuW(
-            menu,
-            MF_OWNERDRAW,
-            kMenuSettings,
-            reinterpret_cast<LPCWSTR>(L"设置..."));
+
         AppendMenuW(
             menu,
             MF_OWNERDRAW | (autoStart_ ? MF_CHECKED : MF_UNCHECKED),
@@ -1384,8 +1483,8 @@ public:
             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            500,
-            720,
+            780,
+            700,
             mainWindow_,
             nullptr,
             instance_,
@@ -1413,24 +1512,32 @@ public:
     }
 
     void CreateSettingsControls(HWND hwnd) {
-        CreateWindowW(L"STATIC", L"字号 (pt)：", WS_CHILD | WS_VISIBLE,
-            24, 20, 90, 24, hwnd, nullptr, instance_, nullptr);
+        auto checkbox = [&](int id, const wchar_t* text, int x, int y, bool checked, int width = 190) {
+            HWND control = CreateWindowW(
+                L"BUTTON", text, WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+                x, y, width, 24, hwnd,
+                reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), instance_, nullptr);
+            SendMessageW(control, BM_SETCHECK, checked ? BST_CHECKED : BST_UNCHECKED, 0);
+        };
 
+        // Font controls span the full width.
+        CreateWindowW(L"STATIC", L"字号 (pt)：", WS_CHILD | WS_VISIBLE,
+            24, 20, 82, 24, hwnd, nullptr, instance_, nullptr);
         HWND fontEdit = CreateWindowExW(
             WS_EX_CLIENTEDGE, L"EDIT", nullptr,
             WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-            118, 16, 72, 26, hwnd,
+            106, 16, 86, 28, hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kEditFontSize)), instance_, nullptr);
         wchar_t fontValue[16]{};
         swprintf_s(fontValue, L"%.1f", fontSize_);
         SetWindowTextW(fontEdit, fontValue);
 
         CreateWindowW(L"STATIC", L"字体：", WS_CHILD | WS_VISIBLE,
-            210, 20, 48, 24, hwnd, nullptr, instance_, nullptr);
+            232, 20, 52, 24, hwnd, nullptr, instance_, nullptr);
         HWND fontCombo = CreateWindowExW(
             WS_EX_CLIENTEDGE, L"COMBOBOX", nullptr,
             WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
-            258, 16, 200, 180, hwnd,
+            284, 16, 310, 180, hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kComboFontChoice)), instance_, nullptr);
         SendMessageW(fontCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Segoe UI Semibold（原版）"));
         SendMessageW(fontCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Bahnschrift Regular"));
@@ -1439,58 +1546,53 @@ public:
         SendMessageW(fontCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Bahnschrift SemiCondensed"));
         SendMessageW(fontCombo, CB_SETCURSEL, static_cast<WPARAM>(fontChoice_), 0);
 
-        CreateWindowW(L"STATIC", L"任务栏显示：", WS_CHILD | WS_VISIBLE,
-            24, 54, 100, 22, hwnd, nullptr, instance_, nullptr);
+        // Left column: what appears on the taskbar.
+        CreateWindowW(L"STATIC", L"任务栏显示", WS_CHILD | WS_VISIBLE,
+            24, 62, 180, 24, hwnd, nullptr, instance_, nullptr);
+        checkbox(kCheckShowFiveHourPercent, L"5小时百分比", 24, 88, showFiveHourPercent_, 200);
+        checkbox(kCheckShowFiveHourTime, L"5小时恢复时间", 24, 116, showFiveHourTime_, 200);
+        checkbox(kCheckShowSevenDayPercent, L"7天百分比", 24, 144, showSevenDayPercent_, 200);
+        checkbox(kCheckShowContext, L"Context百分比", 24, 172, showContext_, 200);
+        checkbox(kCheckShowCache, L"Cache命中率", 24, 200, showCache_, 200);
+        checkbox(kCheckShowDiff, L"代码改动", 24, 228, showDiff_, 130);
+        checkbox(kCheckShowDiffFiles, L"显示文件数", 164, 228, showDiffFiles_, 130);
+        checkbox(kCheckShowTaskDuration, L"任务耗时", 24, 256, showTaskDuration_, 130);
+        checkbox(kCheckShowGenerationSpeed, L"生成速度", 164, 256, showGenerationSpeed_, 130);
 
-        auto checkbox = [&](int id, const wchar_t* text, int x, int y, bool checked, int width = 150) {
-            HWND control = CreateWindowW(
-                L"BUTTON", text, WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                x, y, width, 22, hwnd,
-                reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), instance_, nullptr);
-            SendMessageW(control, BM_SETCHECK, checked ? BST_CHECKED : BST_UNCHECKED, 0);
-        };
+        // Right column: presentation and alert behavior.
+        CreateWindowW(L"STATIC", L"显示样式与提醒", WS_CHILD | WS_VISIBLE,
+            400, 62, 200, 24, hwnd, nullptr, instance_, nullptr);
 
-        checkbox(kCheckShowFiveHourPercent, L"5小时百分比", 24, 78, showFiveHourPercent_);
-        checkbox(kCheckShowFiveHourTime, L"5小时恢复时间", 210, 78, showFiveHourTime_, 180);
-        checkbox(kCheckShowSevenDayPercent, L"7天百分比", 24, 103, showSevenDayPercent_);
-        checkbox(kCheckShowContext, L"Context百分比", 210, 103, showContext_, 180);
-        checkbox(kCheckShowCache, L"Cache命中率", 24, 128, showCache_);
-        checkbox(kCheckShowDiff, L"代码改动", 210, 128, showDiff_, 100);
-        checkbox(kCheckShowDiffFiles, L"显示文件数", 318, 128, showDiffFiles_, 112);
-        checkbox(kCheckShowTaskDuration, L"任务耗时", 24, 153, showTaskDuration_);
-        checkbox(kCheckShowGenerationSpeed, L"生成速度", 118, 153, showGenerationSpeed_, 92);
-
-        CreateWindowW(
-            L"STATIC", L"运行中颜色：", WS_CHILD | WS_VISIBLE,
-            225, 153, 88, 22, hwnd, nullptr, instance_, nullptr);
+        CreateWindowW(L"STATIC", L"运行中颜色：", WS_CHILD | WS_VISIBLE,
+            400, 90, 96, 24, hwnd, nullptr, instance_, nullptr);
         CreateWindowW(
             L"BUTTON", L"选择...", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            313, 149, 70, 26, hwnd,
+            496, 84, 82, 28, hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kButtonWorkingColor)), instance_, nullptr);
         CreateWindowW(
             L"STATIC", L"76%", WS_CHILD | WS_VISIBLE | SS_CENTER,
-            390, 153, 48, 22, hwnd,
+            590, 90, 54, 24, hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kStaticWorkingColorPreview)), instance_, nullptr);
 
-        checkbox(kCheckContextWarningColors, L"Context警告色(80/90%)",
-            24, 183, contextWarningColors_, 190);
-        checkbox(kCheckQuotaWarningColors, L"配额警告色(20/10%)",
-            225, 183, quotaWarningColors_, 190);
+        checkbox(kCheckContextWarningColors, L"Context警告色 (80/90%)",
+            400, 122, contextWarningColors_, 250);
+        checkbox(kCheckQuotaWarningColors, L"配额警告色 (20/10%)",
+            400, 150, quotaWarningColors_, 250);
         checkbox(kCheckDurationUnits, L"耗时使用 h/m/s 格式",
-            24, 208, durationUnits_, 190);
+            400, 178, durationUnits_, 250);
         checkbox(kCheckBlinkOnUserInput, L"等待输入时闪烁任务百分比",
-            225, 208, blinkOnUserInput_, 225);
+            400, 206, blinkOnUserInput_, 280);
         checkbox(kCheckHidePercentSigns, L"任务栏隐藏 %",
-            24, 233, hidePercentSigns_, 190);
-        checkbox(kCheckAutoFitFont, L"溢出时逐行微缩 (最多2pt)",
-            225, 233, autoFitFont_, 225);
+            400, 234, hidePercentSigns_, 220);
+        checkbox(kCheckAutoFitFont, L"溢出时逐行微缩 (最多 2pt)",
+            400, 262, autoFitFont_, 280);
 
         CreateWindowW(L"STATIC", L"Cache显示：", WS_CHILD | WS_VISIBLE,
-            24, 262, 90, 22, hwnd, nullptr, instance_, nullptr);
+            400, 294, 92, 24, hwnd, nullptr, instance_, nullptr);
         HWND cacheMode = CreateWindowExW(
             WS_EX_CLIENTEDGE, L"COMBOBOX", nullptr,
             WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
-            114, 257, 140, 150, hwnd,
+            494, 289, 170, 150, hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kComboCacheDisplayMode)), instance_, nullptr);
         SendMessageW(cacheMode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"整数"));
         SendMessageW(cacheMode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"1位小数"));
@@ -1498,58 +1600,58 @@ public:
         SendMessageW(cacheMode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"90+紧凑"));
         SendMessageW(cacheMode, CB_SETCURSEL, static_cast<WPARAM>(cacheDisplayMode_), 0);
 
-        CreateWindowW(L"STATIC", L"会话来源：", WS_CHILD | WS_VISIBLE,
-            24, 296, 100, 22, hwnd, nullptr, instance_, nullptr);
+        // Session section spans the whole lower half.
+        CreateWindowW(L"STATIC", L"会话来源", WS_CHILD | WS_VISIBLE,
+            24, 338, 180, 24, hwnd, nullptr, instance_, nullptr);
 
         HWND manualRadio = CreateWindowW(
-            L"BUTTON", L"手动绑定 Thread ID", WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON | WS_GROUP,
-            24, 320, 180, 22, hwnd,
+            L"BUTTON", L"手动绑定 Thread ID",
+            WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON | WS_GROUP,
+            24, 364, 220, 24, hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kRadioManualThread)), instance_, nullptr);
         HWND autoRadio = CreateWindowW(
-            L"BUTTON", L"自动跟随活动任务（实验）", WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON,
-            210, 320, 240, 22, hwnd,
+            L"BUTTON", L"自动跟随活动任务（实验）",
+            WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON,
+            270, 364, 250, 24, hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kRadioAutoThread)), instance_, nullptr);
         SendMessageW(manualRadio, BM_SETCHECK, automaticThreadMode_ ? BST_UNCHECKED : BST_CHECKED, 0);
         SendMessageW(autoRadio, BM_SETCHECK, automaticThreadMode_ ? BST_CHECKED : BST_UNCHECKED, 0);
 
         CreateWindowW(L"STATIC", L"当前 Thread ID：", WS_CHILD | WS_VISIBLE,
-            24, 356, 100, 22, hwnd, nullptr, instance_, nullptr);
+            24, 400, 112, 24, hwnd, nullptr, instance_, nullptr);
         CreateWindowExW(
             WS_EX_CLIENTEDGE, L"EDIT", manualThreadId_.c_str(),
             WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-            126, 352, 324, 26, hwnd,
+            138, 396, 600, 28, hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kEditThreadId)), instance_, nullptr);
 
-        CreateWindowW(L"STATIC", L"保存的对话（每行：名称|Thread ID）：",
-            WS_CHILD | WS_VISIBLE, 24, 390, 300, 22, hwnd, nullptr, instance_, nullptr);
+        CreateWindowW(
+            L"STATIC",
+            L"保存的对话（供右键“选择对话”使用；每行：名称|Thread ID）：",
+            WS_CHILD | WS_VISIBLE,
+            24, 438, 620, 24, hwnd, nullptr, instance_, nullptr);
         const std::wstring savedText = SerializeSavedThreads(savedThreads_);
         CreateWindowExW(
             WS_EX_CLIENTEDGE, L"EDIT", savedText.c_str(),
             WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL,
-            24, 414, 426, 82, hwnd,
+            24, 464, 714, 104, hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kEditSavedThreads)), instance_, nullptr);
 
         CreateWindowW(
             L"STATIC",
-            L"右键“对话”菜单只切换当前一个订阅；其它保存项不会后台跟踪。",
+            L"右键“选择对话”会在右侧展开保存清单；切换时只跟踪选中的一个 Thread，其它保存项不产生后台开销。",
             WS_CHILD | WS_VISIBLE,
-            24, 500, 430, 34, hwnd, nullptr, instance_, nullptr);
+            24, 574, 714, 42, hwnd, nullptr, instance_, nullptr);
 
-        checkbox(kCheckAutoStart, L"开机自动启动", 24, 540, autoStart_);
-
-        CreateWindowW(
-            L"STATIC",
-            L"提示：隐藏项目仍会在悬浮提示中显示；自动微缩只缩放不下的那一行。",
-            WS_CHILD | WS_VISIBLE,
-            24, 570, 440, 38, hwnd, nullptr, instance_, nullptr);
+        checkbox(kCheckAutoStart, L"开机自动启动", 24, 618, autoStart_, 180);
 
         CreateWindowW(
             L"BUTTON", L"确定", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            300, 620, 76, 28, hwnd,
+            574, 614, 78, 30, hwnd,
             reinterpret_cast<HMENU>(IDOK), instance_, nullptr);
         CreateWindowW(
             L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            388, 620, 76, 28, hwnd,
+            660, 614, 78, 30, hwnd,
             reinterpret_cast<HMENU>(IDCANCEL), instance_, nullptr);
 
         EnumChildWindows(
@@ -2911,6 +3013,15 @@ private:
             text += L"5小时：暂无数据";
         }
 
+        text += L"\r\n5h消耗速度（估算）：";
+        if (const auto rate = CurrentFiveHourConsumptionRate()) {
+            wchar_t rateText[48]{};
+            swprintf_s(rateText, L"%.3f%%/分钟", *rate);
+            text += rateText;
+        } else {
+            text += L"暂无";
+        }
+
         text += L"\r\n";
         if (quotaValid_ && quota_.sevenDay.valid) {
             text += L"7天：剩余 " + std::to_wstring(quota_.sevenDay.remainingPercent) + L"%";
@@ -2951,6 +3062,31 @@ private:
             wchar_t speed[32]{};
             swprintf_s(speed, L"%.1f token/s", generationSpeed_);
             text += speed;
+        } else {
+            text += L"暂无";
+        }
+
+        text += L"\r\n本轮平均：";
+        if (generationSpeedSampleCount_ > 0) {
+            wchar_t average[32]{};
+            swprintf_s(
+                average,
+                L"%.1f token/s",
+                generationSpeedSampleSum_ /
+                    static_cast<double>(generationSpeedSampleCount_));
+            text += average;
+        } else {
+            text += L"暂无";
+        }
+
+        text += L"\r\n最近速度：";
+        if (!generationSpeedRecent_.empty()) {
+            for (std::size_t i = 0; i < generationSpeedRecent_.size(); ++i) {
+                if (i > 0) text += L" / ";
+                wchar_t sample[24]{};
+                swprintf_s(sample, L"%.1f", generationSpeedRecent_[i]);
+                text += sample;
+            }
         } else {
             text += L"暂无";
         }
@@ -3076,7 +3212,7 @@ private:
         case kMenuAbout:
             MessageBoxW(
                 mainWindow_,
-                L"CodexTaskbar v0.3.5\n\n"
+                L"CodexTaskbar v0.3.6\n\n"
                 L"在 Windows 10 任务栏显示 Codex 配额、绑定会话上下文/缓存和本轮代码改动。\n"
                 L"配额来自官方 app-server；会话指标通过只读 Codex Desktop IPC follower 获取。",
                 L"关于 CodexTaskbar",
@@ -3267,10 +3403,21 @@ private:
 
     bool generationSpeedValid_{false};
     double generationSpeed_{0.0};
+    double generationSpeedSampleSum_{0.0};
+    std::size_t generationSpeedSampleCount_{0};
+    std::vector<double> generationSpeedRecent_;
     std::int64_t generationSpeedLastOutputTokens_{0};
     std::int64_t generationSpeedLastSampleMs_{0};
     std::string generationSpeedThreadId_;
     std::string generationSpeedTurnId_;
+
+    bool fiveHourRateBaselineValid_{false};
+    int fiveHourRateStartRemaining_{0};
+    std::int64_t fiveHourRateResetAtUnix_{0};
+    std::int64_t fiveHourRateStartMs_{0};
+    std::string fiveHourRateThreadId_;
+    std::string fiveHourRateTurnId_;
+
     std::array<wchar_t, 1024> tooltipBuffer_{};
     std::unique_ptr<DesktopThreadMonitor> threadMonitor_;
     RendererActivityMonitor rendererActivityMonitor_;
