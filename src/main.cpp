@@ -1997,7 +1997,9 @@ private:
             width = std::max(40, static_cast<int>(rebarClient.right - rebarClient.left) - 4);
             height = lineHeight * std::max(1, VisibleRowCount()) + 4;
         } else {
-            width = std::max(150, fontSize_ * 15);
+            width = std::max(
+                150,
+                static_cast<int>(std::lround(fontSize_ * 15.0)));
             height = std::max(24, std::min(static_cast<int>(rebarClient.bottom - rebarClient.top), lineHeight + 6));
         }
 
