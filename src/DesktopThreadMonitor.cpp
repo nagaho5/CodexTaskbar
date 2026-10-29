@@ -435,7 +435,7 @@ void DesktopThreadMonitor::WorkerMain() {
         }
 
         ApplyCurrentConfig(false);
-        if (!PumpPipe(250)) {
+        if (!PumpPipe(500)) {
             DisconnectPipe();
             PublishUnavailable();
             continue;
@@ -655,7 +655,15 @@ bool DesktopThreadMonitor::PumpPipe(DWORD timeoutMs) {
 
         if (available == 0) {
             if (std::chrono::steady_clock::now() >= deadline) return true;
-            Sleep(10);
+
+            // Lightweight idle path: wake at most twice per second, but let a
+            // stop/config change interrupt the wait immediately.
+            std::unique_lock lock(mutex_);
+            cv_.wait_for(lock, std::chrono::milliseconds(500), [this] {
+                return stop_ || !active_ ||
+                    configGeneration_ != lastAppliedConfigGeneration_;
+            });
+            if (stop_ || !active_) return true;
             continue;
         }
 
@@ -1063,10 +1071,21 @@ ThreadMetrics DesktopThreadMonitor::DeriveMetrics(const std::string& threadId, T
         // A single newest request can legitimately be ~100% cached and is much
         // noisier than the stable conversation-wide ratio shown by status tools.
         if (cumulative && cumulative->IsObject()) {
+            const std::int64_t total =
+                IntegerField(*cumulative, {"totalTokens", "total_tokens"}, 0);
             const std::int64_t input =
                 IntegerField(*cumulative, {"inputTokens", "input_tokens"}, 0);
             const std::int64_t cached =
                 IntegerField(*cumulative, {"cachedInputTokens", "cached_input_tokens"}, 0);
+            const std::int64_t output =
+                IntegerField(*cumulative, {"outputTokens", "output_tokens"}, 0);
+
+            if (total >= 0 && output >= 0) {
+                metrics.hasTokenUsage = total > 0 || output > 0;
+                metrics.totalTokens = total;
+                metrics.outputTokens = output;
+            }
+
             if (input > 0 && cached >= 0) {
                 metrics.hasCache = true;
                 metrics.inputTokens = input;
