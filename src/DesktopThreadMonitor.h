@@ -17,6 +17,7 @@ struct ThreadMetrics {
     bool connected{false};
     bool valid{false};
     bool activeTurn{false};
+    bool waitingForUserInput{false};
 
     std::string threadId;
     std::string turnId;

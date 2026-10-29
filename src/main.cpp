@@ -70,6 +70,7 @@ constexpr int kStaticWorkingColorPreview = 2015;
 constexpr int kCheckContextWarningColors = 2016;
 constexpr int kCheckQuotaWarningColors = 2017;
 constexpr int kCheckDurationUnits = 2018;
+constexpr int kCheckBlinkOnUserInput = 2019;
 
 constexpr COLORREF kDefaultWorkingColor = RGB(79, 195, 247);
 constexpr COLORREF kWarningYellow = RGB(255, 196, 64);
@@ -79,6 +80,7 @@ struct ColoredSegment {
     std::wstring text;
     COLORREF color{RGB(255, 255, 255)};
     bool workingUnderline{false};
+    bool hidden{false};
 };
 
 struct QuotaPayload {
@@ -521,7 +523,13 @@ public:
     }
 
     bool Initialize() {
-        fontSize_ = std::clamp(ReadRegistryDword(L"FontSize", 10), 8, 24);
+        const int savedFontTenths = ReadRegistryDword(L"FontSizeTenths", -1);
+        fontSize_ = static_cast<double>(std::clamp(
+            savedFontTenths >= 0
+                ? savedFontTenths
+                : ReadRegistryDword(L"FontSize", 10) * 10,
+            80,
+            240)) / 10.0;
         autoStart_ = ReadRegistryDword(L"AutoStart", 1) != 0;
         showFiveHourPercent_ = ReadRegistryDword(L"ShowFiveHourPercent", 1) != 0;
         showFiveHourTime_ = ReadRegistryDword(L"ShowFiveHourTime", 1) != 0;
@@ -537,6 +545,7 @@ public:
         contextWarningColors_ = ReadRegistryDword(L"ContextWarningColors", 0) != 0;
         quotaWarningColors_ = ReadRegistryDword(L"QuotaWarningColors", 0) != 0;
         durationUnits_ = ReadRegistryDword(L"DurationUnits", 0) != 0;
+        blinkOnUserInput_ = ReadRegistryDword(L"BlinkOnUserInput", 1) != 0;
         automaticThreadMode_ = ReadRegistryDword(L"AutomaticThreadMode", 0) != 0;
         manualThreadId_ = ReadRegistryString(L"ManualThreadId");
 
@@ -709,29 +718,46 @@ public:
 
         for (std::size_t i = 0; i < segments.size(); ++i) {
             if (segments[i].text.empty()) continue;
-            SetTextColor(dc, segments[i].color);
-            TextOutW(
-                dc,
-                x,
-                y,
-                segments[i].text.c_str(),
-                static_cast<int>(segments[i].text.size()));
 
-            if (segments[i].workingUnderline && sizes[i].cx > 0) {
-                const int underlineY = std::min(
-                    static_cast<int>(row.bottom) - 1,
-                    y + static_cast<int>(tm.tmHeight));
-                HPEN pen = CreatePen(PS_SOLID, 1, workingColor_);
-                HGDIOBJ oldPen = pen ? SelectObject(dc, pen) : nullptr;
-                MoveToEx(dc, x, underlineY, nullptr);
-                LineTo(dc, x + sizes[i].cx, underlineY);
-                if (oldPen) SelectObject(dc, oldPen);
-                if (pen) DeleteObject(pen);
+            if (!segments[i].hidden) {
+                SetTextColor(dc, segments[i].color);
+                TextOutW(
+                    dc,
+                    x,
+                    y,
+                    segments[i].text.c_str(),
+                    static_cast<int>(segments[i].text.size()));
+
+                if (segments[i].workingUnderline && sizes[i].cx > 0) {
+                    const int underlineY = std::min(
+                        static_cast<int>(row.bottom) - 1,
+                        y + static_cast<int>(tm.tmHeight));
+                    HPEN pen = CreatePen(PS_SOLID, 1, workingColor_);
+                    HGDIOBJ oldPen = pen ? SelectObject(dc, pen) : nullptr;
+                    MoveToEx(dc, x, underlineY, nullptr);
+                    LineTo(dc, x + sizes[i].cx, underlineY);
+                    if (oldPen) SelectObject(dc, oldPen);
+                    if (pen) DeleteObject(pen);
+                }
             }
 
             x += sizes[i].cx;
         }
         SetTextColor(dc, RGB(255, 255, 255));
+    }
+
+    bool WaitingInputBlinkHidden() const {
+        if (!blinkOnUserInput_ || !threadMetrics_.waitingForUserInput) {
+            return false;
+        }
+        return ((GetTickCount64() / 500) % 2) != 0;
+    }
+
+    void UpdateWaitingInputBlink() {
+        const bool hidden = WaitingInputBlinkHidden();
+        if (hidden == lastWaitingInputBlinkHidden_) return;
+        lastWaitingInputBlinkHidden_ = hidden;
+        InvalidateWidget();
     }
 
     bool SevenDayOnFirstLine() const {
@@ -774,7 +800,8 @@ public:
                     quota_.fiveHour.remainingPercent,
                     valid,
                     true),
-                threadMetrics_.activeTurn && quotaWarning});
+                threadMetrics_.activeTurn && quotaWarning,
+                valid && WaitingInputBlinkHidden()});
         }
         if (showFiveHourTime_) {
             segments.push_back({
@@ -784,6 +811,9 @@ public:
                 RGB(255, 255, 255)});
         } else if (showSevenDayPercent_) {
             const bool valid = quotaValid_ && quota_.sevenDay.valid;
+            if (!segments.empty()) {
+                segments.push_back({L" ", RGB(255, 255, 255)});
+            }
             segments.push_back({
                 valid
                     ? std::to_wstring(quota_.sevenDay.remainingPercent) + L"%"
@@ -829,7 +859,8 @@ public:
                     ? std::to_wstring(threadMetrics_.contextPercent) + L"%"
                     : L"--%",
                 ContextPercentColor(valid),
-                threadMetrics_.activeTurn && contextWarning});
+                threadMetrics_.activeTurn && contextWarning,
+                valid && WaitingInputBlinkHidden()});
         }
         if (showCache_) {
             append(
@@ -1120,11 +1151,11 @@ public:
 
         HWND fontEdit = CreateWindowExW(
             WS_EX_CLIENTEDGE, L"EDIT", nullptr,
-            WS_CHILD | WS_VISIBLE | ES_NUMBER | ES_AUTOHSCROLL,
+            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
             118, 16, 72, 26, hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kEditFontSize)), instance_, nullptr);
         wchar_t fontValue[16]{};
-        swprintf_s(fontValue, L"%d", fontSize_);
+        swprintf_s(fontValue, L"%.1f", fontSize_);
         SetWindowTextW(fontEdit, fontValue);
 
         CreateWindowW(L"STATIC", L"任务栏显示：", WS_CHILD | WS_VISIBLE,
@@ -1171,6 +1202,10 @@ public:
             kCheckDurationUnits,
             L"耗时使用 h/m/s 格式",
             24, 208, durationUnits_, 190);
+        checkbox(
+            kCheckBlinkOnUserInput,
+            L"等待输入时闪烁任务百分比",
+            225, 208, blinkOnUserInput_, 225);
 
         CreateWindowW(L"STATIC", L"会话来源：", WS_CHILD | WS_VISIBLE,
             24, 241, 100, 22, hwnd, nullptr, instance_, nullptr);
@@ -1364,8 +1399,14 @@ public:
     void SaveSettingsFromWindow(HWND hwnd) {
         wchar_t text[64]{};
         GetDlgItemTextW(hwnd, kEditFontSize, text, static_cast<int>(std::size(text)));
-        const int requested = _wtoi(text);
-        fontSize_ = std::clamp(requested, 8, 24);
+        wchar_t* end = nullptr;
+        const double requested = std::wcstod(text, &end);
+        if (end != text) {
+            fontSize_ = std::clamp(
+                std::round(requested * 10.0) / 10.0,
+                8.0,
+                24.0);
+        }
 
         auto checked = [&](int id) {
             return SendDlgItemMessageW(hwnd, id, BM_GETCHECK, 0, 0) == BST_CHECKED;
@@ -1384,6 +1425,7 @@ public:
         contextWarningColors_ = checked(kCheckContextWarningColors);
         quotaWarningColors_ = checked(kCheckQuotaWarningColors);
         durationUnits_ = checked(kCheckDurationUnits);
+        blinkOnUserInput_ = checked(kCheckBlinkOnUserInput);
         const bool previousAutomaticMode = automaticThreadMode_;
         automaticThreadMode_ = checked(kRadioAutoThread);
         if (previousAutomaticMode != automaticThreadMode_) {
@@ -1396,7 +1438,11 @@ public:
         while (!manualThreadId_.empty() && iswspace(manualThreadId_.front())) manualThreadId_.erase(manualThreadId_.begin());
         while (!manualThreadId_.empty() && iswspace(manualThreadId_.back())) manualThreadId_.pop_back();
 
-        WriteRegistryDword(L"FontSize", static_cast<DWORD>(fontSize_));
+        const int fontSizeTenths = static_cast<int>(std::lround(fontSize_ * 10.0));
+        WriteRegistryDword(L"FontSizeTenths", static_cast<DWORD>(fontSizeTenths));
+        WriteRegistryDword(
+            L"FontSize",
+            static_cast<DWORD>(std::lround(fontSize_)));
         WriteRegistryDword(L"AutoStart", autoStart_ ? 1u : 0u);
         WriteRegistryDword(L"ShowFiveHourPercent", showFiveHourPercent_ ? 1u : 0u);
         WriteRegistryDword(L"ShowFiveHourTime", showFiveHourTime_ ? 1u : 0u);
@@ -1410,6 +1456,7 @@ public:
         WriteRegistryDword(L"ContextWarningColors", contextWarningColors_ ? 1u : 0u);
         WriteRegistryDword(L"QuotaWarningColors", quotaWarningColors_ ? 1u : 0u);
         WriteRegistryDword(L"DurationUnits", durationUnits_ ? 1u : 0u);
+        WriteRegistryDword(L"BlinkOnUserInput", blinkOnUserInput_ ? 1u : 0u);
         WriteRegistryDword(L"AutomaticThreadMode", automaticThreadMode_ ? 1u : 0u);
         WriteRegistryString(L"ManualThreadId", manualThreadId_);
         SetAutoStartRegistry(autoStart_);
@@ -1477,6 +1524,7 @@ private:
                 return 0;
             }
             if (app && wParam == kHoverTimer) {
+                app->UpdateWaitingInputBlink();
                 app->UpdateHoverState();
                 return 0;
             }
@@ -1796,7 +1844,10 @@ private:
             }
         }
 
-        const int height = -MulDiv(fontSize_, static_cast<int>(dpi), 72);
+        const int height = -std::max(
+            1,
+            static_cast<int>(std::lround(
+                fontSize_ * static_cast<double>(dpi) / 72.0)));
         font_ = CreateFontW(
             height,
             0,
@@ -1946,7 +1997,9 @@ private:
             width = std::max(40, static_cast<int>(rebarClient.right - rebarClient.left) - 4);
             height = lineHeight * std::max(1, VisibleRowCount()) + 4;
         } else {
-            width = std::max(150, fontSize_ * 15);
+            width = std::max(
+                150,
+                static_cast<int>(std::lround(fontSize_ * 15.0)));
             height = std::max(24, std::min(static_cast<int>(rebarClient.bottom - rebarClient.top), lineHeight + 6));
         }
 
@@ -2020,6 +2073,7 @@ private:
                 ? FormatResetTime(quota_.fiveHour.resetsAtUnix)
                 : L"--:--";
         } else if (showSevenDayPercent_) {
+            if (!line.empty()) line.push_back(L' ');
             line += quotaValid_ && quota_.sevenDay.valid
                 ? std::to_wstring(quota_.sevenDay.remainingPercent) + L"%"
                 : L"--%";
@@ -2350,6 +2404,17 @@ private:
         text += L"\r\n会话连接：";
         text += threadMetrics_.connected ? L"已连接" : L"未连接";
 
+        text += L"\r\n任务状态：";
+        if (!threadMetrics_.valid) {
+            text += L"暂无";
+        } else if (threadMetrics_.waitingForUserInput) {
+            text += L"等待输入";
+        } else if (threadMetrics_.activeTurn) {
+            text += L"运行中";
+        } else {
+            text += L"空闲";
+        }
+
         text += L"\r\n";
         const std::int64_t taskDurationMs = CurrentTaskDurationMs();
         if (taskDurationMs >= 0) {
@@ -2441,7 +2506,7 @@ private:
         case kMenuAbout:
             MessageBoxW(
                 mainWindow_,
-                L"CodexTaskbar v0.3.2\n\n"
+                L"CodexTaskbar v0.3.3\n\n"
                 L"在 Windows 10 任务栏显示 Codex 配额、绑定会话上下文/缓存和本轮代码改动。\n"
                 L"配额来自官方 app-server；会话指标通过只读 Codex Desktop IPC follower 获取。",
                 L"关于 CodexTaskbar",
@@ -2611,8 +2676,10 @@ private:
     bool contextWarningColors_{false};
     bool quotaWarningColors_{false};
     bool durationUnits_{false};
+    bool blinkOnUserInput_{true};
+    bool lastWaitingInputBlinkHidden_{false};
     bool automaticThreadMode_{false};
-    int fontSize_{10};
+    double fontSize_{10.0};
     unsigned tickCount_{0};
 
     QuotaSnapshot quota_{};

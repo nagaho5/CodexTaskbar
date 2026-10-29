@@ -46,6 +46,25 @@ std::string StatusField(const JsonValue& object) {
     return {};
 }
 
+bool HasRuntimeActiveFlag(
+    const JsonValue& conversation,
+    std::string_view expectedFlag) {
+    const JsonValue* runtimeStatus =
+        FindAny(conversation, {"threadRuntimeStatus", "thread_runtime_status"});
+    if (!runtimeStatus || !runtimeStatus->IsObject()) return false;
+
+    const JsonValue* flags =
+        FindAny(*runtimeStatus, {"activeFlags", "active_flags"});
+    if (!flags || !flags->IsArray()) return false;
+
+    for (const JsonValue& flag : flags->AsArray()) {
+        if (flag.IsString() && flag.AsString() == expectedFlag) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool IsActiveStatus(std::string value) {
     value.erase(
         std::remove_if(value.begin(), value.end(), [](char ch) {
@@ -1018,6 +1037,8 @@ ThreadMetrics DesktopThreadMonitor::DeriveMetrics(const std::string& threadId, T
     if (!state.hasDocument) return metrics;
 
     metrics.valid = true;
+    metrics.waitingForUserInput =
+        HasRuntimeActiveFlag(state.document, "waitingOnUserInput");
 
     if (const JsonValue* usage = FindUsageObject(state.document)) {
         const JsonValue* last = FindAny(*usage, {"last", "lastTokenUsage", "last_token_usage"});
