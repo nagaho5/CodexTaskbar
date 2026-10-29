@@ -787,11 +787,7 @@ public:
                 }
 
                 if (running) {
-                    EnsureWidget();
-                    PositionWidget();
-                    ShowWindow(widgetWindow_, SW_SHOWNOACTIVATE);
-                    widgetVisible_ = true;
-                    UpdateBlinkTimer();
+                    BeginAnchorReadiness();
                 } else {
                     HideWidget();
                     quotaValid_ = false;
@@ -810,8 +806,9 @@ public:
         // Taskbar geometry almost never changes. Keep a low-frequency fallback
         // for Explorer/TrafficMonitor changes instead of repositioning every
         // second.
-        if (codexRunning_ && widgetVisible_ && (tickCount_ % 10) == 0) {
-            PositionWidget();
+        if (codexRunning_ && widgetVisible_ && !anchorReadyActive_ &&
+            (tickCount_ % 10) == 0) {
+            PositionWidget(false);
         }
     }
 
@@ -1561,13 +1558,9 @@ public:
 
     void HandleTaskbarCreated() {
         AddTrayIcon();
-        taskbarWindow_ = nullptr;
-        rebarWindow_ = nullptr;
+        ResetTaskbarHandles();
         if (codexRunning_) {
-            EnsureWidget();
-            PositionWidget();
-            ShowWindow(widgetWindow_, SW_SHOWNOACTIVATE);
-            widgetVisible_ = true;
+            BeginAnchorReadiness();
         }
     }
 
@@ -2071,7 +2064,17 @@ private:
                 app->UpdateWaitingInputBlink();
                 return 0;
             }
+            if (app && wParam == kAnchorReadyTimer) {
+                app->TryAnchorReadiness();
+                return 0;
+            }
             break;
+
+        case WM_DISPLAYCHANGE:
+            if (app && app->codexRunning_) {
+                app->BeginAnchorReadiness();
+            }
+            return 0;
 
         case kTrayMessage:
             if (app) {
@@ -2121,6 +2124,7 @@ private:
             KillTimer(hwnd, kTickTimer);
             KillTimer(hwnd, kHoverTimer);
             KillTimer(hwnd, kBlinkTimer);
+            KillTimer(hwnd, kAnchorReadyTimer);
             PostQuitMessage(0);
             return 0;
         }
