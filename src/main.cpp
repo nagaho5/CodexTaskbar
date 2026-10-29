@@ -523,7 +523,13 @@ public:
     }
 
     bool Initialize() {
-        fontSize_ = std::clamp(ReadRegistryDword(L"FontSize", 10), 8, 24);
+        const int savedFontTenths = ReadRegistryDword(L"FontSizeTenths", -1);
+        fontSize_ = static_cast<double>(std::clamp(
+            savedFontTenths >= 0
+                ? savedFontTenths
+                : ReadRegistryDword(L"FontSize", 10) * 10,
+            80,
+            240)) / 10.0;
         autoStart_ = ReadRegistryDword(L"AutoStart", 1) != 0;
         showFiveHourPercent_ = ReadRegistryDword(L"ShowFiveHourPercent", 1) != 0;
         showFiveHourTime_ = ReadRegistryDword(L"ShowFiveHourTime", 1) != 0;
@@ -1145,11 +1151,11 @@ public:
 
         HWND fontEdit = CreateWindowExW(
             WS_EX_CLIENTEDGE, L"EDIT", nullptr,
-            WS_CHILD | WS_VISIBLE | ES_NUMBER | ES_AUTOHSCROLL,
+            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
             118, 16, 72, 26, hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kEditFontSize)), instance_, nullptr);
         wchar_t fontValue[16]{};
-        swprintf_s(fontValue, L"%d", fontSize_);
+        swprintf_s(fontValue, L"%.1f", fontSize_);
         SetWindowTextW(fontEdit, fontValue);
 
         CreateWindowW(L"STATIC", L"任务栏显示：", WS_CHILD | WS_VISIBLE,
@@ -1393,8 +1399,14 @@ public:
     void SaveSettingsFromWindow(HWND hwnd) {
         wchar_t text[64]{};
         GetDlgItemTextW(hwnd, kEditFontSize, text, static_cast<int>(std::size(text)));
-        const int requested = _wtoi(text);
-        fontSize_ = std::clamp(requested, 8, 24);
+        wchar_t* end = nullptr;
+        const double requested = std::wcstod(text, &end);
+        if (end != text) {
+            fontSize_ = std::clamp(
+                std::round(requested * 10.0) / 10.0,
+                8.0,
+                24.0);
+        }
 
         auto checked = [&](int id) {
             return SendDlgItemMessageW(hwnd, id, BM_GETCHECK, 0, 0) == BST_CHECKED;
@@ -1426,7 +1438,11 @@ public:
         while (!manualThreadId_.empty() && iswspace(manualThreadId_.front())) manualThreadId_.erase(manualThreadId_.begin());
         while (!manualThreadId_.empty() && iswspace(manualThreadId_.back())) manualThreadId_.pop_back();
 
-        WriteRegistryDword(L"FontSize", static_cast<DWORD>(fontSize_));
+        const int fontSizeTenths = static_cast<int>(std::lround(fontSize_ * 10.0));
+        WriteRegistryDword(L"FontSizeTenths", static_cast<DWORD>(fontSizeTenths));
+        WriteRegistryDword(
+            L"FontSize",
+            static_cast<DWORD>(std::lround(fontSize_)));
         WriteRegistryDword(L"AutoStart", autoStart_ ? 1u : 0u);
         WriteRegistryDword(L"ShowFiveHourPercent", showFiveHourPercent_ ? 1u : 0u);
         WriteRegistryDword(L"ShowFiveHourTime", showFiveHourTime_ ? 1u : 0u);
@@ -1828,7 +1844,10 @@ private:
             }
         }
 
-        const int height = -MulDiv(fontSize_, static_cast<int>(dpi), 72);
+        const int height = -std::max(
+            1,
+            static_cast<int>(std::lround(
+                fontSize_ * static_cast<double>(dpi) / 72.0)));
         font_ = CreateFontW(
             height,
             0,
@@ -2658,7 +2677,7 @@ private:
     bool blinkOnUserInput_{true};
     bool lastWaitingInputBlinkHidden_{false};
     bool automaticThreadMode_{false};
-    int fontSize_{10};
+    double fontSize_{10.0};
     unsigned tickCount_{0};
 
     QuotaSnapshot quota_{};
