@@ -38,6 +38,7 @@ struct ThreadMetrics {
 
     bool hasTurnTiming{false};
     std::int64_t turnStartedAtMs{0};
+    std::int64_t firstTurnWorkItemStartedAtMs{0};
     std::int64_t turnDurationMs{-1};
 
     bool hasDiff{false};
