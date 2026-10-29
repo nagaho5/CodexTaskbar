@@ -1235,6 +1235,29 @@ public:
         SetForegroundWindow(window);
     }
 
+    void SelectSavedThread(std::size_t index) {
+        if (index >= savedThreads_.size()) return;
+
+        manualThreadId_ = savedThreads_[index].id;
+        automaticThreadMode_ = false;
+        rendererActivityMonitor_.Reset();
+
+        generationSpeedValid_ = false;
+        generationSpeed_ = 0.0;
+        generationSpeedThreadId_.clear();
+        generationSpeedTurnId_.clear();
+
+        WriteRegistryDword(L"AutomaticThreadMode", 0);
+        WriteRegistryString(L"ManualThreadId", manualThreadId_);
+
+        if (threadMonitor_) {
+            threadMonitor_->UpdateConfig(WideToUtf8(manualThreadId_), false);
+        }
+
+        UpdateTooltipText();
+        UpdateTrayTip();
+    }
+
     void ShowContextMenu() {
         HMENU menu = CreatePopupMenu();
         if (!menu) {
@@ -1246,6 +1269,40 @@ public:
         menuInfo.fMask = MIM_BACKGROUND;
         menuInfo.hbrBack = darkMenuBrush_;
         SetMenuInfo(menu, &menuInfo);
+
+        if (!savedThreads_.empty()) {
+            HMENU threadsMenu = CreatePopupMenu();
+            if (threadsMenu) {
+                MENUINFO childInfo{};
+                childInfo.cbSize = sizeof(childInfo);
+                childInfo.fMask = MIM_BACKGROUND;
+                childInfo.hbrBack = darkMenuBrush_;
+                SetMenuInfo(threadsMenu, &childInfo);
+
+                const std::size_t count = std::min<std::size_t>(
+                    savedThreads_.size(),
+                    kMenuThreadLimit);
+                for (std::size_t i = 0; i < count; ++i) {
+                    UINT flags = MF_OWNERDRAW;
+                    if (!automaticThreadMode_ &&
+                        savedThreads_[i].id == manualThreadId_) {
+                        flags |= MF_CHECKED;
+                    }
+                    AppendMenuW(
+                        threadsMenu,
+                        flags,
+                        kMenuThreadBase + static_cast<UINT>(i),
+                        reinterpret_cast<LPCWSTR>(savedThreads_[i].name.c_str()));
+                }
+
+                AppendMenuW(
+                    menu,
+                    MF_POPUP | MF_OWNERDRAW,
+                    reinterpret_cast<UINT_PTR>(threadsMenu),
+                    reinterpret_cast<LPCWSTR>(L"对话"));
+                AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+            }
+        }
 
         AppendMenuW(
             menu,
@@ -1546,7 +1603,7 @@ public:
         if (!item || item->CtlType != ODT_MENU) return false;
         UINT dpi = mainWindow_ && IsWindow(mainWindow_) ? GetDpiForWindow(mainWindow_) : 96;
         if (dpi == 0) dpi = 96;
-        item->itemWidth = static_cast<UINT>(MulDiv(176, static_cast<int>(dpi), 96));
+        item->itemWidth = static_cast<UINT>(MulDiv(220, static_cast<int>(dpi), 96));
         item->itemHeight = static_cast<UINT>(MulDiv(28, static_cast<int>(dpi), 96));
         return true;
     }
@@ -2994,6 +3051,13 @@ private:
     }
 
     void HandleMenuCommand(UINT command) {
+        if (command >= kMenuThreadBase &&
+            command < kMenuThreadBase + kMenuThreadLimit) {
+            SelectSavedThread(
+                static_cast<std::size_t>(command - kMenuThreadBase));
+            return;
+        }
+
         switch (command) {
         case kMenuSettings:
             OpenSettings();
