@@ -158,3 +158,54 @@ Validation:
 - Verify both colon and h/m/s formats.
 - Verify with current-speed and recent-average speed display modes.
 - Verify the underline remains legible at the minimum auto-fit font size.
+
+
+## 6. Correct 5h quota-rate baseline when CodexTaskbar attaches mid-task
+
+Problem:
+
+- v0.3.7 uses the Turn's historical `firstTurnWorkItemStartedAtMs` as the denominator start.
+- If CodexTaskbar starts (or reconnects) after the task has already been running for a while, the program did not observe the 5h quota at that historical start time.
+- Pairing the current 5h remaining percentage with an older historical start timestamp artificially lowers the estimated consumption rate.
+
+Required model: observation-aligned baseline
+
+- Never combine a quota percentage sampled now with a time baseline from before CodexTaskbar actually observed that percentage.
+- The baseline must always be a matched pair:
+  - baseline remaining 5h percentage;
+  - timestamp of the quota snapshot that supplied that percentage.
+
+Cases:
+
+1. CodexTaskbar is already running before the task begins:
+   - wait until the first valid 5h quota snapshot whose sample time is at or after `firstTurnWorkItemStartedAtMs`;
+   - use that snapshot's remaining percentage and `lastQuotaSuccessMs_` as the rate baseline;
+   - this still excludes pre-work/network initialization time without inventing historical quota data.
+
+2. CodexTaskbar starts/reconnects while a task is already active:
+   - treat the first valid 5h quota snapshot observed after attach/reconnect as time zero;
+   - baseline remaining = that snapshot's remaining percentage;
+   - baseline time = that snapshot's `lastQuotaSuccessMs_`;
+   - do not use the Turn's earlier `firstTurnWorkItemStartedAtMs` for the denominator.
+
+3. New 5h quota window rolls over:
+   - discard the previous baseline;
+   - establish a new matched percentage/timestamp pair from the first valid snapshot in the new window.
+
+4. Task completes:
+   - retain the last valid calculated rate as the previous final value, as already planned/implemented.
+
+Important invariant:
+
+- numerator and denominator must describe exactly the same observed interval:
+  - consumed percentage = baselineRemaining - currentRemaining;
+  - elapsed time = currentQuotaSampleTime - baselineQuotaSampleTime.
+- This prevents both failure modes:
+  - pre-work/network wait lowering the rate;
+  - mid-task application startup lowering the rate by counting unobserved historical task time.
+
+No extra polling/request requirement:
+
+- Reuse the existing quota snapshots.
+- Do not issue additional quota reads solely to establish the baseline.
+- If no post-work/attach quota snapshot is available yet, show no live estimate and retain the previous final value where applicable.
