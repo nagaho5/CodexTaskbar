@@ -18,6 +18,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Validate updater script
+        shell: pwsh
+        run: |
+          [scriptblock]::Create((Get-Content -Raw "tools\Update-CodexTaskbar.ps1")) | Out-Null
+
       - name: Configure
         shell: pwsh
         run: cmake -S . -B build -A x64
