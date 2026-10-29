@@ -23,6 +23,7 @@
 #include <iterator>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <utility>
@@ -47,12 +48,15 @@ constexpr UINT kThreadMetricsMessage = WM_APP + 4;
 constexpr UINT_PTR kTickTimer = 1;
 constexpr UINT_PTR kHoverTimer = 2;
 constexpr UINT_PTR kBlinkTimer = 3;
+constexpr UINT_PTR kAnchorReadyTimer = 4;
 
 constexpr UINT kMenuSettings = 1001;
 constexpr UINT kMenuAutoStart = 1002;
 constexpr UINT kMenuReconnect = 1003;
 constexpr UINT kMenuAbout = 1004;
 constexpr UINT kMenuExit = 1005;
+constexpr UINT kMenuDisplayPrimary = 1050;
+constexpr UINT kMenuDisplaySecondary = 1051;
 constexpr UINT kMenuThreadBase = 1100;
 constexpr UINT kMenuThreadLimit = 50;
 
@@ -82,6 +86,8 @@ constexpr int kComboCacheDisplayMode = 2023;
 constexpr int kCheckShowGenerationSpeed = 2024;
 constexpr int kComboFontChoice = 2025;
 constexpr int kEditSavedThreads = 2026;
+constexpr int kComboGenerationSpeedMode = 2027;
+constexpr int kCheckCompactHourUnderline = 2028;
 
 constexpr COLORREF kDefaultWorkingColor = RGB(79, 195, 247);
 constexpr COLORREF kWarningYellow = RGB(255, 196, 64);
@@ -107,6 +113,17 @@ struct QuotaPayload {
 struct SavedThreadEntry {
     std::wstring name;
     std::wstring id;
+};
+
+struct GenerationSpeedSample {
+    double speed{0.0};
+    std::int64_t intervalMs{0};
+};
+
+struct TaskbarCandidate {
+    HWND window{nullptr};
+    bool primary{false};
+    std::wstring deviceName;
 };
 
 std::vector<SavedThreadEntry> ParseSavedThreads(const std::wstring& value) {
