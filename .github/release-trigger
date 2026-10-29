@@ -1,3 +1,3 @@
-tag=v0.3.8
-source_commit=7780581e614881077266bda35bef60fc3b5af9e5
-reason=multi-display taskbar targeting, TrafficMonitor readiness, robust generation-speed averaging, compact-hour underline, observation-aligned 5h rate, and SHA256 self-updater
+tag=v0.3.9
+source_commit=3ac45daa0ebd8500d3fc755da084a04c152b3e37
+reason=fix generation-speed sampling and long-standing hover repaint flicker
