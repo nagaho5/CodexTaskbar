@@ -46,12 +46,15 @@ constexpr UINT kQuotaErrorMessage = WM_APP + 3;
 constexpr UINT kThreadMetricsMessage = WM_APP + 4;
 constexpr UINT_PTR kTickTimer = 1;
 constexpr UINT_PTR kHoverTimer = 2;
+constexpr UINT_PTR kBlinkTimer = 3;
 
 constexpr UINT kMenuSettings = 1001;
 constexpr UINT kMenuAutoStart = 1002;
 constexpr UINT kMenuReconnect = 1003;
 constexpr UINT kMenuAbout = 1004;
 constexpr UINT kMenuExit = 1005;
+constexpr UINT kMenuThreadBase = 1100;
+constexpr UINT kMenuThreadLimit = 50;
 
 constexpr int kEditFontSize = 2001;
 constexpr int kCheckAutoStart = 2002;
@@ -76,6 +79,9 @@ constexpr int kCheckHidePercentSigns = 2020;
 constexpr int kCheckNarrowFont = 2021;
 constexpr int kCheckAutoFitFont = 2022;
 constexpr int kComboCacheDisplayMode = 2023;
+constexpr int kCheckShowGenerationSpeed = 2024;
+constexpr int kComboFontChoice = 2025;
+constexpr int kEditSavedThreads = 2026;
 
 constexpr COLORREF kDefaultWorkingColor = RGB(79, 195, 247);
 constexpr COLORREF kWarningYellow = RGB(255, 196, 64);
@@ -88,9 +94,67 @@ struct ColoredSegment {
     bool hidden{false};
 };
 
+struct RowFitCache {
+    std::wstring signature;
+    int availableWidth{-1};
+    HFONT font{nullptr};
+};
+
 struct QuotaPayload {
     QuotaSnapshot snapshot;
 };
+
+struct SavedThreadEntry {
+    std::wstring name;
+    std::wstring id;
+};
+
+std::vector<SavedThreadEntry> ParseSavedThreads(const std::wstring& value) {
+    std::vector<SavedThreadEntry> result;
+    std::size_t start = 0;
+    while (start <= value.size()) {
+        const std::size_t end = value.find_first_of(L"\r\n", start);
+        std::wstring line = value.substr(
+            start,
+            end == std::wstring::npos ? std::wstring::npos : end - start);
+
+        while (!line.empty() && iswspace(line.front())) line.erase(line.begin());
+        while (!line.empty() && iswspace(line.back())) line.pop_back();
+
+        if (!line.empty()) {
+            const std::size_t separator = line.find(L'|');
+            if (separator != std::wstring::npos) {
+                std::wstring name = line.substr(0, separator);
+                std::wstring id = line.substr(separator + 1);
+                while (!name.empty() && iswspace(name.front())) name.erase(name.begin());
+                while (!name.empty() && iswspace(name.back())) name.pop_back();
+                while (!id.empty() && iswspace(id.front())) id.erase(id.begin());
+                while (!id.empty() && iswspace(id.back())) id.pop_back();
+                if (!name.empty() && !id.empty()) {
+                    result.push_back({std::move(name), std::move(id)});
+                }
+            }
+        }
+
+        if (end == std::wstring::npos) break;
+        start = end + 1;
+        while (start < value.size() && (value[start] == L'\r' || value[start] == L'\n')) {
+            ++start;
+        }
+    }
+    if (result.size() > kMenuThreadLimit) result.resize(kMenuThreadLimit);
+    return result;
+}
+
+std::wstring SerializeSavedThreads(const std::vector<SavedThreadEntry>& entries) {
+    std::wstring result;
+    for (const auto& entry : entries) {
+        if (entry.name.empty() || entry.id.empty()) continue;
+        if (!result.empty()) result += L"\r\n";
+        result += entry.name + L"|" + entry.id;
+    }
+    return result;
+}
 
 std::wstring ModulePath() {
     wchar_t buffer[32768]{};
@@ -516,6 +580,7 @@ public:
         if (font_) {
             DeleteObject(font_);
         }
+        ClearRowFitCaches();
         if (widgetFont_ && widgetFont_ != font_) {
             DeleteObject(widgetFont_);
         }
@@ -558,11 +623,16 @@ public:
         durationUnits_ = ReadRegistryDword(L"DurationUnits", 0) != 0;
         blinkOnUserInput_ = ReadRegistryDword(L"BlinkOnUserInput", 1) != 0;
         hidePercentSigns_ = ReadRegistryDword(L"HidePercentSigns", 0) != 0;
-        narrowFont_ = ReadRegistryDword(L"NarrowFont", 0) != 0;
+        const int savedFontChoice = ReadRegistryDword(L"FontChoice", -1);
+        fontChoice_ = savedFontChoice >= 0
+            ? std::clamp(savedFontChoice, 0, 4)
+            : (ReadRegistryDword(L"NarrowFont", 0) != 0 ? 4 : 0);
         autoFitFont_ = ReadRegistryDword(L"AutoFitFont", 0) != 0;
         cacheDisplayMode_ = std::clamp(ReadRegistryDword(L"CacheDisplayMode", 0), 0, 3);
+        showGenerationSpeed_ = ReadRegistryDword(L"ShowGenerationSpeed", 0) != 0;
         automaticThreadMode_ = ReadRegistryDword(L"AutomaticThreadMode", 0) != 0;
         manualThreadId_ = ReadRegistryString(L"ManualThreadId");
+        savedThreads_ = ParseSavedThreads(ReadRegistryString(L"SavedThreads"));
 
         INITCOMMONCONTROLSEX commonControls{sizeof(commonControls), ICC_WIN95_CLASSES};
         InitCommonControlsEx(&commonControls);
@@ -610,7 +680,6 @@ public:
         StartWorker();
         OnTick();
         SetTimer(mainWindow_, kTickTimer, 1000, nullptr);
-        SetTimer(mainWindow_, kHoverTimer, 200, nullptr);
         return true;
     }
 
@@ -626,16 +695,12 @@ public:
     void OnTick() {
         ++tickCount_;
 
-        // Diagnostic-only: observe the renderer's own active-conversation log.
-        // This does not control automatic following in v0.3.1; it only lets us
-        // compare renderer activity against the current IPC-selected thread.
+        // Experimental renderer-log diagnostics stay completely dormant in
+        // manual mode.
         if (automaticThreadMode_ && codexRunning_) {
             rendererActivityMonitor_.Poll();
         }
 
-        // Elapsed turn time changes even when the IPC state itself does not.
-        // Refresh its taskbar/hover presentation once per second while timing
-        // information is available.
         if (threadMetrics_.hasTurnTiming && threadMetrics_.activeTurn) {
             InvalidateWidget();
         }
@@ -643,36 +708,41 @@ public:
             UpdateTooltipText();
         }
 
-        if ((tickCount_ % 2) != 1 && codexRunningKnown_) {
-            if (widgetVisible_) {
-                PositionWidget();
+        const bool shouldCheckRunning =
+            !codexRunningKnown_ || (tickCount_ % 2) == 1;
+        if (shouldCheckRunning) {
+            const bool running = IsCodexDesktopRunning();
+            codexRunningKnown_ = true;
+            if (running != codexRunning_) {
+                codexRunning_ = running;
+                SetWorkerActive(running);
+                if (threadMonitor_) {
+                    threadMonitor_->SetActive(running);
+                }
+
+                if (running) {
+                    EnsureWidget();
+                    PositionWidget();
+                    ShowWindow(widgetWindow_, SW_SHOWNOACTIVATE);
+                    widgetVisible_ = true;
+                    UpdateBlinkTimer();
+                } else {
+                    HideWidget();
+                    quotaValid_ = false;
+                    threadMetrics_ = {};
+                    generationSpeedValid_ = false;
+                    rendererActivityMonitor_.Reset();
+                    UpdateBlinkTimer();
+                    InvalidateWidget();
+                    UpdateTooltipText();
+                }
             }
-            return;
         }
 
-        const bool running = IsCodexDesktopRunning();
-        codexRunningKnown_ = true;
-        if (running != codexRunning_) {
-            codexRunning_ = running;
-            SetWorkerActive(running);
-            if (threadMonitor_) {
-                threadMonitor_->SetActive(running);
-            }
-
-            if (running) {
-                EnsureWidget();
-                PositionWidget();
-                ShowWindow(widgetWindow_, SW_SHOWNOACTIVATE);
-                widgetVisible_ = true;
-            } else {
-                HideWidget();
-                quotaValid_ = false;
-                threadMetrics_ = {};
-                rendererActivityMonitor_.Reset();
-                InvalidateWidget();
-                UpdateTooltipText();
-            }
-        } else if (running && widgetVisible_) {
+        // Taskbar geometry almost never changes. Keep a low-frequency fallback
+        // for Explorer/TrafficMonitor changes instead of repositioning every
+        // second.
+        if (codexRunning_ && widgetVisible_ && (tickCount_ % 10) == 0) {
             PositionWidget();
         }
     }
@@ -694,10 +764,47 @@ public:
     }
 
     void ApplyThreadMetrics(const ThreadMetrics& metrics) {
+        const int oldRows = VisibleRowCount();
+        const std::int64_t nowMs = CurrentUnixMilliseconds();
+
+        const bool identityChanged =
+            metrics.threadId != generationSpeedThreadId_ ||
+            metrics.turnId != generationSpeedTurnId_;
+        if (identityChanged) {
+            generationSpeedThreadId_ = metrics.threadId;
+            generationSpeedTurnId_ = metrics.turnId;
+            generationSpeedValid_ = false;
+            generationSpeed_ = 0.0;
+            generationSpeedLastOutputTokens_ =
+                metrics.hasTokenUsage ? metrics.outputTokens : 0;
+            generationSpeedLastSampleMs_ = nowMs;
+        } else if (metrics.activeTurn && metrics.hasTokenUsage) {
+            if (metrics.outputTokens < generationSpeedLastOutputTokens_) {
+                generationSpeedValid_ = false;
+                generationSpeedLastOutputTokens_ = metrics.outputTokens;
+                generationSpeedLastSampleMs_ = nowMs;
+            } else if (metrics.outputTokens > generationSpeedLastOutputTokens_) {
+                const std::int64_t deltaTokens =
+                    metrics.outputTokens - generationSpeedLastOutputTokens_;
+                const std::int64_t deltaMs =
+                    nowMs - generationSpeedLastSampleMs_;
+                if (deltaMs > 0) {
+                    generationSpeed_ =
+                        static_cast<double>(deltaTokens) * 1000.0 /
+                        static_cast<double>(deltaMs);
+                    generationSpeedValid_ = true;
+                }
+                generationSpeedLastOutputTokens_ = metrics.outputTokens;
+                generationSpeedLastSampleMs_ = nowMs;
+            }
+        }
+
         threadMetrics_ = metrics;
-        if (widgetVisible_) {
+        const int newRows = VisibleRowCount();
+        if (widgetVisible_ && oldRows != newRows) {
             PositionWidget();
         }
+        UpdateBlinkTimer();
         InvalidateWidget();
         UpdateTooltipText();
         UpdateTrayTip();
@@ -960,15 +1067,16 @@ public:
 
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, RGB(255, 255, 255));
-        HFONT oldFont = static_cast<HFONT>(SelectObject(
-            dc,
-            widgetFont_ ? widgetFont_ : font_));
+        HFONT baseFont = widgetFont_ ? widgetFont_ : font_;
+        HFONT oldFont = baseFont
+            ? static_cast<HFONT>(SelectObject(dc, baseFont))
+            : nullptr;
 
         if (verticalTaskbar_) {
             const std::wstring first = FirstLine();
             const std::wstring second = SecondLine();
             const std::wstring duration = TaskDurationLine();
-            const bool diffVisible = IsDiffRowVisible();
+            const std::wstring diffText = DiffLineText();
 
             struct Row {
                 int kind;
@@ -977,13 +1085,14 @@ public:
             std::vector<Row> rows;
             if (!first.empty()) rows.push_back({2, first});
             if (!second.empty()) rows.push_back({3, second});
-            if (diffVisible) rows.push_back({1, {}});
+            if (!diffText.empty()) rows.push_back({1, diffText});
             if (!duration.empty()) rows.push_back({0, duration});
 
             if (rows.empty()) rows.push_back({0, L""});
             const int rowHeight = std::max(
                 1,
-                static_cast<int>(client.bottom - client.top) / static_cast<int>(rows.size()));
+                static_cast<int>(client.bottom - client.top) /
+                    static_cast<int>(rows.size()));
 
             for (std::size_t index = 0; index < rows.size(); ++index) {
                 RECT row{
@@ -993,6 +1102,15 @@ public:
                     index + 1 == rows.size()
                         ? client.bottom
                         : client.top + static_cast<LONG>((index + 1) * rowHeight)};
+
+                HFONT rowFont = FittedRowFont(
+                    dc,
+                    rows[index].kind,
+                    rows[index].text,
+                    static_cast<int>(row.right - row.left));
+                HFONT prior = rowFont
+                    ? static_cast<HFONT>(SelectObject(dc, rowFont))
+                    : nullptr;
 
                 if (rows[index].kind == 1) {
                     DrawDiffRow(dc, row);
@@ -1009,6 +1127,8 @@ public:
                         &row,
                         DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
                 }
+
+                if (prior) SelectObject(dc, prior);
             }
         } else {
             std::vector<ColoredSegment> segments;
@@ -1043,10 +1163,21 @@ public:
             if (!duration.empty()) {
                 appendGroup({{duration, RGB(255, 255, 255)}});
             }
+
+            const std::wstring wholeLine = HorizontalLine();
+            HFONT fitted = FittedRowFont(
+                dc,
+                4,
+                wholeLine,
+                static_cast<int>(client.right - client.left));
+            HFONT prior = fitted
+                ? static_cast<HFONT>(SelectObject(dc, fitted))
+                : nullptr;
             DrawCenteredSegments(dc, client, segments);
+            if (prior) SelectObject(dc, prior);
         }
 
-        SelectObject(dc, oldFont);
+        if (oldFont) SelectObject(dc, oldFont);
         EndPaint(hwnd, &ps);
     }
 
@@ -1104,6 +1235,29 @@ public:
         SetForegroundWindow(window);
     }
 
+    void SelectSavedThread(std::size_t index) {
+        if (index >= savedThreads_.size()) return;
+
+        manualThreadId_ = savedThreads_[index].id;
+        automaticThreadMode_ = false;
+        rendererActivityMonitor_.Reset();
+
+        generationSpeedValid_ = false;
+        generationSpeed_ = 0.0;
+        generationSpeedThreadId_.clear();
+        generationSpeedTurnId_.clear();
+
+        WriteRegistryDword(L"AutomaticThreadMode", 0);
+        WriteRegistryString(L"ManualThreadId", manualThreadId_);
+
+        if (threadMonitor_) {
+            threadMonitor_->UpdateConfig(WideToUtf8(manualThreadId_), false);
+        }
+
+        UpdateTooltipText();
+        UpdateTrayTip();
+    }
+
     void ShowContextMenu() {
         HMENU menu = CreatePopupMenu();
         if (!menu) {
@@ -1115,6 +1269,40 @@ public:
         menuInfo.fMask = MIM_BACKGROUND;
         menuInfo.hbrBack = darkMenuBrush_;
         SetMenuInfo(menu, &menuInfo);
+
+        if (!savedThreads_.empty()) {
+            HMENU threadsMenu = CreatePopupMenu();
+            if (threadsMenu) {
+                MENUINFO childInfo{};
+                childInfo.cbSize = sizeof(childInfo);
+                childInfo.fMask = MIM_BACKGROUND;
+                childInfo.hbrBack = darkMenuBrush_;
+                SetMenuInfo(threadsMenu, &childInfo);
+
+                const std::size_t count = std::min<std::size_t>(
+                    savedThreads_.size(),
+                    kMenuThreadLimit);
+                for (std::size_t i = 0; i < count; ++i) {
+                    UINT flags = MF_OWNERDRAW;
+                    if (!automaticThreadMode_ &&
+                        savedThreads_[i].id == manualThreadId_) {
+                        flags |= MF_CHECKED;
+                    }
+                    AppendMenuW(
+                        threadsMenu,
+                        flags,
+                        kMenuThreadBase + static_cast<UINT>(i),
+                        reinterpret_cast<LPCWSTR>(savedThreads_[i].name.c_str()));
+                }
+
+                AppendMenuW(
+                    menu,
+                    MF_POPUP | MF_OWNERDRAW,
+                    reinterpret_cast<UINT_PTR>(threadsMenu),
+                    reinterpret_cast<LPCWSTR>(L"对话"));
+                AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+            }
+        }
 
         AppendMenuW(
             menu,
@@ -1197,7 +1385,7 @@ public:
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             500,
-            600,
+            720,
             mainWindow_,
             nullptr,
             instance_,
@@ -1237,6 +1425,20 @@ public:
         swprintf_s(fontValue, L"%.1f", fontSize_);
         SetWindowTextW(fontEdit, fontValue);
 
+        CreateWindowW(L"STATIC", L"字体：", WS_CHILD | WS_VISIBLE,
+            210, 20, 48, 24, hwnd, nullptr, instance_, nullptr);
+        HWND fontCombo = CreateWindowExW(
+            WS_EX_CLIENTEDGE, L"COMBOBOX", nullptr,
+            WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+            258, 16, 200, 180, hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kComboFontChoice)), instance_, nullptr);
+        SendMessageW(fontCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Segoe UI Semibold（原版）"));
+        SendMessageW(fontCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Bahnschrift Regular"));
+        SendMessageW(fontCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Segoe UI Regular"));
+        SendMessageW(fontCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Tahoma Regular"));
+        SendMessageW(fontCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Bahnschrift SemiCondensed"));
+        SendMessageW(fontCombo, CB_SETCURSEL, static_cast<WPARAM>(fontChoice_), 0);
+
         CreateWindowW(L"STATIC", L"任务栏显示：", WS_CHILD | WS_VISIBLE,
             24, 54, 100, 22, hwnd, nullptr, instance_, nullptr);
 
@@ -1256,61 +1458,40 @@ public:
         checkbox(kCheckShowDiff, L"代码改动", 210, 128, showDiff_, 100);
         checkbox(kCheckShowDiffFiles, L"显示文件数", 318, 128, showDiffFiles_, 112);
         checkbox(kCheckShowTaskDuration, L"任务耗时", 24, 153, showTaskDuration_);
+        checkbox(kCheckShowGenerationSpeed, L"生成速度", 118, 153, showGenerationSpeed_, 92);
 
         CreateWindowW(
             L"STATIC", L"运行中颜色：", WS_CHILD | WS_VISIBLE,
-            210, 153, 88, 22, hwnd, nullptr, instance_, nullptr);
+            225, 153, 88, 22, hwnd, nullptr, instance_, nullptr);
         CreateWindowW(
             L"BUTTON", L"选择...", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            298, 149, 76, 26, hwnd,
+            313, 149, 70, 26, hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kButtonWorkingColor)), instance_, nullptr);
         CreateWindowW(
             L"STATIC", L"76%", WS_CHILD | WS_VISIBLE | SS_CENTER,
-            382, 153, 48, 22, hwnd,
+            390, 153, 48, 22, hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kStaticWorkingColorPreview)), instance_, nullptr);
 
-        checkbox(
-            kCheckContextWarningColors,
-            L"Context警告色(80/90%)",
+        checkbox(kCheckContextWarningColors, L"Context警告色(80/90%)",
             24, 183, contextWarningColors_, 190);
-        checkbox(
-            kCheckQuotaWarningColors,
-            L"配额警告色(20/10%)",
+        checkbox(kCheckQuotaWarningColors, L"配额警告色(20/10%)",
             225, 183, quotaWarningColors_, 190);
-        checkbox(
-            kCheckDurationUnits,
-            L"耗时使用 h/m/s 格式",
+        checkbox(kCheckDurationUnits, L"耗时使用 h/m/s 格式",
             24, 208, durationUnits_, 190);
-        checkbox(
-            kCheckBlinkOnUserInput,
-            L"等待输入时闪烁任务百分比",
+        checkbox(kCheckBlinkOnUserInput, L"等待输入时闪烁任务百分比",
             225, 208, blinkOnUserInput_, 225);
-
-        checkbox(
-            kCheckHidePercentSigns,
-            L"任务栏隐藏 %",
+        checkbox(kCheckHidePercentSigns, L"任务栏隐藏 %",
             24, 233, hidePercentSigns_, 190);
-        checkbox(
-            kCheckNarrowFont,
-            L"窄体数字 (Bahnschrift)",
-            225, 233, narrowFont_, 225);
-        checkbox(
-            kCheckAutoFitFont,
-            L"溢出时自动微缩 (最多2pt)",
-            24, 258, autoFitFont_, 200);
+        checkbox(kCheckAutoFitFont, L"溢出时逐行微缩 (最多2pt)",
+            225, 233, autoFitFont_, 225);
 
-        CreateWindowW(
-            L"STATIC", L"Cache显示：", WS_CHILD | WS_VISIBLE,
-            225, 260, 90, 22, hwnd, nullptr, instance_, nullptr);
+        CreateWindowW(L"STATIC", L"Cache显示：", WS_CHILD | WS_VISIBLE,
+            24, 262, 90, 22, hwnd, nullptr, instance_, nullptr);
         HWND cacheMode = CreateWindowExW(
-            WS_EX_CLIENTEDGE,
-            L"COMBOBOX",
-            nullptr,
+            WS_EX_CLIENTEDGE, L"COMBOBOX", nullptr,
             WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
-            315, 255, 135, 150, hwnd,
-            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kComboCacheDisplayMode)),
-            instance_,
-            nullptr);
+            114, 257, 140, 150, hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kComboCacheDisplayMode)), instance_, nullptr);
         SendMessageW(cacheMode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"整数"));
         SendMessageW(cacheMode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"1位小数"));
         SendMessageW(cacheMode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"2位小数"));
@@ -1331,29 +1512,44 @@ public:
         SendMessageW(manualRadio, BM_SETCHECK, automaticThreadMode_ ? BST_UNCHECKED : BST_CHECKED, 0);
         SendMessageW(autoRadio, BM_SETCHECK, automaticThreadMode_ ? BST_CHECKED : BST_UNCHECKED, 0);
 
-        CreateWindowW(L"STATIC", L"Thread ID：", WS_CHILD | WS_VISIBLE,
-            24, 356, 80, 22, hwnd, nullptr, instance_, nullptr);
+        CreateWindowW(L"STATIC", L"当前 Thread ID：", WS_CHILD | WS_VISIBLE,
+            24, 356, 100, 22, hwnd, nullptr, instance_, nullptr);
         CreateWindowExW(
             WS_EX_CLIENTEDGE, L"EDIT", manualThreadId_.c_str(),
             WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-            104, 352, 346, 26, hwnd,
+            126, 352, 324, 26, hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kEditThreadId)), instance_, nullptr);
 
-        checkbox(kCheckAutoStart, L"开机自动启动", 24, 398, autoStart_);
+        CreateWindowW(L"STATIC", L"保存的对话（每行：名称|Thread ID）：",
+            WS_CHILD | WS_VISIBLE, 24, 390, 300, 22, hwnd, nullptr, instance_, nullptr);
+        const std::wstring savedText = SerializeSavedThreads(savedThreads_);
+        CreateWindowExW(
+            WS_EX_CLIENTEDGE, L"EDIT", savedText.c_str(),
+            WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL,
+            24, 414, 426, 82, hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kEditSavedThreads)), instance_, nullptr);
 
         CreateWindowW(
             L"STATIC",
-            L"提示：隐藏项目仍会在悬浮提示中显示；自动微缩不会超过你设置的字号。",
+            L"右键“对话”菜单只切换当前一个订阅；其它保存项不会后台跟踪。",
             WS_CHILD | WS_VISIBLE,
-            24, 432, 440, 38, hwnd, nullptr, instance_, nullptr);
+            24, 500, 430, 34, hwnd, nullptr, instance_, nullptr);
+
+        checkbox(kCheckAutoStart, L"开机自动启动", 24, 540, autoStart_);
+
+        CreateWindowW(
+            L"STATIC",
+            L"提示：隐藏项目仍会在悬浮提示中显示；自动微缩只缩放不下的那一行。",
+            WS_CHILD | WS_VISIBLE,
+            24, 570, 440, 38, hwnd, nullptr, instance_, nullptr);
 
         CreateWindowW(
             L"BUTTON", L"确定", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            300, 492, 76, 28, hwnd,
+            300, 620, 76, 28, hwnd,
             reinterpret_cast<HMENU>(IDOK), instance_, nullptr);
         CreateWindowW(
             L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            388, 492, 76, 28, hwnd,
+            388, 620, 76, 28, hwnd,
             reinterpret_cast<HMENU>(IDCANCEL), instance_, nullptr);
 
         EnumChildWindows(
@@ -1407,7 +1603,7 @@ public:
         if (!item || item->CtlType != ODT_MENU) return false;
         UINT dpi = mainWindow_ && IsWindow(mainWindow_) ? GetDpiForWindow(mainWindow_) : 96;
         if (dpi == 0) dpi = 96;
-        item->itemWidth = static_cast<UINT>(MulDiv(176, static_cast<int>(dpi), 96));
+        item->itemWidth = static_cast<UINT>(MulDiv(220, static_cast<int>(dpi), 96));
         item->itemHeight = static_cast<UINT>(MulDiv(28, static_cast<int>(dpi), 96));
         return true;
     }
@@ -1529,14 +1725,20 @@ public:
         showDiff_ = checked(kCheckShowDiff);
         showDiffFiles_ = checked(kCheckShowDiffFiles);
         showTaskDuration_ = checked(kCheckShowTaskDuration);
+        showGenerationSpeed_ = checked(kCheckShowGenerationSpeed);
         workingColor_ = pendingWorkingColor_;
         contextWarningColors_ = checked(kCheckContextWarningColors);
         quotaWarningColors_ = checked(kCheckQuotaWarningColors);
         durationUnits_ = checked(kCheckDurationUnits);
         blinkOnUserInput_ = checked(kCheckBlinkOnUserInput);
         hidePercentSigns_ = checked(kCheckHidePercentSigns);
-        narrowFont_ = checked(kCheckNarrowFont);
         autoFitFont_ = checked(kCheckAutoFitFont);
+
+        const LRESULT fontSelection =
+            SendDlgItemMessageW(hwnd, kComboFontChoice, CB_GETCURSEL, 0, 0);
+        fontChoice_ = fontSelection == CB_ERR
+            ? 0
+            : std::clamp(static_cast<int>(fontSelection), 0, 4);
 
         const LRESULT cacheSelection =
             SendDlgItemMessageW(hwnd, kComboCacheDisplayMode, CB_GETCURSEL, 0, 0);
@@ -1553,12 +1755,16 @@ public:
         wchar_t threadText[256]{};
         GetDlgItemTextW(hwnd, kEditThreadId, threadText, static_cast<int>(std::size(threadText)));
         manualThreadId_ = threadText;
-        while (!manualThreadId_.empty() && iswspace(manualThreadId_.front())) {
-            manualThreadId_.erase(manualThreadId_.begin());
-        }
-        while (!manualThreadId_.empty() && iswspace(manualThreadId_.back())) {
-            manualThreadId_.pop_back();
-        }
+        while (!manualThreadId_.empty() && iswspace(manualThreadId_.front())) manualThreadId_.erase(manualThreadId_.begin());
+        while (!manualThreadId_.empty() && iswspace(manualThreadId_.back())) manualThreadId_.pop_back();
+
+        std::vector<wchar_t> savedBuffer(8192, L'\0');
+        GetDlgItemTextW(
+            hwnd,
+            kEditSavedThreads,
+            savedBuffer.data(),
+            static_cast<int>(savedBuffer.size()));
+        savedThreads_ = ParseSavedThreads(savedBuffer.data());
 
         const int fontSizeTenths = static_cast<int>(std::lround(fontSize_ * 10.0));
         WriteRegistryDword(L"FontSizeTenths", static_cast<DWORD>(fontSizeTenths));
@@ -1572,17 +1778,20 @@ public:
         WriteRegistryDword(L"ShowDiff", showDiff_ ? 1u : 0u);
         WriteRegistryDword(L"ShowDiffFiles", showDiffFiles_ ? 1u : 0u);
         WriteRegistryDword(L"ShowTaskDuration", showTaskDuration_ ? 1u : 0u);
+        WriteRegistryDword(L"ShowGenerationSpeed", showGenerationSpeed_ ? 1u : 0u);
         WriteRegistryDword(L"WorkingColor", static_cast<DWORD>(workingColor_));
         WriteRegistryDword(L"ContextWarningColors", contextWarningColors_ ? 1u : 0u);
         WriteRegistryDword(L"QuotaWarningColors", quotaWarningColors_ ? 1u : 0u);
         WriteRegistryDword(L"DurationUnits", durationUnits_ ? 1u : 0u);
         WriteRegistryDword(L"BlinkOnUserInput", blinkOnUserInput_ ? 1u : 0u);
         WriteRegistryDword(L"HidePercentSigns", hidePercentSigns_ ? 1u : 0u);
-        WriteRegistryDword(L"NarrowFont", narrowFont_ ? 1u : 0u);
+        WriteRegistryDword(L"FontChoice", static_cast<DWORD>(fontChoice_));
+        WriteRegistryDword(L"NarrowFont", fontChoice_ == 4 ? 1u : 0u);
         WriteRegistryDword(L"AutoFitFont", autoFitFont_ ? 1u : 0u);
         WriteRegistryDword(L"CacheDisplayMode", static_cast<DWORD>(cacheDisplayMode_));
         WriteRegistryDword(L"AutomaticThreadMode", automaticThreadMode_ ? 1u : 0u);
         WriteRegistryString(L"ManualThreadId", manualThreadId_);
+        WriteRegistryString(L"SavedThreads", SerializeSavedThreads(savedThreads_));
         SetAutoStartRegistry(autoStart_);
 
         if (threadMonitor_) {
@@ -1590,6 +1799,7 @@ public:
         }
 
         RecreateFont();
+        UpdateBlinkTimer();
         if (widgetVisible_) {
             PositionWidget();
             InvalidateWidget();
@@ -1648,8 +1858,11 @@ private:
                 return 0;
             }
             if (app && wParam == kHoverTimer) {
+                app->ShowHoverAfterDelay();
+                return 0;
+            }
+            if (app && wParam == kBlinkTimer) {
                 app->UpdateWaitingInputBlink();
-                app->UpdateHoverState();
                 return 0;
             }
             break;
@@ -1701,6 +1914,7 @@ private:
         case WM_DESTROY:
             KillTimer(hwnd, kTickTimer);
             KillTimer(hwnd, kHoverTimer);
+            KillTimer(hwnd, kBlinkTimer);
             PostQuitMessage(0);
             return 0;
         }
@@ -1732,6 +1946,20 @@ private:
             if (app) {
                 app->RecreateFont();
                 app->PositionWidget();
+                return 0;
+            }
+            break;
+
+        case WM_MOUSEMOVE:
+            if (app) {
+                app->HandleWidgetMouseMove(hwnd);
+                return 0;
+            }
+            break;
+
+        case WM_MOUSELEAVE:
+            if (app) {
+                app->HandleWidgetMouseLeave();
                 return 0;
             }
             break;
@@ -1970,13 +2198,39 @@ private:
             static_cast<int>(std::lround(
                 pointSize * static_cast<double>(dpi) / 72.0)));
 
-        const bool narrow = widgetFont && narrowFont_;
+        const wchar_t* face = L"Segoe UI";
+        int weight = FW_SEMIBOLD;
+        if (widgetFont) {
+            switch (fontChoice_) {
+            case 1:
+                face = L"Bahnschrift";
+                weight = FW_NORMAL;
+                break;
+            case 2:
+                face = L"Segoe UI";
+                weight = FW_NORMAL;
+                break;
+            case 3:
+                face = L"Tahoma";
+                weight = FW_NORMAL;
+                break;
+            case 4:
+                face = L"Bahnschrift SemiCondensed";
+                weight = FW_NORMAL;
+                break;
+            default:
+                face = L"Segoe UI";
+                weight = FW_SEMIBOLD;
+                break;
+            }
+        }
+
         return CreateFontW(
             height,
             0,
             0,
             0,
-            narrow ? FW_NORMAL : FW_SEMIBOLD,
+            weight,
             FALSE,
             FALSE,
             FALSE,
@@ -1985,20 +2239,23 @@ private:
             CLIP_DEFAULT_PRECIS,
             CLEARTYPE_QUALITY,
             DEFAULT_PITCH | FF_DONTCARE,
-            narrow ? L"Bahnschrift SemiCondensed" : L"Segoe UI");
+            face);
     }
 
-    void ReplaceWidgetFont(double pointSize) {
-        HFONT replacement = CreatePointFont(pointSize, true);
-        if (!replacement) return;
-        if (widgetFont_ && widgetFont_ != font_) {
-            DeleteObject(widgetFont_);
+    void ClearRowFitCaches() {
+        for (auto& cache : rowFitCaches_) {
+            if (cache.font) {
+                DeleteObject(cache.font);
+                cache.font = nullptr;
+            }
+            cache.signature.clear();
+            cache.availableWidth = -1;
         }
-        widgetFont_ = replacement;
-        effectiveWidgetFontSize_ = pointSize;
     }
 
     void RecreateFont() {
+        ClearRowFitCaches();
+
         if (font_) {
             DeleteObject(font_);
             font_ = nullptr;
@@ -2009,14 +2266,10 @@ private:
         }
 
         font_ = CreatePointFont(fontSize_, false);
-        effectiveWidgetFontSize_ = fontSize_;
-        widgetFont_ = CreatePointFont(effectiveWidgetFontSize_, true);
+        widgetFont_ = CreatePointFont(fontSize_, true);
         if (!widgetFont_) {
-            widgetFont_ = CreatePointFont(effectiveWidgetFontSize_, false);
+            widgetFont_ = CreatePointFont(fontSize_, false);
         }
-
-        lastAutoFitWidth_ = -1;
-        lastAutoFitSignature_.clear();
     }
 
     int MeasureTextWidth(HDC dc, const std::wstring& text) const {
@@ -2030,112 +2283,76 @@ private:
         return size.cx;
     }
 
-    std::wstring WidgetFitSignature() const {
-        std::wstring signature = verticalTaskbar_ ? L"V|" : L"H|";
-        signature += FirstLine();
-        signature += L"|";
-        signature += SecondLine();
-        signature += L"|";
-        signature += std::to_wstring(TaskDurationLine().size());
-        signature += L"|";
-        if (IsDiffRowVisible()) {
-            if (showDiffFiles_) {
-                signature += std::to_wstring(
-                    std::to_wstring(threadMetrics_.changedFiles).size());
-            }
-            signature += L":";
-            signature += std::to_wstring(
-                std::to_wstring(threadMetrics_.addedLines).size());
-            signature += L":";
-            signature += std::to_wstring(
-                std::to_wstring(threadMetrics_.removedLines).size());
+    std::wstring NormalizeFitSignature(const std::wstring& text) const {
+        std::wstring result = text;
+        for (wchar_t& ch : result) {
+            if (iswdigit(ch)) ch = L'#';
         }
-        return signature;
+        return result;
     }
 
-    int MeasureWidgetContentWidth(HDC dc) const {
-        if (!dc) return 0;
-        if (!verticalTaskbar_) {
-            return MeasureTextWidth(dc, HorizontalLine());
+    HFONT FittedRowFont(
+        HDC dc,
+        int cacheIndex,
+        const std::wstring& text,
+        int availableWidth) {
+        if (!autoFitFont_ || !dc || !widgetFont_ || text.empty()) {
+            return widgetFont_ ? widgetFont_ : font_;
         }
 
-        int widest = 0;
-        widest = std::max(widest, MeasureTextWidth(dc, FirstLine()));
-        widest = std::max(widest, MeasureTextWidth(dc, SecondLine()));
-        widest = std::max(widest, MeasureTextWidth(dc, TaskDurationLine()));
-
-        if (IsDiffRowVisible()) {
-            std::wstring diff;
-            if (showDiffFiles_) diff += std::to_wstring(threadMetrics_.changedFiles);
-            diff += std::to_wstring(threadMetrics_.addedLines);
-            diff += std::to_wstring(threadMetrics_.removedLines);
-            widest = std::max(widest, MeasureTextWidth(dc, diff));
-        }
-        return widest;
-    }
-
-    void UpdateAutoFitFont(int availableWidth) {
-        availableWidth = std::max(1, availableWidth);
-        const std::wstring signature = WidgetFitSignature();
-
-        if (!autoFitFont_) {
-            if (std::abs(effectiveWidgetFontSize_ - fontSize_) > 0.04) {
-                ReplaceWidgetFont(fontSize_);
-            }
-            lastAutoFitWidth_ = availableWidth;
-            lastAutoFitSignature_ = signature;
-            return;
-        }
-
-        if (availableWidth == lastAutoFitWidth_ &&
-            signature == lastAutoFitSignature_) {
-            return;
-        }
-        lastAutoFitWidth_ = availableWidth;
-        lastAutoFitSignature_ = signature;
-
-        HDC dc = GetDC(widgetWindow_);
-        if (!dc) return;
-
-        HFONT baseFont = CreatePointFont(fontSize_, true);
-        if (!baseFont) {
-            ReleaseDC(widgetWindow_, dc);
-            return;
-        }
-
-        HFONT oldFont = static_cast<HFONT>(SelectObject(dc, baseFont));
-        const int baseWidth = MeasureWidgetContentWidth(dc);
+        cacheIndex = std::clamp(cacheIndex, 0, 4);
+        RowFitCache& cache = rowFitCaches_[static_cast<std::size_t>(cacheIndex)];
+        const std::wstring signature = NormalizeFitSignature(text);
         const int fitWidth = std::max(1, availableWidth - 2);
-        double target = fontSize_;
 
-        if (baseWidth > fitWidth) {
-            const double minimum = std::max(8.0, fontSize_ - 2.0);
-            const double ratio =
-                static_cast<double>(fitWidth) /
-                static_cast<double>(std::max(1, baseWidth));
-            target = std::floor(
-                std::clamp(fontSize_ * ratio, minimum, fontSize_) * 10.0) / 10.0;
+        if (cache.availableWidth == fitWidth &&
+            cache.signature == signature) {
+            return cache.font ? cache.font : widgetFont_;
+        }
 
-            while (target > minimum + 0.04) {
-                HFONT candidate = CreatePointFont(target, true);
-                if (!candidate) break;
-                SelectObject(dc, candidate);
-                const int candidateWidth = MeasureWidgetContentWidth(dc);
-                SelectObject(dc, baseFont);
-                DeleteObject(candidate);
-                if (candidateWidth <= fitWidth) break;
-                target = std::max(minimum, target - 0.1);
-                target = std::round(target * 10.0) / 10.0;
+        if (cache.font) {
+            DeleteObject(cache.font);
+            cache.font = nullptr;
+        }
+        cache.availableWidth = fitWidth;
+        cache.signature = signature;
+
+        HFONT previous = static_cast<HFONT>(SelectObject(dc, widgetFont_));
+        const int baseWidth = MeasureTextWidth(dc, text);
+        SelectObject(dc, previous);
+
+        if (baseWidth <= fitWidth) {
+            return widgetFont_;
+        }
+
+        const double minimum = std::max(8.0, fontSize_ - 2.0);
+        double target = std::floor(
+            std::clamp(
+                fontSize_ * static_cast<double>(fitWidth) /
+                    static_cast<double>(std::max(1, baseWidth)),
+                minimum,
+                fontSize_) *
+            10.0) / 10.0;
+
+        while (target >= minimum - 0.04) {
+            HFONT candidate = CreatePointFont(target, true);
+            if (!candidate) break;
+
+            previous = static_cast<HFONT>(SelectObject(dc, candidate));
+            const int width = MeasureTextWidth(dc, text);
+            SelectObject(dc, previous);
+
+            if (width <= fitWidth || target <= minimum + 0.04) {
+                cache.font = candidate;
+                return cache.font;
             }
+
+            DeleteObject(candidate);
+            target = std::max(minimum, target - 0.1);
+            target = std::round(target * 10.0) / 10.0;
         }
 
-        SelectObject(dc, oldFont);
-        DeleteObject(baseFont);
-        ReleaseDC(widgetWindow_, dc);
-
-        if (std::abs(target - effectiveWidgetFontSize_) > 0.04) {
-            ReplaceWidgetFont(target);
-        }
+        return widgetFont_;
     }
 
     void AddTrayIcon() {
@@ -2259,8 +2476,6 @@ private:
                 150,
                 static_cast<int>(std::lround(fontSize_ * 15.0)));
         }
-
-        UpdateAutoFitFont(std::max(1, width - 2));
 
         HDC dc = GetDC(widgetWindow_);
         HFONT oldFont = dc ? static_cast<HFONT>(SelectObject(
@@ -2407,12 +2622,28 @@ private:
         return -1;
     }
 
+    std::wstring GenerationSpeedText() const {
+        if (!generationSpeedValid_) return L"--";
+        wchar_t text[32]{};
+        swprintf_s(text, L"%.1f", generationSpeed_);
+        return text;
+    }
+
     std::wstring TaskDurationLine() const {
-        if (!showTaskDuration_ || !threadMetrics_.activeTurn) return {};
-        const std::int64_t durationMs = CurrentTaskDurationMs();
-        return durationUnits_
-            ? FormatDurationUnits(durationMs)
-            : FormatDurationCompact(durationMs);
+        if (!threadMetrics_.activeTurn) return {};
+
+        std::wstring line;
+        if (showTaskDuration_) {
+            const std::int64_t durationMs = CurrentTaskDurationMs();
+            line = durationUnits_
+                ? FormatDurationUnits(durationMs)
+                : FormatDurationCompact(durationMs);
+        }
+        if (showGenerationSpeed_) {
+            if (!line.empty()) line.push_back(L' ');
+            line += GenerationSpeedText();
+        }
+        return line;
     }
 
     bool IsDiffRowVisible() const {
@@ -2420,6 +2651,15 @@ private:
             (threadMetrics_.changedFiles > 0 ||
              threadMetrics_.addedLines > 0 ||
              threadMetrics_.removedLines > 0);
+    }
+
+    std::wstring DiffLineText() const {
+        if (!IsDiffRowVisible()) return {};
+        std::wstring text;
+        if (showDiffFiles_) text += std::to_wstring(threadMetrics_.changedFiles);
+        text += std::to_wstring(threadMetrics_.addedLines);
+        text += std::to_wstring(threadMetrics_.removedLines);
+        return text;
     }
 
     int VisibleRowCount() const {
@@ -2603,38 +2843,61 @@ private:
     void ResetHoverState() {
         hoverInside_ = false;
         hoverStartTick_ = 0;
+        KillTimer(mainWindow_, kHoverTimer);
         HideHoverPopup();
     }
 
-    void UpdateHoverState() {
-        if (!widgetVisible_ || !widgetWindow_ || !IsWindow(widgetWindow_) ||
+    void HandleWidgetMouseMove(HWND hwnd) {
+        if (hoverInside_) return;
+
+        hoverInside_ = true;
+        hoverStartTick_ = GetTickCount64();
+
+        TRACKMOUSEEVENT track{};
+        track.cbSize = sizeof(track);
+        track.dwFlags = TME_LEAVE;
+        track.hwndTrack = hwnd;
+        TrackMouseEvent(&track);
+
+        // One-shot-style timer: it is killed on firing or mouse leave.
+        SetTimer(mainWindow_, kHoverTimer, 250, nullptr);
+    }
+
+    void HandleWidgetMouseLeave() {
+        ResetHoverState();
+    }
+
+    void ShowHoverAfterDelay() {
+        KillTimer(mainWindow_, kHoverTimer);
+        if (!hoverInside_ || !widgetVisible_ || !widgetWindow_ ||
             !IsWindowVisible(widgetWindow_)) {
-            ResetHoverState();
             return;
         }
 
         POINT cursor{};
         RECT widgetRect{};
-        if (!GetCursorPos(&cursor) || !GetWindowRect(widgetWindow_, &widgetRect)) {
+        if (!GetCursorPos(&cursor) ||
+            !GetWindowRect(widgetWindow_, &widgetRect) ||
+            !PtInRect(&widgetRect, cursor)) {
             ResetHoverState();
             return;
         }
 
-        const bool inside = PtInRect(&widgetRect, cursor) != FALSE;
-        if (!inside) {
-            ResetHoverState();
-            return;
-        }
+        ShowHoverPopup(cursor);
+    }
 
-        const ULONGLONG now = GetTickCount64();
-        if (!hoverInside_) {
-            hoverInside_ = true;
-            hoverStartTick_ = now;
-            return;
-        }
-
-        if (!hoverPopupVisible_ && now - hoverStartTick_ >= 250) {
-            ShowHoverPopup(cursor);
+    void UpdateBlinkTimer() {
+        const bool shouldRun =
+            widgetVisible_ && blinkOnUserInput_ &&
+            threadMetrics_.waitingForUserInput;
+        if (shouldRun && !blinkTimerActive_) {
+            SetTimer(mainWindow_, kBlinkTimer, 500, nullptr);
+            blinkTimerActive_ = true;
+        } else if (!shouldRun && blinkTimerActive_) {
+            KillTimer(mainWindow_, kBlinkTimer);
+            blinkTimerActive_ = false;
+            lastWaitingInputBlinkHidden_ = false;
+            InvalidateWidget();
         }
     }
 
@@ -2666,11 +2929,30 @@ private:
 
         text += L"\r\n";
         if (threadMetrics_.hasCache) {
-            text += L"缓存：" + std::to_wstring(threadMetrics_.cachePercent) + L"% (" +
+            wchar_t cachePercent[32]{};
+            swprintf_s(cachePercent, L"%.5f", ExactCachePercent());
+            text += L"缓存：" + std::wstring(cachePercent) + L"% (" +
                     FormatInteger(threadMetrics_.cachedInputTokens) + L" / " +
                     FormatInteger(threadMetrics_.inputTokens) + L")";
         } else {
             text += L"缓存：暂无数据";
+        }
+
+        text += L"\r\n";
+        if (threadMetrics_.hasTokenUsage) {
+            text += L"总 Token：" + FormatInteger(threadMetrics_.totalTokens) +
+                    L" · 输出 " + FormatInteger(threadMetrics_.outputTokens);
+        } else {
+            text += L"总 Token：暂无数据";
+        }
+
+        text += L"\r\n生成速度：";
+        if (generationSpeedValid_) {
+            wchar_t speed[32]{};
+            swprintf_s(speed, L"%.1f token/s", generationSpeed_);
+            text += speed;
+        } else {
+            text += L"暂无";
         }
 
         text += L"\r\n";
@@ -2769,6 +3051,13 @@ private:
     }
 
     void HandleMenuCommand(UINT command) {
+        if (command >= kMenuThreadBase &&
+            command < kMenuThreadBase + kMenuThreadLimit) {
+            SelectSavedThread(
+                static_cast<std::size_t>(command - kMenuThreadBase));
+            return;
+        }
+
         switch (command) {
         case kMenuSettings:
             OpenSettings();
@@ -2787,7 +3076,7 @@ private:
         case kMenuAbout:
             MessageBoxW(
                 mainWindow_,
-                L"CodexTaskbar v0.3.4\n\n"
+                L"CodexTaskbar v0.3.5\n\n"
                 L"在 Windows 10 任务栏显示 Codex 配额、绑定会话上下文/缓存和本轮代码改动。\n"
                 L"配额来自官方 app-server；会话指标通过只读 Codex Desktop IPC follower 获取。",
                 L"关于 CodexTaskbar",
@@ -2960,20 +3249,28 @@ private:
     bool durationUnits_{false};
     bool blinkOnUserInput_{true};
     bool lastWaitingInputBlinkHidden_{false};
+    bool blinkTimerActive_{false};
     bool hidePercentSigns_{false};
-    bool narrowFont_{false};
+    int fontChoice_{0};
     bool autoFitFont_{false};
     int cacheDisplayMode_{0};
+    bool showGenerationSpeed_{false};
     bool automaticThreadMode_{false};
     double fontSize_{10.0};
-    double effectiveWidgetFontSize_{10.0};
-    int lastAutoFitWidth_{-1};
-    std::wstring lastAutoFitSignature_;
+    std::array<RowFitCache, 5> rowFitCaches_{};
     unsigned tickCount_{0};
 
     QuotaSnapshot quota_{};
     ThreadMetrics threadMetrics_{};
     std::wstring manualThreadId_;
+    std::vector<SavedThreadEntry> savedThreads_;
+
+    bool generationSpeedValid_{false};
+    double generationSpeed_{0.0};
+    std::int64_t generationSpeedLastOutputTokens_{0};
+    std::int64_t generationSpeedLastSampleMs_{0};
+    std::string generationSpeedThreadId_;
+    std::string generationSpeedTurnId_;
     std::array<wchar_t, 1024> tooltipBuffer_{};
     std::unique_ptr<DesktopThreadMonitor> threadMonitor_;
     RendererActivityMonitor rendererActivityMonitor_;
