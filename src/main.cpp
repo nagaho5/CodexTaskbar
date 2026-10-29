@@ -253,6 +253,52 @@ bool IsCodexDesktopRunning() {
     return FindCodexMainWindow() != nullptr;
 }
 
+std::vector<TaskbarCandidate> EnumerateTaskbars() {
+    std::vector<TaskbarCandidate> result;
+
+    EnumWindows(
+        [](HWND hwnd, LPARAM value) -> BOOL {
+            auto* result =
+                reinterpret_cast<std::vector<TaskbarCandidate>*>(value);
+
+            wchar_t className[128]{};
+            if (!GetClassNameW(
+                    hwnd,
+                    className,
+                    static_cast<int>(std::size(className)))) {
+                return TRUE;
+            }
+
+            const bool taskbarClass =
+                wcscmp(className, L"Shell_TrayWnd") == 0 ||
+                wcscmp(className, L"Shell_SecondaryTrayWnd") == 0;
+            if (!taskbarClass) return TRUE;
+
+            HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL);
+            if (!monitor) return TRUE;
+
+            MONITORINFOEXW info{};
+            info.cbSize = sizeof(info);
+            if (!GetMonitorInfoW(monitor, &info)) return TRUE;
+
+            result->push_back({
+                hwnd,
+                (info.dwFlags & MONITORINFOF_PRIMARY) != 0,
+                info.szDevice});
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&result));
+
+    std::sort(
+        result.begin(),
+        result.end(),
+        [](const TaskbarCandidate& left, const TaskbarCandidate& right) {
+            if (left.primary != right.primary) return left.primary > right.primary;
+            return left.deviceName < right.deviceName;
+        });
+    return result;
+}
+
 HWND FindDescendantByTitle(HWND root, const wchar_t* title) {
     struct Context {
         const wchar_t* title;
