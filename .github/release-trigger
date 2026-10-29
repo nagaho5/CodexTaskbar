@@ -1,3 +1,3 @@
-tag=v0.3.7
-source_commit=531a11201c29f26f8d54636dccbfb6ad10fb8d27
-reason=retain final 5h quota-rate estimate and start timing at first real work item
+tag=v0.3.8
+source_commit=7780581e614881077266bda35bef60fc3b5af9e5
+reason=multi-display taskbar targeting, TrafficMonitor readiness, robust generation-speed averaging, compact-hour underline, observation-aligned 5h rate, and SHA256 self-updater
