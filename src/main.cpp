@@ -580,6 +580,7 @@ public:
         if (font_) {
             DeleteObject(font_);
         }
+        ClearRowFitCaches();
         if (widgetFont_ && widgetFont_ != font_) {
             DeleteObject(widgetFont_);
         }
@@ -1327,7 +1328,7 @@ public:
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             500,
-            600,
+            720,
             mainWindow_,
             nullptr,
             instance_,
@@ -1367,6 +1368,20 @@ public:
         swprintf_s(fontValue, L"%.1f", fontSize_);
         SetWindowTextW(fontEdit, fontValue);
 
+        CreateWindowW(L"STATIC", L"字体：", WS_CHILD | WS_VISIBLE,
+            210, 20, 48, 24, hwnd, nullptr, instance_, nullptr);
+        HWND fontCombo = CreateWindowExW(
+            WS_EX_CLIENTEDGE, L"COMBOBOX", nullptr,
+            WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+            258, 16, 200, 180, hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kComboFontChoice)), instance_, nullptr);
+        SendMessageW(fontCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Segoe UI Semibold（原版）"));
+        SendMessageW(fontCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Bahnschrift Regular"));
+        SendMessageW(fontCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Segoe UI Regular"));
+        SendMessageW(fontCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Tahoma Regular"));
+        SendMessageW(fontCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Bahnschrift SemiCondensed"));
+        SendMessageW(fontCombo, CB_SETCURSEL, static_cast<WPARAM>(fontChoice_), 0);
+
         CreateWindowW(L"STATIC", L"任务栏显示：", WS_CHILD | WS_VISIBLE,
             24, 54, 100, 22, hwnd, nullptr, instance_, nullptr);
 
@@ -1386,61 +1401,40 @@ public:
         checkbox(kCheckShowDiff, L"代码改动", 210, 128, showDiff_, 100);
         checkbox(kCheckShowDiffFiles, L"显示文件数", 318, 128, showDiffFiles_, 112);
         checkbox(kCheckShowTaskDuration, L"任务耗时", 24, 153, showTaskDuration_);
+        checkbox(kCheckShowGenerationSpeed, L"生成速度", 118, 153, showGenerationSpeed_, 92);
 
         CreateWindowW(
             L"STATIC", L"运行中颜色：", WS_CHILD | WS_VISIBLE,
-            210, 153, 88, 22, hwnd, nullptr, instance_, nullptr);
+            225, 153, 88, 22, hwnd, nullptr, instance_, nullptr);
         CreateWindowW(
             L"BUTTON", L"选择...", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            298, 149, 76, 26, hwnd,
+            313, 149, 70, 26, hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kButtonWorkingColor)), instance_, nullptr);
         CreateWindowW(
             L"STATIC", L"76%", WS_CHILD | WS_VISIBLE | SS_CENTER,
-            382, 153, 48, 22, hwnd,
+            390, 153, 48, 22, hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kStaticWorkingColorPreview)), instance_, nullptr);
 
-        checkbox(
-            kCheckContextWarningColors,
-            L"Context警告色(80/90%)",
+        checkbox(kCheckContextWarningColors, L"Context警告色(80/90%)",
             24, 183, contextWarningColors_, 190);
-        checkbox(
-            kCheckQuotaWarningColors,
-            L"配额警告色(20/10%)",
+        checkbox(kCheckQuotaWarningColors, L"配额警告色(20/10%)",
             225, 183, quotaWarningColors_, 190);
-        checkbox(
-            kCheckDurationUnits,
-            L"耗时使用 h/m/s 格式",
+        checkbox(kCheckDurationUnits, L"耗时使用 h/m/s 格式",
             24, 208, durationUnits_, 190);
-        checkbox(
-            kCheckBlinkOnUserInput,
-            L"等待输入时闪烁任务百分比",
+        checkbox(kCheckBlinkOnUserInput, L"等待输入时闪烁任务百分比",
             225, 208, blinkOnUserInput_, 225);
-
-        checkbox(
-            kCheckHidePercentSigns,
-            L"任务栏隐藏 %",
+        checkbox(kCheckHidePercentSigns, L"任务栏隐藏 %",
             24, 233, hidePercentSigns_, 190);
-        checkbox(
-            kCheckNarrowFont,
-            L"窄体数字 (Bahnschrift)",
-            225, 233, narrowFont_, 225);
-        checkbox(
-            kCheckAutoFitFont,
-            L"溢出时自动微缩 (最多2pt)",
-            24, 258, autoFitFont_, 200);
+        checkbox(kCheckAutoFitFont, L"溢出时逐行微缩 (最多2pt)",
+            225, 233, autoFitFont_, 225);
 
-        CreateWindowW(
-            L"STATIC", L"Cache显示：", WS_CHILD | WS_VISIBLE,
-            225, 260, 90, 22, hwnd, nullptr, instance_, nullptr);
+        CreateWindowW(L"STATIC", L"Cache显示：", WS_CHILD | WS_VISIBLE,
+            24, 262, 90, 22, hwnd, nullptr, instance_, nullptr);
         HWND cacheMode = CreateWindowExW(
-            WS_EX_CLIENTEDGE,
-            L"COMBOBOX",
-            nullptr,
+            WS_EX_CLIENTEDGE, L"COMBOBOX", nullptr,
             WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
-            315, 255, 135, 150, hwnd,
-            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kComboCacheDisplayMode)),
-            instance_,
-            nullptr);
+            114, 257, 140, 150, hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kComboCacheDisplayMode)), instance_, nullptr);
         SendMessageW(cacheMode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"整数"));
         SendMessageW(cacheMode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"1位小数"));
         SendMessageW(cacheMode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"2位小数"));
@@ -1461,29 +1455,44 @@ public:
         SendMessageW(manualRadio, BM_SETCHECK, automaticThreadMode_ ? BST_UNCHECKED : BST_CHECKED, 0);
         SendMessageW(autoRadio, BM_SETCHECK, automaticThreadMode_ ? BST_CHECKED : BST_UNCHECKED, 0);
 
-        CreateWindowW(L"STATIC", L"Thread ID：", WS_CHILD | WS_VISIBLE,
-            24, 356, 80, 22, hwnd, nullptr, instance_, nullptr);
+        CreateWindowW(L"STATIC", L"当前 Thread ID：", WS_CHILD | WS_VISIBLE,
+            24, 356, 100, 22, hwnd, nullptr, instance_, nullptr);
         CreateWindowExW(
             WS_EX_CLIENTEDGE, L"EDIT", manualThreadId_.c_str(),
             WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-            104, 352, 346, 26, hwnd,
+            126, 352, 324, 26, hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kEditThreadId)), instance_, nullptr);
 
-        checkbox(kCheckAutoStart, L"开机自动启动", 24, 398, autoStart_);
+        CreateWindowW(L"STATIC", L"保存的对话（每行：名称|Thread ID）：",
+            WS_CHILD | WS_VISIBLE, 24, 390, 300, 22, hwnd, nullptr, instance_, nullptr);
+        const std::wstring savedText = SerializeSavedThreads(savedThreads_);
+        CreateWindowExW(
+            WS_EX_CLIENTEDGE, L"EDIT", savedText.c_str(),
+            WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL,
+            24, 414, 426, 82, hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kEditSavedThreads)), instance_, nullptr);
 
         CreateWindowW(
             L"STATIC",
-            L"提示：隐藏项目仍会在悬浮提示中显示；自动微缩不会超过你设置的字号。",
+            L"右键“对话”菜单只切换当前一个订阅；其它保存项不会后台跟踪。",
             WS_CHILD | WS_VISIBLE,
-            24, 432, 440, 38, hwnd, nullptr, instance_, nullptr);
+            24, 500, 430, 34, hwnd, nullptr, instance_, nullptr);
+
+        checkbox(kCheckAutoStart, L"开机自动启动", 24, 540, autoStart_);
+
+        CreateWindowW(
+            L"STATIC",
+            L"提示：隐藏项目仍会在悬浮提示中显示；自动微缩只缩放不下的那一行。",
+            WS_CHILD | WS_VISIBLE,
+            24, 570, 440, 38, hwnd, nullptr, instance_, nullptr);
 
         CreateWindowW(
             L"BUTTON", L"确定", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            300, 492, 76, 28, hwnd,
+            300, 620, 76, 28, hwnd,
             reinterpret_cast<HMENU>(IDOK), instance_, nullptr);
         CreateWindowW(
             L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            388, 492, 76, 28, hwnd,
+            388, 620, 76, 28, hwnd,
             reinterpret_cast<HMENU>(IDCANCEL), instance_, nullptr);
 
         EnumChildWindows(
@@ -1659,14 +1668,20 @@ public:
         showDiff_ = checked(kCheckShowDiff);
         showDiffFiles_ = checked(kCheckShowDiffFiles);
         showTaskDuration_ = checked(kCheckShowTaskDuration);
+        showGenerationSpeed_ = checked(kCheckShowGenerationSpeed);
         workingColor_ = pendingWorkingColor_;
         contextWarningColors_ = checked(kCheckContextWarningColors);
         quotaWarningColors_ = checked(kCheckQuotaWarningColors);
         durationUnits_ = checked(kCheckDurationUnits);
         blinkOnUserInput_ = checked(kCheckBlinkOnUserInput);
         hidePercentSigns_ = checked(kCheckHidePercentSigns);
-        narrowFont_ = checked(kCheckNarrowFont);
         autoFitFont_ = checked(kCheckAutoFitFont);
+
+        const LRESULT fontSelection =
+            SendDlgItemMessageW(hwnd, kComboFontChoice, CB_GETCURSEL, 0, 0);
+        fontChoice_ = fontSelection == CB_ERR
+            ? 0
+            : std::clamp(static_cast<int>(fontSelection), 0, 4);
 
         const LRESULT cacheSelection =
             SendDlgItemMessageW(hwnd, kComboCacheDisplayMode, CB_GETCURSEL, 0, 0);
@@ -1683,12 +1698,16 @@ public:
         wchar_t threadText[256]{};
         GetDlgItemTextW(hwnd, kEditThreadId, threadText, static_cast<int>(std::size(threadText)));
         manualThreadId_ = threadText;
-        while (!manualThreadId_.empty() && iswspace(manualThreadId_.front())) {
-            manualThreadId_.erase(manualThreadId_.begin());
-        }
-        while (!manualThreadId_.empty() && iswspace(manualThreadId_.back())) {
-            manualThreadId_.pop_back();
-        }
+        while (!manualThreadId_.empty() && iswspace(manualThreadId_.front())) manualThreadId_.erase(manualThreadId_.begin());
+        while (!manualThreadId_.empty() && iswspace(manualThreadId_.back())) manualThreadId_.pop_back();
+
+        std::vector<wchar_t> savedBuffer(8192, L'\0');
+        GetDlgItemTextW(
+            hwnd,
+            kEditSavedThreads,
+            savedBuffer.data(),
+            static_cast<int>(savedBuffer.size()));
+        savedThreads_ = ParseSavedThreads(savedBuffer.data());
 
         const int fontSizeTenths = static_cast<int>(std::lround(fontSize_ * 10.0));
         WriteRegistryDword(L"FontSizeTenths", static_cast<DWORD>(fontSizeTenths));
@@ -1702,17 +1721,20 @@ public:
         WriteRegistryDword(L"ShowDiff", showDiff_ ? 1u : 0u);
         WriteRegistryDword(L"ShowDiffFiles", showDiffFiles_ ? 1u : 0u);
         WriteRegistryDword(L"ShowTaskDuration", showTaskDuration_ ? 1u : 0u);
+        WriteRegistryDword(L"ShowGenerationSpeed", showGenerationSpeed_ ? 1u : 0u);
         WriteRegistryDword(L"WorkingColor", static_cast<DWORD>(workingColor_));
         WriteRegistryDword(L"ContextWarningColors", contextWarningColors_ ? 1u : 0u);
         WriteRegistryDword(L"QuotaWarningColors", quotaWarningColors_ ? 1u : 0u);
         WriteRegistryDword(L"DurationUnits", durationUnits_ ? 1u : 0u);
         WriteRegistryDword(L"BlinkOnUserInput", blinkOnUserInput_ ? 1u : 0u);
         WriteRegistryDword(L"HidePercentSigns", hidePercentSigns_ ? 1u : 0u);
-        WriteRegistryDword(L"NarrowFont", narrowFont_ ? 1u : 0u);
+        WriteRegistryDword(L"FontChoice", static_cast<DWORD>(fontChoice_));
+        WriteRegistryDword(L"NarrowFont", fontChoice_ == 4 ? 1u : 0u);
         WriteRegistryDword(L"AutoFitFont", autoFitFont_ ? 1u : 0u);
         WriteRegistryDword(L"CacheDisplayMode", static_cast<DWORD>(cacheDisplayMode_));
         WriteRegistryDword(L"AutomaticThreadMode", automaticThreadMode_ ? 1u : 0u);
         WriteRegistryString(L"ManualThreadId", manualThreadId_);
+        WriteRegistryString(L"SavedThreads", SerializeSavedThreads(savedThreads_));
         SetAutoStartRegistry(autoStart_);
 
         if (threadMonitor_) {
@@ -1720,6 +1742,7 @@ public:
         }
 
         RecreateFont();
+        UpdateBlinkTimer();
         if (widgetVisible_) {
             PositionWidget();
             InvalidateWidget();
