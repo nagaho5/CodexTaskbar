@@ -3117,12 +3117,13 @@ private:
                     static_cast<long long>(seconds));
 
                 if (durationUnits_) {
-                    const std::wstring minuteField =
-                        std::to_wstring(minutes) + L"m";
                     segments.push_back({
-                        minuteField,
+                        std::to_wstring(minutes),
                         RGB(255, 255, 255),
                         hours == 1});
+                    segments.push_back({
+                        L"m",
+                        RGB(255, 255, 255)});
                     segments.push_back({
                         secondsText,
                         RGB(255, 255, 255),
@@ -3652,7 +3653,7 @@ private:
         case kMenuAbout:
             MessageBoxW(
                 mainWindow_,
-                L"CodexTaskbar v0.3.7\n\n"
+                L"CodexTaskbar v0.3.8\n\n"
                 L"在 Windows 10 任务栏显示 Codex 配额、绑定会话上下文/缓存和本轮代码改动。\n"
                 L"配额来自官方 app-server；会话指标通过只读 Codex Desktop IPC follower 获取。",
                 L"关于 CodexTaskbar",
