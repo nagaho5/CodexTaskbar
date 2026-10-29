@@ -1751,6 +1751,25 @@ public:
         checkbox(kCheckShowTaskDuration, L"任务耗时", 24, 256, showTaskDuration_, 130);
         checkbox(kCheckShowGenerationSpeed, L"生成速度", 164, 256, showGenerationSpeed_, 130);
 
+        CreateWindowW(L"STATIC", L"速度显示：", WS_CHILD | WS_VISIBLE,
+            24, 292, 80, 24, hwnd, nullptr, instance_, nullptr);
+        HWND speedMode = CreateWindowExW(
+            WS_EX_CLIENTEDGE, L"COMBOBOX", nullptr,
+            WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+            106, 287, 180, 120, hwnd,
+            reinterpret_cast<HMENU>(
+                static_cast<INT_PTR>(kComboGenerationSpeedMode)),
+            instance_, nullptr);
+        SendMessageW(
+            speedMode, CB_ADDSTRING, 0,
+            reinterpret_cast<LPARAM>(L"实时速度"));
+        SendMessageW(
+            speedMode, CB_ADDSTRING, 0,
+            reinterpret_cast<LPARAM>(L"最近平均"));
+        SendMessageW(
+            speedMode, CB_SETCURSEL,
+            static_cast<WPARAM>(generationSpeedMode_), 0);
+
         // Right column: presentation and alert behavior.
         CreateWindowW(L"STATIC", L"显示样式与提醒", WS_CHILD | WS_VISIBLE,
             400, 62, 200, 24, hwnd, nullptr, instance_, nullptr);
@@ -1792,58 +1811,63 @@ public:
         SendMessageW(cacheMode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"90+紧凑"));
         SendMessageW(cacheMode, CB_SETCURSEL, static_cast<WPARAM>(cacheDisplayMode_), 0);
 
+        checkbox(
+            kCheckCompactHourUnderline,
+            L"小时用下划线压缩",
+            400, 322, compactHourUnderline_, 250);
+
         // Session section spans the whole lower half.
         CreateWindowW(L"STATIC", L"会话来源", WS_CHILD | WS_VISIBLE,
-            24, 338, 180, 24, hwnd, nullptr, instance_, nullptr);
+            24, 350, 180, 24, hwnd, nullptr, instance_, nullptr);
 
         HWND manualRadio = CreateWindowW(
             L"BUTTON", L"手动绑定 Thread ID",
             WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON | WS_GROUP,
-            24, 364, 220, 24, hwnd,
+            24, 376, 220, 24, hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kRadioManualThread)), instance_, nullptr);
         HWND autoRadio = CreateWindowW(
             L"BUTTON", L"自动跟随活动任务（实验）",
             WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON,
-            270, 364, 250, 24, hwnd,
+            270, 376, 250, 24, hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kRadioAutoThread)), instance_, nullptr);
         SendMessageW(manualRadio, BM_SETCHECK, automaticThreadMode_ ? BST_UNCHECKED : BST_CHECKED, 0);
         SendMessageW(autoRadio, BM_SETCHECK, automaticThreadMode_ ? BST_CHECKED : BST_UNCHECKED, 0);
 
         CreateWindowW(L"STATIC", L"当前 Thread ID：", WS_CHILD | WS_VISIBLE,
-            24, 400, 112, 24, hwnd, nullptr, instance_, nullptr);
+            24, 412, 112, 24, hwnd, nullptr, instance_, nullptr);
         CreateWindowExW(
             WS_EX_CLIENTEDGE, L"EDIT", manualThreadId_.c_str(),
             WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-            138, 396, 600, 28, hwnd,
+            138, 408, 600, 28, hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kEditThreadId)), instance_, nullptr);
 
         CreateWindowW(
             L"STATIC",
             L"保存的对话（供右键“选择对话”使用；每行：名称|Thread ID）：",
             WS_CHILD | WS_VISIBLE,
-            24, 438, 620, 24, hwnd, nullptr, instance_, nullptr);
+            24, 450, 620, 24, hwnd, nullptr, instance_, nullptr);
         const std::wstring savedText = SerializeSavedThreads(savedThreads_);
         CreateWindowExW(
             WS_EX_CLIENTEDGE, L"EDIT", savedText.c_str(),
             WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL,
-            24, 464, 714, 104, hwnd,
+            24, 476, 714, 104, hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kEditSavedThreads)), instance_, nullptr);
 
         CreateWindowW(
             L"STATIC",
             L"右键“选择对话”会在右侧展开保存清单；切换时只跟踪选中的一个 Thread，其它保存项不产生后台开销。",
             WS_CHILD | WS_VISIBLE,
-            24, 574, 714, 42, hwnd, nullptr, instance_, nullptr);
+            24, 586, 714, 42, hwnd, nullptr, instance_, nullptr);
 
-        checkbox(kCheckAutoStart, L"开机自动启动", 24, 618, autoStart_, 180);
+        checkbox(kCheckAutoStart, L"开机自动启动", 24, 630, autoStart_, 180);
 
         CreateWindowW(
             L"BUTTON", L"确定", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            574, 614, 78, 30, hwnd,
+            574, 626, 78, 30, hwnd,
             reinterpret_cast<HMENU>(IDOK), instance_, nullptr);
         CreateWindowW(
             L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            660, 614, 78, 30, hwnd,
+            660, 626, 78, 30, hwnd,
             reinterpret_cast<HMENU>(IDCANCEL), instance_, nullptr);
 
         EnumChildWindows(
@@ -2020,6 +2044,8 @@ public:
         showDiffFiles_ = checked(kCheckShowDiffFiles);
         showTaskDuration_ = checked(kCheckShowTaskDuration);
         showGenerationSpeed_ = checked(kCheckShowGenerationSpeed);
+        compactHourUnderline_ =
+            checked(kCheckCompactHourUnderline);
         workingColor_ = pendingWorkingColor_;
         contextWarningColors_ = checked(kCheckContextWarningColors);
         quotaWarningColors_ = checked(kCheckQuotaWarningColors);
@@ -2039,6 +2065,17 @@ public:
         cacheDisplayMode_ = cacheSelection == CB_ERR
             ? 0
             : std::clamp(static_cast<int>(cacheSelection), 0, 3);
+
+        const LRESULT speedSelection =
+            SendDlgItemMessageW(
+                hwnd,
+                kComboGenerationSpeedMode,
+                CB_GETCURSEL,
+                0,
+                0);
+        generationSpeedMode_ = speedSelection == CB_ERR
+            ? 0
+            : std::clamp(static_cast<int>(speedSelection), 0, 1);
 
         const bool previousAutomaticMode = automaticThreadMode_;
         automaticThreadMode_ = checked(kRadioAutoThread);
@@ -2073,6 +2110,12 @@ public:
         WriteRegistryDword(L"ShowDiffFiles", showDiffFiles_ ? 1u : 0u);
         WriteRegistryDword(L"ShowTaskDuration", showTaskDuration_ ? 1u : 0u);
         WriteRegistryDword(L"ShowGenerationSpeed", showGenerationSpeed_ ? 1u : 0u);
+        WriteRegistryDword(
+            L"GenerationSpeedMode",
+            static_cast<DWORD>(generationSpeedMode_));
+        WriteRegistryDword(
+            L"CompactHourUnderline",
+            compactHourUnderline_ ? 1u : 0u);
         WriteRegistryDword(L"WorkingColor", static_cast<DWORD>(workingColor_));
         WriteRegistryDword(L"ContextWarningColors", contextWarningColors_ ? 1u : 0u);
         WriteRegistryDword(L"QuotaWarningColors", quotaWarningColors_ ? 1u : 0u);
