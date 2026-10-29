@@ -693,6 +693,9 @@ public:
         autoFitFont_ = ReadRegistryDword(L"AutoFitFont", 0) != 0;
         cacheDisplayMode_ = std::clamp(ReadRegistryDword(L"CacheDisplayMode", 0), 0, 3);
         showGenerationSpeed_ = ReadRegistryDword(L"ShowGenerationSpeed", 0) != 0;
+        generationSpeedMode_ = std::clamp(ReadRegistryDword(L"GenerationSpeedMode", 0), 0, 1);
+        compactHourUnderline_ = ReadRegistryDword(L"CompactHourUnderline", 0) != 0;
+        displayTarget_ = std::clamp(ReadRegistryDword(L"DisplayTarget", 0), 0, 1);
         automaticThreadMode_ = ReadRegistryDword(L"AutomaticThreadMode", 0) != 0;
         manualThreadId_ = ReadRegistryString(L"ManualThreadId");
         savedThreads_ = ParseSavedThreads(ReadRegistryString(L"SavedThreads"));
@@ -3456,6 +3459,9 @@ private:
     HWND taskbarWindow_{nullptr};
     HWND rebarWindow_{nullptr};
     HWND hoverWindow_{nullptr};
+    std::wstring activeTaskbarDevice_;
+    bool anchorReadyActive_{false};
+    ULONGLONG anchorReadyDeadline_{0};
     HFONT font_{nullptr};
     HFONT widgetFont_{nullptr};
     HBRUSH darkBackgroundBrush_{nullptr};
@@ -3496,6 +3502,9 @@ private:
     bool autoFitFont_{false};
     int cacheDisplayMode_{0};
     bool showGenerationSpeed_{false};
+    int generationSpeedMode_{0};
+    bool compactHourUnderline_{false};
+    int displayTarget_{0};
     bool automaticThreadMode_{false};
     double fontSize_{10.0};
     std::array<RowFitCache, 5> rowFitCaches_{};
@@ -3508,9 +3517,7 @@ private:
 
     bool generationSpeedValid_{false};
     double generationSpeed_{0.0};
-    double generationSpeedSampleSum_{0.0};
-    std::size_t generationSpeedSampleCount_{0};
-    std::vector<double> generationSpeedRecent_;
+    std::vector<GenerationSpeedSample> generationSpeedRecent_;
     std::int64_t generationSpeedLastOutputTokens_{0};
     std::int64_t generationSpeedLastSampleMs_{0};
     std::string generationSpeedThreadId_;
