@@ -1,3 +1,3 @@
-tag=v0.3.4
-source_commit=2147be4a267975d9184f5357b56a4e920ba80ca3
-reason=compact taskbar formatting, optional percent hiding, narrow font, cache precision modes, and overflow auto-fit
+tag=v0.3.5
+source_commit=34530ffae43300a8871f887bfcdedb245cbaef44
+reason=lightweight runtime, generation speed, saved manual threads, font choices, and per-row auto-fit
