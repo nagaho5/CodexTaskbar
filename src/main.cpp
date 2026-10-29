@@ -849,6 +849,9 @@ public:
             generationSpeedTurnId_ = metrics.turnId;
             generationSpeedValid_ = false;
             generationSpeed_ = 0.0;
+            generationSpeedSampleSum_ = 0.0;
+            generationSpeedSampleCount_ = 0;
+            generationSpeedRecent_.clear();
             generationSpeedLastOutputTokens_ =
                 metrics.hasTokenUsage ? metrics.outputTokens : 0;
             generationSpeedLastSampleMs_ = nowMs;
@@ -867,6 +870,14 @@ public:
                         static_cast<double>(deltaTokens) * 1000.0 /
                         static_cast<double>(deltaMs);
                     generationSpeedValid_ = true;
+
+                    generationSpeedSampleSum_ += generationSpeed_;
+                    ++generationSpeedSampleCount_;
+                    generationSpeedRecent_.push_back(generationSpeed_);
+                    if (generationSpeedRecent_.size() > 5) {
+                        generationSpeedRecent_.erase(
+                            generationSpeedRecent_.begin());
+                    }
                 }
                 generationSpeedLastOutputTokens_ = metrics.outputTokens;
                 generationSpeedLastSampleMs_ = nowMs;
@@ -1318,6 +1329,9 @@ public:
 
         generationSpeedValid_ = false;
         generationSpeed_ = 0.0;
+        generationSpeedSampleSum_ = 0.0;
+        generationSpeedSampleCount_ = 0;
+        generationSpeedRecent_.clear();
         generationSpeedThreadId_.clear();
         generationSpeedTurnId_.clear();
 
@@ -3038,6 +3052,31 @@ private:
             text += L"暂无";
         }
 
+        text += L"\r\n本轮平均：";
+        if (generationSpeedSampleCount_ > 0) {
+            wchar_t average[32]{};
+            swprintf_s(
+                average,
+                L"%.1f token/s",
+                generationSpeedSampleSum_ /
+                    static_cast<double>(generationSpeedSampleCount_));
+            text += average;
+        } else {
+            text += L"暂无";
+        }
+
+        text += L"\r\n最近速度：";
+        if (!generationSpeedRecent_.empty()) {
+            for (std::size_t i = 0; i < generationSpeedRecent_.size(); ++i) {
+                if (i > 0) text += L" / ";
+                wchar_t sample[24]{};
+                swprintf_s(sample, L"%.1f", generationSpeedRecent_[i]);
+                text += sample;
+            }
+        } else {
+            text += L"暂无";
+        }
+
         text += L"\r\n";
         if (quotaValid_) {
             text += L"配额连接：正常 · " + FormatElapsedAge(lastQuotaSuccessMs_) + L"更新";
@@ -3350,6 +3389,9 @@ private:
 
     bool generationSpeedValid_{false};
     double generationSpeed_{0.0};
+    double generationSpeedSampleSum_{0.0};
+    std::size_t generationSpeedSampleCount_{0};
+    std::vector<double> generationSpeedRecent_;
     std::int64_t generationSpeedLastOutputTokens_{0};
     std::int64_t generationSpeedLastSampleMs_{0};
     std::string generationSpeedThreadId_;
