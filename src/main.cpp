@@ -451,7 +451,7 @@ std::wstring FormatDurationCompact(std::int64_t milliseconds) {
             static_cast<long long>(minutes),
             static_cast<long long>(seconds));
     } else {
-        swprintf_s(text, L"%02lld:%02lld",
+        swprintf_s(text, L"%lld:%02lld",
             static_cast<long long>(minutes),
             static_cast<long long>(seconds));
     }
@@ -731,6 +731,7 @@ public:
                     quotaValid_ = false;
                     threadMetrics_ = {};
                     generationSpeedValid_ = false;
+                    fiveHourRateBaselineValid_ = false;
                     rendererActivityMonitor_.Reset();
                     UpdateBlinkTimer();
                     InvalidateWidget();
@@ -748,9 +749,25 @@ public:
     }
 
     void ApplyQuota(const QuotaSnapshot& snapshot) {
+        const std::int64_t nowMs = CurrentUnixMilliseconds();
+
+        if (fiveHourRateBaselineValid_ &&
+            snapshot.fiveHour.valid &&
+            snapshot.fiveHour.resetsAtUnix != fiveHourRateResetAtUnix_) {
+            // The 5h window rolled over while the task was still running.
+            // Restart the rate baseline at the new window instead of mixing
+            // percentages from two different windows.
+            fiveHourRateBaselineValid_ = false;
+        }
+
         quota_ = snapshot;
         quotaValid_ = true;
-        lastQuotaSuccessMs_ = CurrentUnixMilliseconds();
+        lastQuotaSuccessMs_ = nowMs;
+
+        if (threadMetrics_.activeTurn && !fiveHourRateBaselineValid_) {
+            StartFiveHourRateBaseline(threadMetrics_, nowMs);
+        }
+
         InvalidateWidget();
         UpdateTooltipText();
         UpdateTrayTip();
@@ -763,6 +780,48 @@ public:
         UpdateTrayTip();
     }
 
+    void StartFiveHourRateBaseline(
+        const ThreadMetrics& metrics,
+        std::int64_t nowMs) {
+        if (!metrics.activeTurn ||
+            !quotaValid_ ||
+            !quota_.fiveHour.valid) {
+            return;
+        }
+
+        fiveHourRateBaselineValid_ = true;
+        fiveHourRateStartRemaining_ = quota_.fiveHour.remainingPercent;
+        fiveHourRateResetAtUnix_ = quota_.fiveHour.resetsAtUnix;
+        fiveHourRateStartMs_ =
+            metrics.turnStartedAtMs > 0 ? metrics.turnStartedAtMs : nowMs;
+        fiveHourRateThreadId_ = metrics.threadId;
+        fiveHourRateTurnId_ = metrics.turnId;
+    }
+
+    std::optional<double> CurrentFiveHourConsumptionRate() const {
+        if (!fiveHourRateBaselineValid_ ||
+            !threadMetrics_.activeTurn ||
+            !quotaValid_ ||
+            !quota_.fiveHour.valid ||
+            quota_.fiveHour.resetsAtUnix != fiveHourRateResetAtUnix_ ||
+            fiveHourRateStartMs_ <= 0) {
+            return std::nullopt;
+        }
+
+        const int consumed =
+            fiveHourRateStartRemaining_ - quota_.fiveHour.remainingPercent;
+        if (consumed < 0) return std::nullopt;
+
+        const std::int64_t elapsedMs =
+            CurrentUnixMilliseconds() - fiveHourRateStartMs_;
+        if (elapsedMs <= 0) return std::nullopt;
+
+        const double elapsedMinutes =
+            static_cast<double>(elapsedMs) / 60000.0;
+        return static_cast<double>(consumed) /
+            std::max(0.001, elapsedMinutes);
+    }
+
     void ApplyThreadMetrics(const ThreadMetrics& metrics) {
         const int oldRows = VisibleRowCount();
         const std::int64_t nowMs = CurrentUnixMilliseconds();
@@ -770,6 +829,21 @@ public:
         const bool identityChanged =
             metrics.threadId != generationSpeedThreadId_ ||
             metrics.turnId != generationSpeedTurnId_;
+        const bool rateIdentityChanged =
+            metrics.threadId != fiveHourRateThreadId_ ||
+            metrics.turnId != fiveHourRateTurnId_;
+
+        if (rateIdentityChanged) {
+            fiveHourRateBaselineValid_ = false;
+            fiveHourRateThreadId_ = metrics.threadId;
+            fiveHourRateTurnId_ = metrics.turnId;
+            if (metrics.activeTurn) {
+                StartFiveHourRateBaseline(metrics, nowMs);
+            }
+        } else if (metrics.activeTurn && !fiveHourRateBaselineValid_) {
+            StartFiveHourRateBaseline(metrics, nowMs);
+        }
+
         if (identityChanged) {
             generationSpeedThreadId_ = metrics.threadId;
             generationSpeedTurnId_ = metrics.turnId;
@@ -2911,6 +2985,15 @@ private:
             text += L"5小时：暂无数据";
         }
 
+        text += L"\r\n5h消耗速度（估算）：";
+        if (const auto rate = CurrentFiveHourConsumptionRate()) {
+            wchar_t rateText[48]{};
+            swprintf_s(rateText, L"%.3f%%/分钟", *rate);
+            text += rateText;
+        } else {
+            text += L"暂无";
+        }
+
         text += L"\r\n";
         if (quotaValid_ && quota_.sevenDay.valid) {
             text += L"7天：剩余 " + std::to_wstring(quota_.sevenDay.remainingPercent) + L"%";
@@ -3271,6 +3354,14 @@ private:
     std::int64_t generationSpeedLastSampleMs_{0};
     std::string generationSpeedThreadId_;
     std::string generationSpeedTurnId_;
+
+    bool fiveHourRateBaselineValid_{false};
+    int fiveHourRateStartRemaining_{0};
+    std::int64_t fiveHourRateResetAtUnix_{0};
+    std::int64_t fiveHourRateStartMs_{0};
+    std::string fiveHourRateThreadId_;
+    std::string fiveHourRateTurnId_;
+
     std::array<wchar_t, 1024> tooltipBuffer_{};
     std::unique_ptr<DesktopThreadMonitor> threadMonitor_;
     RendererActivityMonitor rendererActivityMonitor_;
