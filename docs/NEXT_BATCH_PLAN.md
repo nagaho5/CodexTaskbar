@@ -112,3 +112,49 @@ Runtime cost:
 
 - The rolling window is a few in-memory numbers only.
 - No additional IPC queries, quota queries, disk reads, or timers.
+
+
+## 5. Optional hour compression using colored underline
+
+Problem:
+
+- On the narrow vertical taskbar, the combined duration + generation-speed row can stop fitting once duration reaches one hour.
+- Further global font shrinking would hurt readability for information that otherwise still fits.
+
+Goal:
+
+- Add an optional compact-hour encoding that removes the explicit hour characters and encodes 1h/2h by underlining a different time field.
+- Use the existing user-configured working underline color (`workingColor_`), so no new color setting is needed.
+
+Recommended encoding:
+
+- Below 1 hour: unchanged.
+- From 1:00:00 through 1:59:59:
+  - omit the explicit hour;
+  - display only the normal minute/second portion;
+  - underline the minute field in `workingColor_`.
+  - Example in colon mode: `1:05:02` -> `5:02`, underline only `5`.
+- From 2:00:00 through 2:59:59:
+  - omit the explicit hour;
+  - display only the normal minute/second portion;
+  - underline the seconds field in `workingColor_`.
+  - Example in colon mode: `2:05:02` -> `5:02`, underline only `02`.
+- 3 hours or more:
+  - fall back to the normal explicit-hour representation rather than inventing another ambiguous encoding.
+  - The user rarely/never sees 3h+ tasks, so correctness is more important than saving a few characters there.
+
+Formatting interaction:
+
+- This is an independent optional setting (suggested label: `小时用下划线压缩`).
+- Colon mode keeps its existing minute/second formatting rules; only the explicit hour is removed when compression is active.
+- h/m/s mode should preserve its chosen style after removing the hour portion (for example `1h5m02` -> `5m02`) and apply the same minute-vs-second underline convention.
+- The generation-speed value on the same row remains unchanged.
+- Per-row auto-fit should measure the already-compressed text, so hour compression gets a chance to solve the overflow before font shrinking.
+- The colored hour underline is a semantic marker, not the warning underline logic used by quota/context rows, so duration-row rendering needs its own segmented drawing path.
+
+Validation:
+
+- Verify 59:59 -> 1:00:00 transition, 1:59:59 -> 2:00:00 transition, and 2:59:59 -> 3:00:00 fallback.
+- Verify both colon and h/m/s formats.
+- Verify with current-speed and recent-average speed display modes.
+- Verify the underline remains legible at the minimum auto-fit font size.
