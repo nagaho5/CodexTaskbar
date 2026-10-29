@@ -688,16 +688,12 @@ public:
     void OnTick() {
         ++tickCount_;
 
-        // Diagnostic-only: observe the renderer's own active-conversation log.
-        // This does not control automatic following in v0.3.1; it only lets us
-        // compare renderer activity against the current IPC-selected thread.
+        // Experimental renderer-log diagnostics stay completely dormant in
+        // manual mode.
         if (automaticThreadMode_ && codexRunning_) {
             rendererActivityMonitor_.Poll();
         }
 
-        // Elapsed turn time changes even when the IPC state itself does not.
-        // Refresh its taskbar/hover presentation once per second while timing
-        // information is available.
         if (threadMetrics_.hasTurnTiming && threadMetrics_.activeTurn) {
             InvalidateWidget();
         }
@@ -705,36 +701,41 @@ public:
             UpdateTooltipText();
         }
 
-        if ((tickCount_ % 2) != 1 && codexRunningKnown_) {
-            if (widgetVisible_) {
-                PositionWidget();
+        const bool shouldCheckRunning =
+            !codexRunningKnown_ || (tickCount_ % 2) == 1;
+        if (shouldCheckRunning) {
+            const bool running = IsCodexDesktopRunning();
+            codexRunningKnown_ = true;
+            if (running != codexRunning_) {
+                codexRunning_ = running;
+                SetWorkerActive(running);
+                if (threadMonitor_) {
+                    threadMonitor_->SetActive(running);
+                }
+
+                if (running) {
+                    EnsureWidget();
+                    PositionWidget();
+                    ShowWindow(widgetWindow_, SW_SHOWNOACTIVATE);
+                    widgetVisible_ = true;
+                    UpdateBlinkTimer();
+                } else {
+                    HideWidget();
+                    quotaValid_ = false;
+                    threadMetrics_ = {};
+                    generationSpeedValid_ = false;
+                    rendererActivityMonitor_.Reset();
+                    UpdateBlinkTimer();
+                    InvalidateWidget();
+                    UpdateTooltipText();
+                }
             }
-            return;
         }
 
-        const bool running = IsCodexDesktopRunning();
-        codexRunningKnown_ = true;
-        if (running != codexRunning_) {
-            codexRunning_ = running;
-            SetWorkerActive(running);
-            if (threadMonitor_) {
-                threadMonitor_->SetActive(running);
-            }
-
-            if (running) {
-                EnsureWidget();
-                PositionWidget();
-                ShowWindow(widgetWindow_, SW_SHOWNOACTIVATE);
-                widgetVisible_ = true;
-            } else {
-                HideWidget();
-                quotaValid_ = false;
-                threadMetrics_ = {};
-                rendererActivityMonitor_.Reset();
-                InvalidateWidget();
-                UpdateTooltipText();
-            }
-        } else if (running && widgetVisible_) {
+        // Taskbar geometry almost never changes. Keep a low-frequency fallback
+        // for Explorer/TrafficMonitor changes instead of repositioning every
+        // second.
+        if (codexRunning_ && widgetVisible_ && (tickCount_ % 10) == 0) {
             PositionWidget();
         }
     }
@@ -1747,8 +1748,11 @@ private:
                 return 0;
             }
             if (app && wParam == kHoverTimer) {
+                app->ShowHoverAfterDelay();
+                return 0;
+            }
+            if (app && wParam == kBlinkTimer) {
                 app->UpdateWaitingInputBlink();
-                app->UpdateHoverState();
                 return 0;
             }
             break;
@@ -1800,6 +1804,7 @@ private:
         case WM_DESTROY:
             KillTimer(hwnd, kTickTimer);
             KillTimer(hwnd, kHoverTimer);
+            KillTimer(hwnd, kBlinkTimer);
             PostQuitMessage(0);
             return 0;
         }
@@ -1831,6 +1836,20 @@ private:
             if (app) {
                 app->RecreateFont();
                 app->PositionWidget();
+                return 0;
+            }
+            break;
+
+        case WM_MOUSEMOVE:
+            if (app) {
+                app->HandleWidgetMouseMove(hwnd);
+                return 0;
+            }
+            break;
+
+        case WM_MOUSELEAVE:
+            if (app) {
+                app->HandleWidgetMouseLeave();
                 return 0;
             }
             break;
@@ -2718,38 +2737,61 @@ private:
     void ResetHoverState() {
         hoverInside_ = false;
         hoverStartTick_ = 0;
+        KillTimer(mainWindow_, kHoverTimer);
         HideHoverPopup();
     }
 
-    void UpdateHoverState() {
-        if (!widgetVisible_ || !widgetWindow_ || !IsWindow(widgetWindow_) ||
+    void HandleWidgetMouseMove(HWND hwnd) {
+        if (hoverInside_) return;
+
+        hoverInside_ = true;
+        hoverStartTick_ = GetTickCount64();
+
+        TRACKMOUSEEVENT track{};
+        track.cbSize = sizeof(track);
+        track.dwFlags = TME_LEAVE;
+        track.hwndTrack = hwnd;
+        TrackMouseEvent(&track);
+
+        // One-shot-style timer: it is killed on firing or mouse leave.
+        SetTimer(mainWindow_, kHoverTimer, 250, nullptr);
+    }
+
+    void HandleWidgetMouseLeave() {
+        ResetHoverState();
+    }
+
+    void ShowHoverAfterDelay() {
+        KillTimer(mainWindow_, kHoverTimer);
+        if (!hoverInside_ || !widgetVisible_ || !widgetWindow_ ||
             !IsWindowVisible(widgetWindow_)) {
-            ResetHoverState();
             return;
         }
 
         POINT cursor{};
         RECT widgetRect{};
-        if (!GetCursorPos(&cursor) || !GetWindowRect(widgetWindow_, &widgetRect)) {
+        if (!GetCursorPos(&cursor) ||
+            !GetWindowRect(widgetWindow_, &widgetRect) ||
+            !PtInRect(&widgetRect, cursor)) {
             ResetHoverState();
             return;
         }
 
-        const bool inside = PtInRect(&widgetRect, cursor) != FALSE;
-        if (!inside) {
-            ResetHoverState();
-            return;
-        }
+        ShowHoverPopup(cursor);
+    }
 
-        const ULONGLONG now = GetTickCount64();
-        if (!hoverInside_) {
-            hoverInside_ = true;
-            hoverStartTick_ = now;
-            return;
-        }
-
-        if (!hoverPopupVisible_ && now - hoverStartTick_ >= 250) {
-            ShowHoverPopup(cursor);
+    void UpdateBlinkTimer() {
+        const bool shouldRun =
+            widgetVisible_ && blinkOnUserInput_ &&
+            threadMetrics_.waitingForUserInput;
+        if (shouldRun && !blinkTimerActive_) {
+            SetTimer(mainWindow_, kBlinkTimer, 500, nullptr);
+            blinkTimerActive_ = true;
+        } else if (!shouldRun && blinkTimerActive_) {
+            KillTimer(mainWindow_, kBlinkTimer);
+            blinkTimerActive_ = false;
+            lastWaitingInputBlinkHidden_ = false;
+            InvalidateWidget();
         }
     }
 
@@ -3094,6 +3136,7 @@ private:
     bool durationUnits_{false};
     bool blinkOnUserInput_{true};
     bool lastWaitingInputBlinkHidden_{false};
+    bool blinkTimerActive_{false};
     bool hidePercentSigns_{false};
     int fontChoice_{0};
     bool autoFitFont_{false};
