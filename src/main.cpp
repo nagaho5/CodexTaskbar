@@ -1361,13 +1361,10 @@ public:
                 } else if (rows[index].kind == 3) {
                     DrawCenteredSegments(dc, row, SecondLineSegments());
                 } else {
-                    SetTextColor(dc, RGB(255, 255, 255));
-                    DrawTextW(
+                    DrawCenteredSegments(
                         dc,
-                        rows[index].text.c_str(),
-                        -1,
-                        &row,
-                        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                        row,
+                        TaskDurationSegments());
                 }
 
                 if (prior) SelectObject(dc, prior);
@@ -1401,9 +1398,9 @@ public:
                 appendGroup(diffSegments);
             }
 
-            const std::wstring duration = TaskDurationLine();
-            if (!duration.empty()) {
-                appendGroup({{duration, RGB(255, 255, 255)}});
+            const auto durationSegments = TaskDurationSegments();
+            if (!durationSegments.empty()) {
+                appendGroup(durationSegments);
             }
 
             const std::wstring wholeLine = HorizontalLine();
@@ -3047,19 +3044,86 @@ private:
         return text;
     }
 
-    std::wstring TaskDurationLine() const {
-        if (!threadMetrics_.activeTurn) return {};
+    std::vector<ColoredSegment> TaskDurationSegments() const {
+        std::vector<ColoredSegment> segments;
+        if (!threadMetrics_.activeTurn) return segments;
 
-        std::wstring line;
         if (showTaskDuration_) {
             const std::int64_t durationMs = CurrentTaskDurationMs();
-            line = durationUnits_
-                ? FormatDurationUnits(durationMs)
-                : FormatDurationCompact(durationMs);
+            const std::int64_t totalSeconds =
+                durationMs >= 0 ? durationMs / 1000 : -1;
+            const std::int64_t hours =
+                totalSeconds >= 0 ? totalSeconds / 3600 : -1;
+            const std::int64_t minutes =
+                totalSeconds >= 0 ? (totalSeconds / 60) % 60 : -1;
+            const std::int64_t seconds =
+                totalSeconds >= 0 ? totalSeconds % 60 : -1;
+
+            if (compactHourUnderline_ &&
+                hours >= 1 &&
+                hours <= 2 &&
+                minutes >= 0 &&
+                seconds >= 0) {
+                wchar_t secondsText[8]{};
+                swprintf_s(
+                    secondsText,
+                    L"%02lld",
+                    static_cast<long long>(seconds));
+
+                if (durationUnits_) {
+                    const std::wstring minuteField =
+                        std::to_wstring(minutes) + L"m";
+                    segments.push_back({
+                        minuteField,
+                        RGB(255, 255, 255),
+                        hours == 1});
+                    segments.push_back({
+                        secondsText,
+                        RGB(255, 255, 255),
+                        hours == 2});
+                } else {
+                    segments.push_back({
+                        std::to_wstring(minutes),
+                        RGB(255, 255, 255),
+                        hours == 1});
+                    segments.push_back({
+                        L":",
+                        RGB(255, 255, 255)});
+                    segments.push_back({
+                        secondsText,
+                        RGB(255, 255, 255),
+                        hours == 2});
+                }
+            } else {
+                const std::wstring durationText = durationUnits_
+                    ? FormatDurationUnits(durationMs)
+                    : FormatDurationCompact(durationMs);
+                if (!durationText.empty()) {
+                    segments.push_back({
+                        durationText,
+                        RGB(255, 255, 255)});
+                }
+            }
         }
+
         if (showGenerationSpeed_) {
-            if (!line.empty()) line.push_back(L' ');
-            line += GenerationSpeedText();
+            if (!segments.empty()) {
+                segments.push_back({
+                    L" ",
+                    RGB(255, 255, 255)});
+            }
+            segments.push_back({
+                GenerationSpeedText(),
+                RGB(255, 255, 255)});
+        }
+
+        return segments;
+    }
+
+    std::wstring TaskDurationLine() const {
+        std::wstring line;
+        for (const auto& segment : TaskDurationSegments()) {
+            line += segment.text;
         }
         return line;
     }
