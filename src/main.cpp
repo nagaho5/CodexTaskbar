@@ -756,10 +756,47 @@ public:
     }
 
     void ApplyThreadMetrics(const ThreadMetrics& metrics) {
+        const int oldRows = VisibleRowCount();
+        const std::int64_t nowMs = CurrentUnixMilliseconds();
+
+        const bool identityChanged =
+            metrics.threadId != generationSpeedThreadId_ ||
+            metrics.turnId != generationSpeedTurnId_;
+        if (identityChanged) {
+            generationSpeedThreadId_ = metrics.threadId;
+            generationSpeedTurnId_ = metrics.turnId;
+            generationSpeedValid_ = false;
+            generationSpeed_ = 0.0;
+            generationSpeedLastOutputTokens_ =
+                metrics.hasTokenUsage ? metrics.outputTokens : 0;
+            generationSpeedLastSampleMs_ = nowMs;
+        } else if (metrics.activeTurn && metrics.hasTokenUsage) {
+            if (metrics.outputTokens < generationSpeedLastOutputTokens_) {
+                generationSpeedValid_ = false;
+                generationSpeedLastOutputTokens_ = metrics.outputTokens;
+                generationSpeedLastSampleMs_ = nowMs;
+            } else if (metrics.outputTokens > generationSpeedLastOutputTokens_) {
+                const std::int64_t deltaTokens =
+                    metrics.outputTokens - generationSpeedLastOutputTokens_;
+                const std::int64_t deltaMs =
+                    nowMs - generationSpeedLastSampleMs_;
+                if (deltaMs > 0) {
+                    generationSpeed_ =
+                        static_cast<double>(deltaTokens) * 1000.0 /
+                        static_cast<double>(deltaMs);
+                    generationSpeedValid_ = true;
+                }
+                generationSpeedLastOutputTokens_ = metrics.outputTokens;
+                generationSpeedLastSampleMs_ = nowMs;
+            }
+        }
+
         threadMetrics_ = metrics;
-        if (widgetVisible_) {
+        const int newRows = VisibleRowCount();
+        if (widgetVisible_ && oldRows != newRows) {
             PositionWidget();
         }
+        UpdateBlinkTimer();
         InvalidateWidget();
         UpdateTooltipText();
         UpdateTrayTip();
@@ -2469,12 +2506,28 @@ private:
         return -1;
     }
 
+    std::wstring GenerationSpeedText() const {
+        if (!generationSpeedValid_) return L"--";
+        wchar_t text[32]{};
+        swprintf_s(text, L"%.1f", generationSpeed_);
+        return text;
+    }
+
     std::wstring TaskDurationLine() const {
-        if (!showTaskDuration_ || !threadMetrics_.activeTurn) return {};
-        const std::int64_t durationMs = CurrentTaskDurationMs();
-        return durationUnits_
-            ? FormatDurationUnits(durationMs)
-            : FormatDurationCompact(durationMs);
+        if (!threadMetrics_.activeTurn) return {};
+
+        std::wstring line;
+        if (showTaskDuration_) {
+            const std::int64_t durationMs = CurrentTaskDurationMs();
+            line = durationUnits_
+                ? FormatDurationUnits(durationMs)
+                : FormatDurationCompact(durationMs);
+        }
+        if (showGenerationSpeed_) {
+            if (!line.empty()) line.push_back(L' ');
+            line += GenerationSpeedText();
+        }
+        return line;
     }
 
     bool IsDiffRowVisible() const {
@@ -2728,11 +2781,30 @@ private:
 
         text += L"\r\n";
         if (threadMetrics_.hasCache) {
-            text += L"缓存：" + std::to_wstring(threadMetrics_.cachePercent) + L"% (" +
+            wchar_t cachePercent[32]{};
+            swprintf_s(cachePercent, L"%.5f", ExactCachePercent());
+            text += L"缓存：" + std::wstring(cachePercent) + L"% (" +
                     FormatInteger(threadMetrics_.cachedInputTokens) + L" / " +
                     FormatInteger(threadMetrics_.inputTokens) + L")";
         } else {
             text += L"缓存：暂无数据";
+        }
+
+        text += L"\r\n";
+        if (threadMetrics_.hasTokenUsage) {
+            text += L"总 Token：" + FormatInteger(threadMetrics_.totalTokens) +
+                    L" · 输出 " + FormatInteger(threadMetrics_.outputTokens);
+        } else {
+            text += L"总 Token：暂无数据";
+        }
+
+        text += L"\r\n生成速度：";
+        if (generationSpeedValid_) {
+            wchar_t speed[32]{};
+            swprintf_s(speed, L"%.1f token/s", generationSpeed_);
+            text += speed;
+        } else {
+            text += L"暂无";
         }
 
         text += L"\r\n";
