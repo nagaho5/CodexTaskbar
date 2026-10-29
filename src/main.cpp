@@ -1358,18 +1358,24 @@ public:
         menuInfo.hbrBack = darkMenuBrush_;
         SetMenuInfo(menu, &menuInfo);
 
-        if (!savedThreads_.empty()) {
-            HMENU threadsMenu = CreatePopupMenu();
-            if (threadsMenu) {
-                MENUINFO childInfo{};
-                childInfo.cbSize = sizeof(childInfo);
-                childInfo.fMask = MIM_BACKGROUND;
-                childInfo.hbrBack = darkMenuBrush_;
-                SetMenuInfo(threadsMenu, &childInfo);
+        HMENU threadsMenu = CreatePopupMenu();
+        if (threadsMenu) {
+            MENUINFO childInfo{};
+            childInfo.cbSize = sizeof(childInfo);
+            childInfo.fMask = MIM_BACKGROUND;
+            childInfo.hbrBack = darkMenuBrush_;
+            SetMenuInfo(threadsMenu, &childInfo);
 
-                const std::size_t count = std::min<std::size_t>(
-                    savedThreads_.size(),
-                    kMenuThreadLimit);
+            const std::size_t count = std::min<std::size_t>(
+                savedThreads_.size(),
+                kMenuThreadLimit);
+            if (count == 0) {
+                AppendMenuW(
+                    threadsMenu,
+                    MF_OWNERDRAW | MF_GRAYED,
+                    0,
+                    reinterpret_cast<LPCWSTR>(L"暂无已保存对话"));
+            } else {
                 for (std::size_t i = 0; i < count; ++i) {
                     UINT flags = MF_OWNERDRAW;
                     if (!automaticThreadMode_ &&
@@ -1382,14 +1388,14 @@ public:
                         kMenuThreadBase + static_cast<UINT>(i),
                         reinterpret_cast<LPCWSTR>(savedThreads_[i].name.c_str()));
                 }
-
-                AppendMenuW(
-                    menu,
-                    MF_POPUP | MF_OWNERDRAW,
-                    reinterpret_cast<UINT_PTR>(threadsMenu),
-                    reinterpret_cast<LPCWSTR>(L"对话"));
-                AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
             }
+
+            AppendMenuW(
+                menu,
+                MF_POPUP | MF_OWNERDRAW,
+                reinterpret_cast<UINT_PTR>(threadsMenu),
+                reinterpret_cast<LPCWSTR>(L"选择对话  ▶"));
+            AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         }
 
         AppendMenuW(
@@ -1472,8 +1478,8 @@ public:
             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            500,
-            720,
+            780,
+            700,
             mainWindow_,
             nullptr,
             instance_,
