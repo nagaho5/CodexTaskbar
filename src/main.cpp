@@ -1429,8 +1429,6 @@ public:
 
         generationSpeedValid_ = false;
         generationSpeed_ = 0.0;
-        generationSpeedSampleSum_ = 0.0;
-        generationSpeedSampleCount_ = 0;
         generationSpeedRecent_.clear();
         generationSpeedThreadId_.clear();
         generationSpeedTurnId_.clear();
@@ -1448,6 +1446,20 @@ public:
 
         UpdateTooltipText();
         UpdateTrayTip();
+    }
+
+    void SelectDisplayTarget(int target) {
+        target = std::clamp(target, 0, 1);
+        if (target == 1 && !SecondaryTaskbarAvailable()) return;
+
+        displayTarget_ = target;
+        WriteRegistryDword(
+            L"DisplayTarget",
+            static_cast<DWORD>(displayTarget_));
+
+        if (codexRunning_) {
+            BeginAnchorReadiness();
+        }
     }
 
     void ShowContextMenu() {
@@ -1508,6 +1520,35 @@ public:
             AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         }
 
+        HMENU displayMenu = CreatePopupMenu();
+        if (displayMenu) {
+            MENUINFO childInfo{};
+            childInfo.cbSize = sizeof(childInfo);
+            childInfo.fMask = MIM_BACKGROUND;
+            childInfo.hbrBack = darkMenuBrush_;
+            SetMenuInfo(displayMenu, &childInfo);
+
+            AppendMenuW(
+                displayMenu,
+                MF_OWNERDRAW |
+                    (displayTarget_ == 0 ? MF_CHECKED : MF_UNCHECKED),
+                kMenuDisplayPrimary,
+                reinterpret_cast<LPCWSTR>(L"主屏"));
+            AppendMenuW(
+                displayMenu,
+                MF_OWNERDRAW |
+                    (displayTarget_ == 1 ? MF_CHECKED : MF_UNCHECKED) |
+                    (SecondaryTaskbarAvailable() ? MF_ENABLED : MF_GRAYED),
+                kMenuDisplaySecondary,
+                reinterpret_cast<LPCWSTR>(L"副屏"));
+
+            AppendMenuW(
+                menu,
+                MF_POPUP | MF_OWNERDRAW,
+                reinterpret_cast<UINT_PTR>(displayMenu),
+                reinterpret_cast<LPCWSTR>(L"显示位置  ▶"));
+            AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        }
 
         AppendMenuW(
             menu,
@@ -3411,6 +3452,14 @@ private:
         switch (command) {
         case kMenuSettings:
             OpenSettings();
+            break;
+
+        case kMenuDisplayPrimary:
+            SelectDisplayTarget(0);
+            break;
+
+        case kMenuDisplaySecondary:
+            SelectDisplayTarget(1);
             break;
 
         case kMenuAutoStart:
