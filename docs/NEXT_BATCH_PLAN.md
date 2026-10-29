@@ -76,29 +76,37 @@ Goal:
 
 Recommended recent-average algorithm:
 
-- Do not average already-computed speed values arithmetically.
-- Store recent valid generation intervals as pairs:
-  - deltaOutputTokens
-  - deltaTimeMs
-- Use a rolling window of the latest 8 valid intervals.
-- Weighted average:
-  - sum(deltaOutputTokens) * 1000 / sum(deltaTimeMs)
-- Do not show the average until at least 5 valid intervals exist; before that, show the existing current speed.
-- Once 5+ intervals exist, taskbar average mode uses the weighted rolling average.
-- Hover continues to show current speed, recent-average speed, and recent samples for diagnosis.
+- Replace the current lifetime-style `generationSpeedSampleSum / sampleCount` average. A single bad early sample can poison the displayed average for the entire Turn (observed example: current/recent values around 4-15 token/s while the lifetime average showed 4489.1 token/s).
+- Keep a rolling window of the latest 8 accepted instantaneous speed samples.
+- Do not expose a recent average until at least 5 accepted samples exist; before that, taskbar average mode shows the existing current speed.
+- Once 5+ samples exist, compute a robust recent mean from the rolling window:
+  - sort a copy of the accepted speeds;
+  - if there are 5-8 samples, discard the single lowest and single highest value;
+  - arithmetic-mean the remaining values.
+- Example: recent speeds `9.8 / 4.4 / 7.8 / 15.4 / 6.3` become roughly `8.0 token/s` after trimming 4.4 and 15.4, which matches the visible recent behavior instead of being dominated by a stale outlier.
+- Use this same robust recent mean for:
+  - hover `最近平均`;
+  - the optional taskbar `平均速度` mode.
+- Keep hover `当前速度` and the raw recent-sample list for diagnosis.
+- Remove or stop displaying the old whole-Turn arithmetic sample average.
 
-Interruption filtering:
+Sample validation / interruption filtering:
 
+- Before a speed sample enters the rolling window, reject obviously invalid timing samples:
+  - deltaOutputTokens must be > 0;
+  - deltaTimeMs must be > 0;
+  - very tiny timing intervals that can create absurd multi-thousand token/s spikes should be treated as baseline-only events rather than valid samples.
 - Long gaps caused by tool calls, network waits, approval waits, or other non-generation work should not be counted as slow generation.
 - If the interval since the previous output-token increase is clearly longer than normal generation cadence, treat it as a new generation burst:
   - update the baseline timestamp/token count;
-  - do not add that long-gap interval to the rolling average.
-- Use an adaptive threshold rather than a hard 3-second cutoff:
-  - absolute floor: 3 seconds;
-  - once enough normal intervals exist, threshold = max(3 seconds, 4 × median of recent valid interval durations).
-- Before enough history exists, use a conservative 5-second startup threshold.
-- This avoids misclassifying a naturally slower IPC token-update cadence while still excluding obvious tool/network/approval pauses.
-- This fixes the current weakness where the first token update after a long tool call can inherit the entire pause in deltaTime.
+  - do not add that long-gap interval to the rolling window.
+- Use an adaptive long-gap threshold:
+  - before enough history exists: conservative 5-second threshold;
+  - after enough normal interval history exists: max(3 seconds, 4 × median of recent accepted interval durations).
+- Do not add an arbitrary hard maximum token/s cap unless real-device traces show it is needed; prefer timing validation + robust trimming so the metric can adapt to future faster models.
+- This fixes both failure modes:
+  - absurd early high-speed samples no longer poison the average;
+  - tool/network pauses no longer make the first post-pause sample look artificially slow.
 
 Runtime cost:
 
