@@ -854,25 +854,28 @@ public:
         std::int64_t nowMs) {
         (void)nowMs;
 
-        // Do not start timing at turn/started. Codex can spend a long time
-        // connecting/initializing before real work begins. The canonical Turn
-        // exposes the first work-item timestamp specifically for this boundary.
+        // The rate baseline must be an actually observed pair: quota
+        // percentage + the timestamp of that same quota snapshot. Never pair a
+        // current percentage with a historical task-start timestamp.
         if (!metrics.activeTurn ||
             metrics.firstTurnWorkItemStartedAtMs <= 0 ||
             !quotaValid_ ||
-            !quota_.fiveHour.valid) {
+            !quota_.fiveHour.valid ||
+            lastQuotaSuccessMs_ <= 0 ||
+            lastQuotaSuccessMs_ < metrics.firstTurnWorkItemStartedAtMs) {
             return;
         }
 
         fiveHourRateBaselineValid_ = true;
         fiveHourRateStartRemaining_ = quota_.fiveHour.remainingPercent;
         fiveHourRateResetAtUnix_ = quota_.fiveHour.resetsAtUnix;
-        fiveHourRateStartMs_ = metrics.firstTurnWorkItemStartedAtMs;
+        fiveHourRateStartMs_ = lastQuotaSuccessMs_;
         fiveHourRateThreadId_ = metrics.threadId;
         fiveHourRateTurnId_ = metrics.turnId;
 
-        // A new task has genuinely started doing work. Only now retire the
-        // previous task's frozen final rate.
+        // A new task has now reached real work and CodexTaskbar has observed a
+        // post-work quota snapshot. Only at this matched baseline do we retire
+        // the previous task's frozen final rate.
         fiveHourRateStoredValid_ = false;
     }
 
@@ -3774,6 +3777,10 @@ private:
             reconnectRequested_ = true;
         }
         quotaValid_ = false;
+        // A manual reconnect starts a new observation interval. Preserve the
+        // previous final value in hover, but require a fresh matched quota/time
+        // pair before reporting a new live 5h rate.
+        fiveHourRateBaselineValid_ = false;
         if (threadMonitor_) {
             threadMonitor_->UpdateConfig(WideToUtf8(manualThreadId_), automaticThreadMode_);
         }
