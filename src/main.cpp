@@ -2617,18 +2617,62 @@ private:
         Shell_NotifyIconW(NIM_MODIFY, &data);
     }
 
-    void EnsureWidget() {
-        taskbarWindow_ = FindWindowW(L"Shell_TrayWnd", nullptr);
-        if (!taskbarWindow_) {
-            return;
+    TaskbarCandidate ResolveTaskbarCandidate() const {
+        const auto candidates = EnumerateTaskbars();
+        if (candidates.empty()) return {};
+
+        if (displayTarget_ == 1) {
+            for (const auto& candidate : candidates) {
+                if (!candidate.primary) return candidate;
+            }
         }
 
-        rebarWindow_ = FindWindowExW(taskbarWindow_, nullptr, L"ReBarWindow32", nullptr);
-        if (!rebarWindow_) {
-            rebarWindow_ = FindWindowExW(taskbarWindow_, nullptr, L"WorkerW", nullptr);
+        for (const auto& candidate : candidates) {
+            if (candidate.primary) return candidate;
         }
-        if (!rebarWindow_) {
-            rebarWindow_ = taskbarWindow_;
+        return candidates.front();
+    }
+
+    bool SecondaryTaskbarAvailable() const {
+        const auto candidates = EnumerateTaskbars();
+        return std::any_of(
+            candidates.begin(),
+            candidates.end(),
+            [](const TaskbarCandidate& candidate) {
+                return !candidate.primary;
+            });
+    }
+
+    void ResetTaskbarHandles() {
+        taskbarWindow_ = nullptr;
+        rebarWindow_ = nullptr;
+        activeTaskbarDevice_.clear();
+    }
+
+    void EnsureWidget() {
+        const TaskbarCandidate target = ResolveTaskbarCandidate();
+        if (!target.window) return;
+
+        const bool taskbarChanged =
+            taskbarWindow_ != target.window ||
+            activeTaskbarDevice_ != target.deviceName;
+        taskbarWindow_ = target.window;
+        activeTaskbarDevice_ = target.deviceName;
+
+        if (taskbarChanged) {
+            rebarWindow_ = nullptr;
+        }
+
+        if (!rebarWindow_ || !IsWindow(rebarWindow_)) {
+            rebarWindow_ =
+                FindWindowExW(taskbarWindow_, nullptr, L"ReBarWindow32", nullptr);
+            if (!rebarWindow_) {
+                rebarWindow_ =
+                    FindWindowExW(taskbarWindow_, nullptr, L"WorkerW", nullptr);
+            }
+            if (!rebarWindow_) {
+                rebarWindow_ = taskbarWindow_;
+            }
         }
 
         bool dpiContextChanged = false;
@@ -2652,31 +2696,31 @@ private:
             dpiContextChanged = true;
         }
 
-        // SetParent can move a PerMonitorV2 child into Explorer's DPI context.
-        // Rebuild the font only after the widget has its final taskbar parent.
         if (dpiContextChanged) {
             RecreateFont();
         }
-
     }
 
-    void PositionWidget() {
+    bool PositionWidget(bool requireTrafficMonitor = false) {
         EnsureWidget();
-        if (!widgetWindow_ || !rebarWindow_) {
-            return;
+        if (!widgetWindow_ || !rebarWindow_ || !taskbarWindow_) {
+            return false;
         }
 
         RECT taskbarRect{};
         GetWindowRect(taskbarWindow_, &taskbarRect);
         verticalTaskbar_ =
-            (taskbarRect.bottom - taskbarRect.top) > (taskbarRect.right - taskbarRect.left);
+            (taskbarRect.bottom - taskbarRect.top) >
+            (taskbarRect.right - taskbarRect.left);
 
         RECT rebarClient{};
         GetClientRect(rebarWindow_, &rebarClient);
 
         int width = 0;
         if (verticalTaskbar_) {
-            width = std::max(40, static_cast<int>(rebarClient.right - rebarClient.left) - 4);
+            width = std::max(
+                40,
+                static_cast<int>(rebarClient.right - rebarClient.left) - 4);
         } else {
             width = std::max(
                 150,
@@ -2694,38 +2738,49 @@ private:
             ReleaseDC(widgetWindow_, dc);
         }
 
-        const int lineHeight = std::max(14, static_cast<int>(metrics.tmHeight) + 1);
+        const int lineHeight =
+            std::max(14, static_cast<int>(metrics.tmHeight) + 1);
         int height = 0;
         if (verticalTaskbar_) {
-            height = lineHeight * std::max(1, VisibleRowCount()) + 4;
+            height =
+                lineHeight * std::max(1, VisibleRowCount()) + 4;
         } else {
             height = std::max(
                 24,
                 std::min(
-                    static_cast<int>(rebarClient.bottom - rebarClient.top),
+                    static_cast<int>(
+                        rebarClient.bottom - rebarClient.top),
                     lineHeight + 6));
         }
 
-        HWND trafficMonitor = FindDescendantByTitle(taskbarWindow_, kTrafficMonitorTitle);
-        HWND trayNotify = FindDescendantByClass(taskbarWindow_, L"TrayNotifyWnd");
+        HWND trafficMonitor =
+            FindDescendantByTitle(taskbarWindow_, kTrafficMonitorTitle);
+        HWND trayNotify =
+            FindDescendantByClass(taskbarWindow_, L"TrayNotifyWnd");
 
         if (verticalTaskbar_) {
-            int anchorTop = rebarClient.bottom;
+            if (requireTrafficMonitor && !trafficMonitor) {
+                return false;
+            }
 
+            int anchorTop = rebarClient.bottom;
             HWND anchor = trafficMonitor ? trafficMonitor : trayNotify;
             if (anchor) {
                 RECT anchorRect{};
                 GetWindowRect(anchor, &anchorRect);
-                anchorRect = ScreenRectToClient(rebarWindow_, anchorRect);
+                anchorRect =
+                    ScreenRectToClient(rebarWindow_, anchorRect);
                 anchorTop = anchorRect.top;
             }
 
-            const int y = std::max(static_cast<int>(rebarClient.top), anchorTop - height - 1);
+            const int y = std::max(
+                static_cast<int>(rebarClient.top),
+                anchorTop - height - 1);
             const int x = std::max(
                 0,
-                (static_cast<int>(rebarClient.right - rebarClient.left) - width) / 2);
+                (static_cast<int>(
+                    rebarClient.right - rebarClient.left) - width) / 2);
 
-            // Never resize or reposition the Windows task-list region.
             SetWindowPos(
                 widgetWindow_,
                 HWND_TOP,
@@ -2738,13 +2793,15 @@ private:
             RECT trayRect{};
             int x = rebarClient.right - width - 2;
             if (trayNotify && GetWindowRect(trayNotify, &trayRect)) {
-                trayRect = ScreenRectToClient(rebarWindow_, trayRect);
+                trayRect =
+                    ScreenRectToClient(rebarWindow_, trayRect);
                 x = trayRect.left - width - 2;
             }
             x = std::max(static_cast<int>(rebarClient.left), x);
             const int y = std::max(
                 static_cast<int>(rebarClient.top),
-                (static_cast<int>(rebarClient.bottom - rebarClient.top) - height) / 2);
+                (static_cast<int>(
+                    rebarClient.bottom - rebarClient.top) - height) / 2);
             SetWindowPos(
                 widgetWindow_,
                 HWND_TOP,
@@ -2756,6 +2813,51 @@ private:
         }
 
         InvalidateWidget();
+        return true;
+    }
+
+    void StopAnchorReadiness() {
+        if (mainWindow_) {
+            KillTimer(mainWindow_, kAnchorReadyTimer);
+        }
+        anchorReadyActive_ = false;
+    }
+
+    void TryAnchorReadiness() {
+        if (!anchorReadyActive_ || !codexRunning_) return;
+
+        if (PositionWidget(true)) {
+            StopAnchorReadiness();
+            ShowWindow(widgetWindow_, SW_SHOWNOACTIVATE);
+            widgetVisible_ = true;
+            UpdateBlinkTimer();
+            return;
+        }
+
+        if (GetTickCount64() >= anchorReadyDeadline_) {
+            PositionWidget(false);
+            StopAnchorReadiness();
+            if (widgetWindow_) {
+                ShowWindow(widgetWindow_, SW_SHOWNOACTIVATE);
+                widgetVisible_ = true;
+                UpdateBlinkTimer();
+            }
+        }
+    }
+
+    void BeginAnchorReadiness() {
+        StopAnchorReadiness();
+        ResetTaskbarHandles();
+
+        if (widgetWindow_ && IsWindow(widgetWindow_)) {
+            ShowWindow(widgetWindow_, SW_HIDE);
+        }
+        widgetVisible_ = false;
+
+        anchorReadyActive_ = true;
+        anchorReadyDeadline_ = GetTickCount64() + 5000;
+        SetTimer(mainWindow_, kAnchorReadyTimer, 200, nullptr);
+        TryAnchorReadiness();
     }
 
     void HideWidget() {
