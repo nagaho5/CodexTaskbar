@@ -1,3 +1,3 @@
-tag=v0.3.2
-source_commit=57ce8819ad478ea291a8bbe797e632431366fa6a
-reason=fix Windows renderer diagnostic log discovery for dated codex-desktop session logs
+tag=v0.3.3
+source_commit=b7731b254497322be66aecf41590d156dbbf0531
+reason=waiting-for-user-input status, optional blink alert, first-line spacing refinement, and decimal font sizing
