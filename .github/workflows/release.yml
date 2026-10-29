@@ -48,6 +48,8 @@ jobs:
           gh release create $tag `
             "build\Release\CodexTaskbar.exe" `
             "build\Release\SHA256.txt" `
+            "tools\Update-CodexTaskbar.ps1" `
+            "tools\Update-CodexTaskbar.cmd" `
             --target "$env:GITHUB_SHA" `
             --title "CodexTaskbar $tag" `
             --notes "Windows x64 native build. Compact Codex quota, thread context/cache and live code-change display for the Windows 10 taskbar."
