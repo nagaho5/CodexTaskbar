@@ -46,12 +46,15 @@ constexpr UINT kQuotaErrorMessage = WM_APP + 3;
 constexpr UINT kThreadMetricsMessage = WM_APP + 4;
 constexpr UINT_PTR kTickTimer = 1;
 constexpr UINT_PTR kHoverTimer = 2;
+constexpr UINT_PTR kBlinkTimer = 3;
 
 constexpr UINT kMenuSettings = 1001;
 constexpr UINT kMenuAutoStart = 1002;
 constexpr UINT kMenuReconnect = 1003;
 constexpr UINT kMenuAbout = 1004;
 constexpr UINT kMenuExit = 1005;
+constexpr UINT kMenuThreadBase = 1100;
+constexpr UINT kMenuThreadLimit = 50;
 
 constexpr int kEditFontSize = 2001;
 constexpr int kCheckAutoStart = 2002;
@@ -76,6 +79,9 @@ constexpr int kCheckHidePercentSigns = 2020;
 constexpr int kCheckNarrowFont = 2021;
 constexpr int kCheckAutoFitFont = 2022;
 constexpr int kComboCacheDisplayMode = 2023;
+constexpr int kCheckShowGenerationSpeed = 2024;
+constexpr int kComboFontChoice = 2025;
+constexpr int kEditSavedThreads = 2026;
 
 constexpr COLORREF kDefaultWorkingColor = RGB(79, 195, 247);
 constexpr COLORREF kWarningYellow = RGB(255, 196, 64);
@@ -91,6 +97,58 @@ struct ColoredSegment {
 struct QuotaPayload {
     QuotaSnapshot snapshot;
 };
+
+struct SavedThreadEntry {
+    std::wstring name;
+    std::wstring id;
+};
+
+std::vector<SavedThreadEntry> ParseSavedThreads(const std::wstring& value) {
+    std::vector<SavedThreadEntry> result;
+    std::size_t start = 0;
+    while (start <= value.size()) {
+        const std::size_t end = value.find_first_of(L"\r\n", start);
+        std::wstring line = value.substr(
+            start,
+            end == std::wstring::npos ? std::wstring::npos : end - start);
+
+        while (!line.empty() && iswspace(line.front())) line.erase(line.begin());
+        while (!line.empty() && iswspace(line.back())) line.pop_back();
+
+        if (!line.empty()) {
+            const std::size_t separator = line.find(L'|');
+            if (separator != std::wstring::npos) {
+                std::wstring name = line.substr(0, separator);
+                std::wstring id = line.substr(separator + 1);
+                while (!name.empty() && iswspace(name.front())) name.erase(name.begin());
+                while (!name.empty() && iswspace(name.back())) name.pop_back();
+                while (!id.empty() && iswspace(id.front())) id.erase(id.begin());
+                while (!id.empty() && iswspace(id.back())) id.pop_back();
+                if (!name.empty() && !id.empty()) {
+                    result.push_back({std::move(name), std::move(id)});
+                }
+            }
+        }
+
+        if (end == std::wstring::npos) break;
+        start = end + 1;
+        while (start < value.size() && (value[start] == L'\r' || value[start] == L'\n')) {
+            ++start;
+        }
+    }
+    if (result.size() > kMenuThreadLimit) result.resize(kMenuThreadLimit);
+    return result;
+}
+
+std::wstring SerializeSavedThreads(const std::vector<SavedThreadEntry>& entries) {
+    std::wstring result;
+    for (const auto& entry : entries) {
+        if (entry.name.empty() || entry.id.empty()) continue;
+        if (!result.empty()) result += L"\r\n";
+        result += entry.name + L"|" + entry.id;
+    }
+    return result;
+}
 
 std::wstring ModulePath() {
     wchar_t buffer[32768]{};
@@ -558,11 +616,16 @@ public:
         durationUnits_ = ReadRegistryDword(L"DurationUnits", 0) != 0;
         blinkOnUserInput_ = ReadRegistryDword(L"BlinkOnUserInput", 1) != 0;
         hidePercentSigns_ = ReadRegistryDword(L"HidePercentSigns", 0) != 0;
-        narrowFont_ = ReadRegistryDword(L"NarrowFont", 0) != 0;
+        const int savedFontChoice = ReadRegistryDword(L"FontChoice", -1);
+        fontChoice_ = savedFontChoice >= 0
+            ? std::clamp(savedFontChoice, 0, 4)
+            : (ReadRegistryDword(L"NarrowFont", 0) != 0 ? 4 : 0);
         autoFitFont_ = ReadRegistryDword(L"AutoFitFont", 0) != 0;
         cacheDisplayMode_ = std::clamp(ReadRegistryDword(L"CacheDisplayMode", 0), 0, 3);
+        showGenerationSpeed_ = ReadRegistryDword(L"ShowGenerationSpeed", 0) != 0;
         automaticThreadMode_ = ReadRegistryDword(L"AutomaticThreadMode", 0) != 0;
         manualThreadId_ = ReadRegistryString(L"ManualThreadId");
+        savedThreads_ = ParseSavedThreads(ReadRegistryString(L"SavedThreads"));
 
         INITCOMMONCONTROLSEX commonControls{sizeof(commonControls), ICC_WIN95_CLASSES};
         InitCommonControlsEx(&commonControls);
@@ -610,7 +673,6 @@ public:
         StartWorker();
         OnTick();
         SetTimer(mainWindow_, kTickTimer, 1000, nullptr);
-        SetTimer(mainWindow_, kHoverTimer, 200, nullptr);
         return true;
     }
 
@@ -2787,7 +2849,7 @@ private:
         case kMenuAbout:
             MessageBoxW(
                 mainWindow_,
-                L"CodexTaskbar v0.3.4\n\n"
+                L"CodexTaskbar v0.3.5\n\n"
                 L"在 Windows 10 任务栏显示 Codex 配额、绑定会话上下文/缓存和本轮代码改动。\n"
                 L"配额来自官方 app-server；会话指标通过只读 Codex Desktop IPC follower 获取。",
                 L"关于 CodexTaskbar",
@@ -2961,9 +3023,10 @@ private:
     bool blinkOnUserInput_{true};
     bool lastWaitingInputBlinkHidden_{false};
     bool hidePercentSigns_{false};
-    bool narrowFont_{false};
+    int fontChoice_{0};
     bool autoFitFont_{false};
     int cacheDisplayMode_{0};
+    bool showGenerationSpeed_{false};
     bool automaticThreadMode_{false};
     double fontSize_{10.0};
     double effectiveWidgetFontSize_{10.0};
@@ -2974,6 +3037,14 @@ private:
     QuotaSnapshot quota_{};
     ThreadMetrics threadMetrics_{};
     std::wstring manualThreadId_;
+    std::vector<SavedThreadEntry> savedThreads_;
+
+    bool generationSpeedValid_{false};
+    double generationSpeed_{0.0};
+    std::int64_t generationSpeedLastOutputTokens_{0};
+    std::int64_t generationSpeedLastSampleMs_{0};
+    std::string generationSpeedThreadId_;
+    std::string generationSpeedTurnId_;
     std::array<wchar_t, 1024> tooltipBuffer_{};
     std::unique_ptr<DesktopThreadMonitor> threadMonitor_;
     RendererActivityMonitor rendererActivityMonitor_;
