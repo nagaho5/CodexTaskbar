@@ -1334,6 +1334,9 @@ public:
         generationSpeedRecent_.clear();
         generationSpeedThreadId_.clear();
         generationSpeedTurnId_.clear();
+        fiveHourRateBaselineValid_ = false;
+        fiveHourRateThreadId_.clear();
+        fiveHourRateTurnId_.clear();
 
         WriteRegistryDword(L"AutomaticThreadMode", 0);
         WriteRegistryString(L"ManualThreadId", manualThreadId_);
@@ -1357,6 +1360,12 @@ public:
         menuInfo.fMask = MIM_BACKGROUND;
         menuInfo.hbrBack = darkMenuBrush_;
         SetMenuInfo(menu, &menuInfo);
+
+        AppendMenuW(
+            menu,
+            MF_OWNERDRAW,
+            kMenuSettings,
+            reinterpret_cast<LPCWSTR>(L"设置..."));
 
         HMENU threadsMenu = CreatePopupMenu();
         if (threadsMenu) {
@@ -1398,11 +1407,7 @@ public:
             AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         }
 
-        AppendMenuW(
-            menu,
-            MF_OWNERDRAW,
-            kMenuSettings,
-            reinterpret_cast<LPCWSTR>(L"设置..."));
+
         AppendMenuW(
             menu,
             MF_OWNERDRAW | (autoStart_ ? MF_CHECKED : MF_UNCHECKED),
@@ -3207,7 +3212,7 @@ private:
         case kMenuAbout:
             MessageBoxW(
                 mainWindow_,
-                L"CodexTaskbar v0.3.5\n\n"
+                L"CodexTaskbar v0.3.6\n\n"
                 L"在 Windows 10 任务栏显示 Codex 配额、绑定会话上下文/缓存和本轮代码改动。\n"
                 L"配额来自官方 app-server；会话指标通过只读 Codex Desktop IPC follower 获取。",
                 L"关于 CodexTaskbar",
