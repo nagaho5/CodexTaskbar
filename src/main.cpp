@@ -94,6 +94,12 @@ struct ColoredSegment {
     bool hidden{false};
 };
 
+struct RowFitCache {
+    std::wstring signature;
+    int availableWidth{-1};
+    HFONT font{nullptr};
+};
+
 struct QuotaPayload {
     QuotaSnapshot snapshot;
 };
@@ -1060,15 +1066,16 @@ public:
 
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, RGB(255, 255, 255));
-        HFONT oldFont = static_cast<HFONT>(SelectObject(
-            dc,
-            widgetFont_ ? widgetFont_ : font_));
+        HFONT baseFont = widgetFont_ ? widgetFont_ : font_;
+        HFONT oldFont = baseFont
+            ? static_cast<HFONT>(SelectObject(dc, baseFont))
+            : nullptr;
 
         if (verticalTaskbar_) {
             const std::wstring first = FirstLine();
             const std::wstring second = SecondLine();
             const std::wstring duration = TaskDurationLine();
-            const bool diffVisible = IsDiffRowVisible();
+            const std::wstring diffText = DiffLineText();
 
             struct Row {
                 int kind;
@@ -1077,13 +1084,14 @@ public:
             std::vector<Row> rows;
             if (!first.empty()) rows.push_back({2, first});
             if (!second.empty()) rows.push_back({3, second});
-            if (diffVisible) rows.push_back({1, {}});
+            if (!diffText.empty()) rows.push_back({1, diffText});
             if (!duration.empty()) rows.push_back({0, duration});
 
             if (rows.empty()) rows.push_back({0, L""});
             const int rowHeight = std::max(
                 1,
-                static_cast<int>(client.bottom - client.top) / static_cast<int>(rows.size()));
+                static_cast<int>(client.bottom - client.top) /
+                    static_cast<int>(rows.size()));
 
             for (std::size_t index = 0; index < rows.size(); ++index) {
                 RECT row{
@@ -1093,6 +1101,15 @@ public:
                     index + 1 == rows.size()
                         ? client.bottom
                         : client.top + static_cast<LONG>((index + 1) * rowHeight)};
+
+                HFONT rowFont = FittedRowFont(
+                    dc,
+                    rows[index].kind,
+                    rows[index].text,
+                    static_cast<int>(row.right - row.left));
+                HFONT prior = rowFont
+                    ? static_cast<HFONT>(SelectObject(dc, rowFont))
+                    : nullptr;
 
                 if (rows[index].kind == 1) {
                     DrawDiffRow(dc, row);
@@ -1109,6 +1126,8 @@ public:
                         &row,
                         DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
                 }
+
+                if (prior) SelectObject(dc, prior);
             }
         } else {
             std::vector<ColoredSegment> segments;
@@ -1143,10 +1162,21 @@ public:
             if (!duration.empty()) {
                 appendGroup({{duration, RGB(255, 255, 255)}});
             }
+
+            const std::wstring wholeLine = HorizontalLine();
+            HFONT fitted = FittedRowFont(
+                dc,
+                4,
+                wholeLine,
+                static_cast<int>(client.right - client.left));
+            HFONT prior = fitted
+                ? static_cast<HFONT>(SelectObject(dc, fitted))
+                : nullptr;
             DrawCenteredSegments(dc, client, segments);
+            if (prior) SelectObject(dc, prior);
         }
 
-        SelectObject(dc, oldFont);
+        if (oldFont) SelectObject(dc, oldFont);
         EndPaint(hwnd, &ps);
     }
 
@@ -2088,13 +2118,39 @@ private:
             static_cast<int>(std::lround(
                 pointSize * static_cast<double>(dpi) / 72.0)));
 
-        const bool narrow = widgetFont && narrowFont_;
+        const wchar_t* face = L"Segoe UI";
+        int weight = FW_SEMIBOLD;
+        if (widgetFont) {
+            switch (fontChoice_) {
+            case 1:
+                face = L"Bahnschrift";
+                weight = FW_NORMAL;
+                break;
+            case 2:
+                face = L"Segoe UI";
+                weight = FW_NORMAL;
+                break;
+            case 3:
+                face = L"Tahoma";
+                weight = FW_NORMAL;
+                break;
+            case 4:
+                face = L"Bahnschrift SemiCondensed";
+                weight = FW_NORMAL;
+                break;
+            default:
+                face = L"Segoe UI";
+                weight = FW_SEMIBOLD;
+                break;
+            }
+        }
+
         return CreateFontW(
             height,
             0,
             0,
             0,
-            narrow ? FW_NORMAL : FW_SEMIBOLD,
+            weight,
             FALSE,
             FALSE,
             FALSE,
@@ -2103,20 +2159,23 @@ private:
             CLIP_DEFAULT_PRECIS,
             CLEARTYPE_QUALITY,
             DEFAULT_PITCH | FF_DONTCARE,
-            narrow ? L"Bahnschrift SemiCondensed" : L"Segoe UI");
+            face);
     }
 
-    void ReplaceWidgetFont(double pointSize) {
-        HFONT replacement = CreatePointFont(pointSize, true);
-        if (!replacement) return;
-        if (widgetFont_ && widgetFont_ != font_) {
-            DeleteObject(widgetFont_);
+    void ClearRowFitCaches() {
+        for (auto& cache : rowFitCaches_) {
+            if (cache.font) {
+                DeleteObject(cache.font);
+                cache.font = nullptr;
+            }
+            cache.signature.clear();
+            cache.availableWidth = -1;
         }
-        widgetFont_ = replacement;
-        effectiveWidgetFontSize_ = pointSize;
     }
 
     void RecreateFont() {
+        ClearRowFitCaches();
+
         if (font_) {
             DeleteObject(font_);
             font_ = nullptr;
@@ -2127,14 +2186,10 @@ private:
         }
 
         font_ = CreatePointFont(fontSize_, false);
-        effectiveWidgetFontSize_ = fontSize_;
-        widgetFont_ = CreatePointFont(effectiveWidgetFontSize_, true);
+        widgetFont_ = CreatePointFont(fontSize_, true);
         if (!widgetFont_) {
-            widgetFont_ = CreatePointFont(effectiveWidgetFontSize_, false);
+            widgetFont_ = CreatePointFont(fontSize_, false);
         }
-
-        lastAutoFitWidth_ = -1;
-        lastAutoFitSignature_.clear();
     }
 
     int MeasureTextWidth(HDC dc, const std::wstring& text) const {
@@ -2148,112 +2203,76 @@ private:
         return size.cx;
     }
 
-    std::wstring WidgetFitSignature() const {
-        std::wstring signature = verticalTaskbar_ ? L"V|" : L"H|";
-        signature += FirstLine();
-        signature += L"|";
-        signature += SecondLine();
-        signature += L"|";
-        signature += std::to_wstring(TaskDurationLine().size());
-        signature += L"|";
-        if (IsDiffRowVisible()) {
-            if (showDiffFiles_) {
-                signature += std::to_wstring(
-                    std::to_wstring(threadMetrics_.changedFiles).size());
-            }
-            signature += L":";
-            signature += std::to_wstring(
-                std::to_wstring(threadMetrics_.addedLines).size());
-            signature += L":";
-            signature += std::to_wstring(
-                std::to_wstring(threadMetrics_.removedLines).size());
+    std::wstring NormalizeFitSignature(const std::wstring& text) const {
+        std::wstring result = text;
+        for (wchar_t& ch : result) {
+            if (iswdigit(ch)) ch = L'#';
         }
-        return signature;
+        return result;
     }
 
-    int MeasureWidgetContentWidth(HDC dc) const {
-        if (!dc) return 0;
-        if (!verticalTaskbar_) {
-            return MeasureTextWidth(dc, HorizontalLine());
+    HFONT FittedRowFont(
+        HDC dc,
+        int cacheIndex,
+        const std::wstring& text,
+        int availableWidth) {
+        if (!autoFitFont_ || !dc || !widgetFont_ || text.empty()) {
+            return widgetFont_ ? widgetFont_ : font_;
         }
 
-        int widest = 0;
-        widest = std::max(widest, MeasureTextWidth(dc, FirstLine()));
-        widest = std::max(widest, MeasureTextWidth(dc, SecondLine()));
-        widest = std::max(widest, MeasureTextWidth(dc, TaskDurationLine()));
-
-        if (IsDiffRowVisible()) {
-            std::wstring diff;
-            if (showDiffFiles_) diff += std::to_wstring(threadMetrics_.changedFiles);
-            diff += std::to_wstring(threadMetrics_.addedLines);
-            diff += std::to_wstring(threadMetrics_.removedLines);
-            widest = std::max(widest, MeasureTextWidth(dc, diff));
-        }
-        return widest;
-    }
-
-    void UpdateAutoFitFont(int availableWidth) {
-        availableWidth = std::max(1, availableWidth);
-        const std::wstring signature = WidgetFitSignature();
-
-        if (!autoFitFont_) {
-            if (std::abs(effectiveWidgetFontSize_ - fontSize_) > 0.04) {
-                ReplaceWidgetFont(fontSize_);
-            }
-            lastAutoFitWidth_ = availableWidth;
-            lastAutoFitSignature_ = signature;
-            return;
-        }
-
-        if (availableWidth == lastAutoFitWidth_ &&
-            signature == lastAutoFitSignature_) {
-            return;
-        }
-        lastAutoFitWidth_ = availableWidth;
-        lastAutoFitSignature_ = signature;
-
-        HDC dc = GetDC(widgetWindow_);
-        if (!dc) return;
-
-        HFONT baseFont = CreatePointFont(fontSize_, true);
-        if (!baseFont) {
-            ReleaseDC(widgetWindow_, dc);
-            return;
-        }
-
-        HFONT oldFont = static_cast<HFONT>(SelectObject(dc, baseFont));
-        const int baseWidth = MeasureWidgetContentWidth(dc);
+        cacheIndex = std::clamp(cacheIndex, 0, 4);
+        RowFitCache& cache = rowFitCaches_[static_cast<std::size_t>(cacheIndex)];
+        const std::wstring signature = NormalizeFitSignature(text);
         const int fitWidth = std::max(1, availableWidth - 2);
-        double target = fontSize_;
 
-        if (baseWidth > fitWidth) {
-            const double minimum = std::max(8.0, fontSize_ - 2.0);
-            const double ratio =
-                static_cast<double>(fitWidth) /
-                static_cast<double>(std::max(1, baseWidth));
-            target = std::floor(
-                std::clamp(fontSize_ * ratio, minimum, fontSize_) * 10.0) / 10.0;
+        if (cache.availableWidth == fitWidth &&
+            cache.signature == signature) {
+            return cache.font ? cache.font : widgetFont_;
+        }
 
-            while (target > minimum + 0.04) {
-                HFONT candidate = CreatePointFont(target, true);
-                if (!candidate) break;
-                SelectObject(dc, candidate);
-                const int candidateWidth = MeasureWidgetContentWidth(dc);
-                SelectObject(dc, baseFont);
-                DeleteObject(candidate);
-                if (candidateWidth <= fitWidth) break;
-                target = std::max(minimum, target - 0.1);
-                target = std::round(target * 10.0) / 10.0;
+        if (cache.font) {
+            DeleteObject(cache.font);
+            cache.font = nullptr;
+        }
+        cache.availableWidth = fitWidth;
+        cache.signature = signature;
+
+        HFONT previous = static_cast<HFONT>(SelectObject(dc, widgetFont_));
+        const int baseWidth = MeasureTextWidth(dc, text);
+        SelectObject(dc, previous);
+
+        if (baseWidth <= fitWidth) {
+            return widgetFont_;
+        }
+
+        const double minimum = std::max(8.0, fontSize_ - 2.0);
+        double target = std::floor(
+            std::clamp(
+                fontSize_ * static_cast<double>(fitWidth) /
+                    static_cast<double>(std::max(1, baseWidth)),
+                minimum,
+                fontSize_) *
+            10.0) / 10.0;
+
+        while (target >= minimum - 0.04) {
+            HFONT candidate = CreatePointFont(target, true);
+            if (!candidate) break;
+
+            previous = static_cast<HFONT>(SelectObject(dc, candidate));
+            const int width = MeasureTextWidth(dc, text);
+            SelectObject(dc, previous);
+
+            if (width <= fitWidth || target <= minimum + 0.04) {
+                cache.font = candidate;
+                return cache.font;
             }
+
+            DeleteObject(candidate);
+            target = std::max(minimum, target - 0.1);
+            target = std::round(target * 10.0) / 10.0;
         }
 
-        SelectObject(dc, oldFont);
-        DeleteObject(baseFont);
-        ReleaseDC(widgetWindow_, dc);
-
-        if (std::abs(target - effectiveWidgetFontSize_) > 0.04) {
-            ReplaceWidgetFont(target);
-        }
+        return widgetFont_;
     }
 
     void AddTrayIcon() {
@@ -2377,8 +2396,6 @@ private:
                 150,
                 static_cast<int>(std::lround(fontSize_ * 15.0)));
         }
-
-        UpdateAutoFitFont(std::max(1, width - 2));
 
         HDC dc = GetDC(widgetWindow_);
         HFONT oldFont = dc ? static_cast<HFONT>(SelectObject(
@@ -2554,6 +2571,15 @@ private:
             (threadMetrics_.changedFiles > 0 ||
              threadMetrics_.addedLines > 0 ||
              threadMetrics_.removedLines > 0);
+    }
+
+    std::wstring DiffLineText() const {
+        if (!IsDiffRowVisible()) return {};
+        std::wstring text;
+        if (showDiffFiles_) text += std::to_wstring(threadMetrics_.changedFiles);
+        text += std::to_wstring(threadMetrics_.addedLines);
+        text += std::to_wstring(threadMetrics_.removedLines);
+        return text;
     }
 
     int VisibleRowCount() const {
@@ -3144,9 +3170,7 @@ private:
     bool showGenerationSpeed_{false};
     bool automaticThreadMode_{false};
     double fontSize_{10.0};
-    double effectiveWidgetFontSize_{10.0};
-    int lastAutoFitWidth_{-1};
-    std::wstring lastAutoFitSignature_;
+    std::array<RowFitCache, 5> rowFitCaches_{};
     unsigned tickCount_{0};
 
     QuotaSnapshot quota_{};
