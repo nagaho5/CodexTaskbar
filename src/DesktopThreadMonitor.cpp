@@ -1129,6 +1129,7 @@ ThreadMetrics DesktopThreadMonitor::DeriveMetrics(const std::string& threadId, T
             IntegerField(*latestTurn, {"durationMs", "duration_ms"}, -1);
         metrics.turnStartedAtMs =
             turnStartedAtMs > 0 ? turnStartedAtMs : firstWorkItemStartedAtMs;
+        metrics.firstTurnWorkItemStartedAtMs = firstWorkItemStartedAtMs;
         metrics.turnDurationMs = durationMs;
         metrics.hasTurnTiming =
             metrics.turnStartedAtMs > 0 || metrics.turnDurationMs >= 0;
