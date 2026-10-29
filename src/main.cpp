@@ -14,6 +14,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <ctime>
@@ -71,6 +72,10 @@ constexpr int kCheckContextWarningColors = 2016;
 constexpr int kCheckQuotaWarningColors = 2017;
 constexpr int kCheckDurationUnits = 2018;
 constexpr int kCheckBlinkOnUserInput = 2019;
+constexpr int kCheckHidePercentSigns = 2020;
+constexpr int kCheckNarrowFont = 2021;
+constexpr int kCheckAutoFitFont = 2022;
+constexpr int kComboCacheDisplayMode = 2023;
 
 constexpr COLORREF kDefaultWorkingColor = RGB(79, 195, 247);
 constexpr COLORREF kWarningYellow = RGB(255, 196, 64);
@@ -416,11 +421,14 @@ std::wstring FormatDurationUnits(std::int64_t milliseconds) {
 
     wchar_t text[32]{};
     if (hours > 0) {
-        swprintf_s(text, L"%lldh%02lldm%02llds",
+        // Compact hour form: no leading zero for hours/minutes, seconds stay
+        // two digits, and the trailing "s" is omitted (e.g. 1h5m02).
+        swprintf_s(text, L"%lldh%lldm%02lld",
             static_cast<long long>(hours),
             static_cast<long long>(minutes),
             static_cast<long long>(seconds));
     } else {
+        // Sub-hour h/m/s mode intentionally keeps its existing format.
         swprintf_s(text, L"%lldm%02llds",
             static_cast<long long>(minutes),
             static_cast<long long>(seconds));
@@ -546,6 +554,10 @@ public:
         quotaWarningColors_ = ReadRegistryDword(L"QuotaWarningColors", 0) != 0;
         durationUnits_ = ReadRegistryDword(L"DurationUnits", 0) != 0;
         blinkOnUserInput_ = ReadRegistryDword(L"BlinkOnUserInput", 1) != 0;
+        hidePercentSigns_ = ReadRegistryDword(L"HidePercentSigns", 0) != 0;
+        narrowFont_ = ReadRegistryDword(L"NarrowFont", 0) != 0;
+        autoFitFont_ = ReadRegistryDword(L"AutoFitFont", 0) != 0;
+        cacheDisplayMode_ = std::clamp(ReadRegistryDword(L"CacheDisplayMode", 0), 0, 3);
         automaticThreadMode_ = ReadRegistryDword(L"AutomaticThreadMode", 0) != 0;
         manualThreadId_ = ReadRegistryString(L"ManualThreadId");
 
@@ -760,6 +772,67 @@ public:
         InvalidateWidget();
     }
 
+    std::wstring TaskbarPercentText(int value, bool valid) const {
+        if (!valid) return hidePercentSigns_ ? L"--" : L"--%";
+        return std::to_wstring(value) + (hidePercentSigns_ ? L"" : L"%");
+    }
+
+    double ExactCachePercent() const {
+        if (!threadMetrics_.hasCache || threadMetrics_.inputTokens <= 0) return 0.0;
+        const double value =
+            100.0 * static_cast<double>(threadMetrics_.cachedInputTokens) /
+            static_cast<double>(threadMetrics_.inputTokens);
+        return std::clamp(value, 0.0, 100.0);
+    }
+
+    std::wstring FixedCachePercent(double value, int decimals) const {
+        wchar_t text[32]{};
+        if (decimals <= 0) {
+            swprintf_s(text, L"%d", static_cast<int>(std::lround(value)));
+        } else if (decimals == 1) {
+            swprintf_s(text, L"%.1f", value);
+        } else {
+            swprintf_s(text, L"%.2f", value);
+        }
+        std::wstring result = text;
+        if (!hidePercentSigns_) result.push_back(L'%');
+        return result;
+    }
+
+    std::wstring CacheTaskbarText() const {
+        if (!threadMetrics_.hasCache) {
+            return hidePercentSigns_ ? L"--" : L"--%";
+        }
+
+        const double exact = ExactCachePercent();
+        if (cacheDisplayMode_ == 1) {
+            return FixedCachePercent(exact, 1);
+        }
+        if (cacheDisplayMode_ == 2) {
+            return FixedCachePercent(exact, 2);
+        }
+        if (cacheDisplayMode_ == 3) {
+            const int hundredths = std::clamp(
+                static_cast<int>(std::lround(exact * 100.0)),
+                0,
+                10000);
+            if (hundredths >= 9000 && hundredths < 10000) {
+                wchar_t compact[8]{};
+                // 90.04 -> 004, 95.82 -> 582, 99.04 -> 904.
+                swprintf_s(compact, L"%03d", hundredths - 9000);
+                return compact;
+            }
+            if (hundredths >= 10000) {
+                return L"100";
+            }
+            // Below 90%, fall back to an unambiguous two-decimal display.
+            return FixedCachePercent(exact, 2);
+        }
+        return TaskbarPercentText(
+            threadMetrics_.cachePercent,
+            threadMetrics_.hasCache);
+    }
+
     bool SevenDayOnFirstLine() const {
         return showSevenDayPercent_ && !showFiveHourTime_;
     }
@@ -793,9 +866,9 @@ public:
                 quotaWarningColors_ && valid &&
                 quota_.fiveHour.remainingPercent <= 20;
             segments.push_back({
-                valid
-                    ? std::to_wstring(quota_.fiveHour.remainingPercent) + L"%"
-                    : L"--%",
+                TaskbarPercentText(
+                    quota_.fiveHour.remainingPercent,
+                    valid),
                 QuotaPercentColor(
                     quota_.fiveHour.remainingPercent,
                     valid,
@@ -804,6 +877,9 @@ public:
                 valid && WaitingInputBlinkHidden()});
         }
         if (showFiveHourTime_) {
+            if (hidePercentSigns_ && !segments.empty()) {
+                segments.push_back({L" ", RGB(255, 255, 255)});
+            }
             segments.push_back({
                 quotaValid_ && quota_.fiveHour.valid
                     ? FormatResetTime(quota_.fiveHour.resetsAtUnix)
@@ -815,9 +891,9 @@ public:
                 segments.push_back({L" ", RGB(255, 255, 255)});
             }
             segments.push_back({
-                valid
-                    ? std::to_wstring(quota_.sevenDay.remainingPercent) + L"%"
-                    : L"--%",
+                TaskbarPercentText(
+                    quota_.sevenDay.remainingPercent,
+                    valid),
                 QuotaPercentColor(
                     quota_.sevenDay.remainingPercent,
                     valid,
@@ -838,9 +914,9 @@ public:
         if (showSevenDayPercent_ && !SevenDayOnFirstLine()) {
             const bool valid = quotaValid_ && quota_.sevenDay.valid;
             append(
-                valid
-                    ? std::to_wstring(quota_.sevenDay.remainingPercent) + L"%"
-                    : L"--%",
+                TaskbarPercentText(
+                    quota_.sevenDay.remainingPercent,
+                    valid),
                 QuotaPercentColor(
                     quota_.sevenDay.remainingPercent,
                     valid,
@@ -855,18 +931,16 @@ public:
                 segments.push_back({L" ", RGB(255, 255, 255), false});
             }
             segments.push_back({
-                valid
-                    ? std::to_wstring(threadMetrics_.contextPercent) + L"%"
-                    : L"--%",
+                TaskbarPercentText(
+                    threadMetrics_.contextPercent,
+                    valid),
                 ContextPercentColor(valid),
                 threadMetrics_.activeTurn && contextWarning,
                 valid && WaitingInputBlinkHidden()});
         }
         if (showCache_) {
             append(
-                threadMetrics_.hasCache
-                    ? std::to_wstring(threadMetrics_.cachePercent) + L"%"
-                    : L"--%",
+                CacheTaskbarText(),
                 RGB(255, 255, 255));
         }
         return segments;
@@ -2064,19 +2138,20 @@ private:
     std::wstring FirstLine() const {
         std::wstring line;
         if (showFiveHourPercent_) {
-            line += quotaValid_ && quota_.fiveHour.valid
-                ? std::to_wstring(quota_.fiveHour.remainingPercent) + L"%"
-                : L"--%";
+            line += TaskbarPercentText(
+                quota_.fiveHour.remainingPercent,
+                quotaValid_ && quota_.fiveHour.valid);
         }
         if (showFiveHourTime_) {
+            if (hidePercentSigns_ && !line.empty()) line.push_back(L' ');
             line += quotaValid_ && quota_.fiveHour.valid
                 ? FormatResetTime(quota_.fiveHour.resetsAtUnix)
                 : L"--:--";
         } else if (showSevenDayPercent_) {
             if (!line.empty()) line.push_back(L' ');
-            line += quotaValid_ && quota_.sevenDay.valid
-                ? std::to_wstring(quota_.sevenDay.remainingPercent) + L"%"
-                : L"--%";
+            line += TaskbarPercentText(
+                quota_.sevenDay.remainingPercent,
+                quotaValid_ && quota_.sevenDay.valid);
         }
         return line;
     }
@@ -2085,22 +2160,17 @@ private:
         std::vector<std::wstring> values;
 
         if (showSevenDayPercent_ && !SevenDayOnFirstLine()) {
-            values.push_back(
-                quotaValid_ && quota_.sevenDay.valid
-                    ? std::to_wstring(quota_.sevenDay.remainingPercent) + L"%"
-                    : L"--%");
+            values.push_back(TaskbarPercentText(
+                quota_.sevenDay.remainingPercent,
+                quotaValid_ && quota_.sevenDay.valid));
         }
         if (showContext_) {
-            values.push_back(
-                threadMetrics_.hasContext
-                    ? std::to_wstring(threadMetrics_.contextPercent) + L"%"
-                    : L"--%");
+            values.push_back(TaskbarPercentText(
+                threadMetrics_.contextPercent,
+                threadMetrics_.hasContext));
         }
         if (showCache_) {
-            values.push_back(
-                threadMetrics_.hasCache
-                    ? std::to_wstring(threadMetrics_.cachePercent) + L"%"
-                    : L"--%");
+            values.push_back(CacheTaskbarText());
         }
 
         std::wstring line;
