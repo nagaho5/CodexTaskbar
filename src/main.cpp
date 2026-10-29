@@ -732,6 +732,7 @@ public:
                     threadMetrics_ = {};
                     generationSpeedValid_ = false;
                     fiveHourRateBaselineValid_ = false;
+                    fiveHourRateStoredValid_ = false;
                     rendererActivityMonitor_.Reset();
                     UpdateBlinkTimer();
                     InvalidateWidget();
@@ -768,6 +769,11 @@ public:
             StartFiveHourRateBaseline(threadMetrics_, nowMs);
         }
 
+        if (const auto rate = CurrentFiveHourConsumptionRate()) {
+            fiveHourRateStoredValue_ = *rate;
+            fiveHourRateStoredValid_ = true;
+        }
+
         InvalidateWidget();
         UpdateTooltipText();
         UpdateTrayTip();
@@ -783,7 +789,13 @@ public:
     void StartFiveHourRateBaseline(
         const ThreadMetrics& metrics,
         std::int64_t nowMs) {
+        (void)nowMs;
+
+        // Do not start timing at turn/started. Codex can spend a long time
+        // connecting/initializing before real work begins. The canonical Turn
+        // exposes the first work-item timestamp specifically for this boundary.
         if (!metrics.activeTurn ||
+            metrics.firstTurnWorkItemStartedAtMs <= 0 ||
             !quotaValid_ ||
             !quota_.fiveHour.valid) {
             return;
@@ -792,10 +804,13 @@ public:
         fiveHourRateBaselineValid_ = true;
         fiveHourRateStartRemaining_ = quota_.fiveHour.remainingPercent;
         fiveHourRateResetAtUnix_ = quota_.fiveHour.resetsAtUnix;
-        fiveHourRateStartMs_ =
-            metrics.turnStartedAtMs > 0 ? metrics.turnStartedAtMs : nowMs;
+        fiveHourRateStartMs_ = metrics.firstTurnWorkItemStartedAtMs;
         fiveHourRateThreadId_ = metrics.threadId;
         fiveHourRateTurnId_ = metrics.turnId;
+
+        // A new task has genuinely started doing work. Only now retire the
+        // previous task's frozen final rate.
+        fiveHourRateStoredValid_ = false;
     }
 
     std::optional<double> CurrentFiveHourConsumptionRate() const {
@@ -804,7 +819,8 @@ public:
             !quotaValid_ ||
             !quota_.fiveHour.valid ||
             quota_.fiveHour.resetsAtUnix != fiveHourRateResetAtUnix_ ||
-            fiveHourRateStartMs_ <= 0) {
+            fiveHourRateStartMs_ <= 0 ||
+            lastQuotaSuccessMs_ <= fiveHourRateStartMs_) {
             return std::nullopt;
         }
 
@@ -812,14 +828,27 @@ public:
             fiveHourRateStartRemaining_ - quota_.fiveHour.remainingPercent;
         if (consumed < 0) return std::nullopt;
 
+        // The numerator is sampled only when quota refreshes (normally every
+        // 60s), so use that same sample timestamp for the denominator. Using
+        // "now" would make the rate decay between quota refreshes.
         const std::int64_t elapsedMs =
-            CurrentUnixMilliseconds() - fiveHourRateStartMs_;
+            lastQuotaSuccessMs_ - fiveHourRateStartMs_;
         if (elapsedMs <= 0) return std::nullopt;
 
         const double elapsedMinutes =
             static_cast<double>(elapsedMs) / 60000.0;
         return static_cast<double>(consumed) /
             std::max(0.001, elapsedMinutes);
+    }
+
+    std::optional<double> DisplayFiveHourConsumptionRate() const {
+        if (const auto live = CurrentFiveHourConsumptionRate()) {
+            return live;
+        }
+        if (fiveHourRateStoredValid_) {
+            return fiveHourRateStoredValue_;
+        }
+        return std::nullopt;
     }
 
     void ApplyThreadMetrics(const ThreadMetrics& metrics) {
@@ -842,6 +871,14 @@ public:
             }
         } else if (metrics.activeTurn && !fiveHourRateBaselineValid_) {
             StartFiveHourRateBaseline(metrics, nowMs);
+        }
+
+        // If the current task just completed, keep the latest measured value.
+        // It remains available in hover until the next task reaches its first
+        // real work item, at which point StartFiveHourRateBaseline clears it.
+        if (threadMetrics_.activeTurn && !metrics.activeTurn &&
+            fiveHourRateStoredValid_) {
+            fiveHourRateBaselineValid_ = false;
         }
 
         if (identityChanged) {
@@ -1335,6 +1372,7 @@ public:
         generationSpeedThreadId_.clear();
         generationSpeedTurnId_.clear();
         fiveHourRateBaselineValid_ = false;
+        fiveHourRateStoredValid_ = false;
         fiveHourRateThreadId_.clear();
         fiveHourRateTurnId_.clear();
 
@@ -3013,8 +3051,12 @@ private:
             text += L"5小时：暂无数据";
         }
 
-        text += L"\r\n5h消耗速度（估算）：";
-        if (const auto rate = CurrentFiveHourConsumptionRate()) {
+        const bool liveFiveHourRate =
+            CurrentFiveHourConsumptionRate().has_value();
+        text += liveFiveHourRate
+            ? L"\r\n5h消耗速度（估算）："
+            : L"\r\n上次5h消耗速度（估算）：";
+        if (const auto rate = DisplayFiveHourConsumptionRate()) {
             wchar_t rateText[48]{};
             swprintf_s(rateText, L"%.3f%%/分钟", *rate);
             text += rateText;
@@ -3212,7 +3254,7 @@ private:
         case kMenuAbout:
             MessageBoxW(
                 mainWindow_,
-                L"CodexTaskbar v0.3.6\n\n"
+                L"CodexTaskbar v0.3.7\n\n"
                 L"在 Windows 10 任务栏显示 Codex 配额、绑定会话上下文/缓存和本轮代码改动。\n"
                 L"配额来自官方 app-server；会话指标通过只读 Codex Desktop IPC follower 获取。",
                 L"关于 CodexTaskbar",
@@ -3412,6 +3454,8 @@ private:
     std::string generationSpeedTurnId_;
 
     bool fiveHourRateBaselineValid_{false};
+    bool fiveHourRateStoredValid_{false};
+    double fiveHourRateStoredValue_{0.0};
     int fiveHourRateStartRemaining_{0};
     std::int64_t fiveHourRateResetAtUnix_{0};
     std::int64_t fiveHourRateStartMs_{0};
