@@ -14,6 +14,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <ctime>
@@ -71,6 +72,10 @@ constexpr int kCheckContextWarningColors = 2016;
 constexpr int kCheckQuotaWarningColors = 2017;
 constexpr int kCheckDurationUnits = 2018;
 constexpr int kCheckBlinkOnUserInput = 2019;
+constexpr int kCheckHidePercentSigns = 2020;
+constexpr int kCheckNarrowFont = 2021;
+constexpr int kCheckAutoFitFont = 2022;
+constexpr int kComboCacheDisplayMode = 2023;
 
 constexpr COLORREF kDefaultWorkingColor = RGB(79, 195, 247);
 constexpr COLORREF kWarningYellow = RGB(255, 196, 64);
@@ -416,11 +421,14 @@ std::wstring FormatDurationUnits(std::int64_t milliseconds) {
 
     wchar_t text[32]{};
     if (hours > 0) {
-        swprintf_s(text, L"%lldh%02lldm%02llds",
+        // Compact hour form: no leading zero for hours/minutes, seconds stay
+        // two digits, and the trailing "s" is omitted (e.g. 1h5m02).
+        swprintf_s(text, L"%lldh%lldm%02lld",
             static_cast<long long>(hours),
             static_cast<long long>(minutes),
             static_cast<long long>(seconds));
     } else {
+        // Sub-hour h/m/s mode intentionally keeps its existing format.
         swprintf_s(text, L"%lldm%02llds",
             static_cast<long long>(minutes),
             static_cast<long long>(seconds));
@@ -508,6 +516,9 @@ public:
         if (font_) {
             DeleteObject(font_);
         }
+        if (widgetFont_ && widgetFont_ != font_) {
+            DeleteObject(widgetFont_);
+        }
         if (darkBackgroundBrush_) {
             DeleteObject(darkBackgroundBrush_);
         }
@@ -546,6 +557,10 @@ public:
         quotaWarningColors_ = ReadRegistryDword(L"QuotaWarningColors", 0) != 0;
         durationUnits_ = ReadRegistryDword(L"DurationUnits", 0) != 0;
         blinkOnUserInput_ = ReadRegistryDword(L"BlinkOnUserInput", 1) != 0;
+        hidePercentSigns_ = ReadRegistryDword(L"HidePercentSigns", 0) != 0;
+        narrowFont_ = ReadRegistryDword(L"NarrowFont", 0) != 0;
+        autoFitFont_ = ReadRegistryDword(L"AutoFitFont", 0) != 0;
+        cacheDisplayMode_ = std::clamp(ReadRegistryDword(L"CacheDisplayMode", 0), 0, 3);
         automaticThreadMode_ = ReadRegistryDword(L"AutomaticThreadMode", 0) != 0;
         manualThreadId_ = ReadRegistryString(L"ManualThreadId");
 
@@ -760,6 +775,67 @@ public:
         InvalidateWidget();
     }
 
+    std::wstring TaskbarPercentText(int value, bool valid) const {
+        if (!valid) return hidePercentSigns_ ? L"--" : L"--%";
+        return std::to_wstring(value) + (hidePercentSigns_ ? L"" : L"%");
+    }
+
+    double ExactCachePercent() const {
+        if (!threadMetrics_.hasCache || threadMetrics_.inputTokens <= 0) return 0.0;
+        const double value =
+            100.0 * static_cast<double>(threadMetrics_.cachedInputTokens) /
+            static_cast<double>(threadMetrics_.inputTokens);
+        return std::clamp(value, 0.0, 100.0);
+    }
+
+    std::wstring FixedCachePercent(double value, int decimals) const {
+        wchar_t text[32]{};
+        if (decimals <= 0) {
+            swprintf_s(text, L"%d", static_cast<int>(std::lround(value)));
+        } else if (decimals == 1) {
+            swprintf_s(text, L"%.1f", value);
+        } else {
+            swprintf_s(text, L"%.2f", value);
+        }
+        std::wstring result = text;
+        if (!hidePercentSigns_) result.push_back(L'%');
+        return result;
+    }
+
+    std::wstring CacheTaskbarText() const {
+        if (!threadMetrics_.hasCache) {
+            return hidePercentSigns_ ? L"--" : L"--%";
+        }
+
+        const double exact = ExactCachePercent();
+        if (cacheDisplayMode_ == 1) {
+            return FixedCachePercent(exact, 1);
+        }
+        if (cacheDisplayMode_ == 2) {
+            return FixedCachePercent(exact, 2);
+        }
+        if (cacheDisplayMode_ == 3) {
+            const int hundredths = std::clamp(
+                static_cast<int>(std::lround(exact * 100.0)),
+                0,
+                10000);
+            if (hundredths >= 9000 && hundredths < 10000) {
+                wchar_t compact[8]{};
+                // 90.04 -> 004, 95.82 -> 582, 99.04 -> 904.
+                swprintf_s(compact, L"%03d", hundredths - 9000);
+                return compact;
+            }
+            if (hundredths >= 10000) {
+                return L"100";
+            }
+            // Below 90%, fall back to an unambiguous two-decimal display.
+            return FixedCachePercent(exact, 2);
+        }
+        return TaskbarPercentText(
+            threadMetrics_.cachePercent,
+            threadMetrics_.hasCache);
+    }
+
     bool SevenDayOnFirstLine() const {
         return showSevenDayPercent_ && !showFiveHourTime_;
     }
@@ -793,9 +869,9 @@ public:
                 quotaWarningColors_ && valid &&
                 quota_.fiveHour.remainingPercent <= 20;
             segments.push_back({
-                valid
-                    ? std::to_wstring(quota_.fiveHour.remainingPercent) + L"%"
-                    : L"--%",
+                TaskbarPercentText(
+                    quota_.fiveHour.remainingPercent,
+                    valid),
                 QuotaPercentColor(
                     quota_.fiveHour.remainingPercent,
                     valid,
@@ -804,6 +880,9 @@ public:
                 valid && WaitingInputBlinkHidden()});
         }
         if (showFiveHourTime_) {
+            if (hidePercentSigns_ && !segments.empty()) {
+                segments.push_back({L" ", RGB(255, 255, 255)});
+            }
             segments.push_back({
                 quotaValid_ && quota_.fiveHour.valid
                     ? FormatResetTime(quota_.fiveHour.resetsAtUnix)
@@ -815,9 +894,9 @@ public:
                 segments.push_back({L" ", RGB(255, 255, 255)});
             }
             segments.push_back({
-                valid
-                    ? std::to_wstring(quota_.sevenDay.remainingPercent) + L"%"
-                    : L"--%",
+                TaskbarPercentText(
+                    quota_.sevenDay.remainingPercent,
+                    valid),
                 QuotaPercentColor(
                     quota_.sevenDay.remainingPercent,
                     valid,
@@ -838,9 +917,9 @@ public:
         if (showSevenDayPercent_ && !SevenDayOnFirstLine()) {
             const bool valid = quotaValid_ && quota_.sevenDay.valid;
             append(
-                valid
-                    ? std::to_wstring(quota_.sevenDay.remainingPercent) + L"%"
-                    : L"--%",
+                TaskbarPercentText(
+                    quota_.sevenDay.remainingPercent,
+                    valid),
                 QuotaPercentColor(
                     quota_.sevenDay.remainingPercent,
                     valid,
@@ -855,18 +934,16 @@ public:
                 segments.push_back({L" ", RGB(255, 255, 255), false});
             }
             segments.push_back({
-                valid
-                    ? std::to_wstring(threadMetrics_.contextPercent) + L"%"
-                    : L"--%",
+                TaskbarPercentText(
+                    threadMetrics_.contextPercent,
+                    valid),
                 ContextPercentColor(valid),
                 threadMetrics_.activeTurn && contextWarning,
                 valid && WaitingInputBlinkHidden()});
         }
         if (showCache_) {
             append(
-                threadMetrics_.hasCache
-                    ? std::to_wstring(threadMetrics_.cachePercent) + L"%"
-                    : L"--%",
+                CacheTaskbarText(),
                 RGB(255, 255, 255));
         }
         return segments;
@@ -883,7 +960,9 @@ public:
 
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, RGB(255, 255, 255));
-        HFONT oldFont = static_cast<HFONT>(SelectObject(dc, font_));
+        HFONT oldFont = static_cast<HFONT>(SelectObject(
+            dc,
+            widgetFont_ ? widgetFont_ : font_));
 
         if (verticalTaskbar_) {
             const std::wstring first = FirstLine();
@@ -1118,7 +1197,7 @@ public:
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             500,
-            520,
+            600,
             mainWindow_,
             nullptr,
             instance_,
@@ -1207,50 +1286,79 @@ public:
             L"等待输入时闪烁任务百分比",
             225, 208, blinkOnUserInput_, 225);
 
+        checkbox(
+            kCheckHidePercentSigns,
+            L"任务栏隐藏 %",
+            24, 233, hidePercentSigns_, 190);
+        checkbox(
+            kCheckNarrowFont,
+            L"窄体数字 (Bahnschrift)",
+            225, 233, narrowFont_, 225);
+        checkbox(
+            kCheckAutoFitFont,
+            L"溢出时自动微缩 (最多2pt)",
+            24, 258, autoFitFont_, 200);
+
+        CreateWindowW(
+            L"STATIC", L"Cache显示：", WS_CHILD | WS_VISIBLE,
+            225, 260, 90, 22, hwnd, nullptr, instance_, nullptr);
+        HWND cacheMode = CreateWindowExW(
+            WS_EX_CLIENTEDGE,
+            L"COMBOBOX",
+            nullptr,
+            WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+            315, 255, 135, 150, hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kComboCacheDisplayMode)),
+            instance_,
+            nullptr);
+        SendMessageW(cacheMode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"整数"));
+        SendMessageW(cacheMode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"1位小数"));
+        SendMessageW(cacheMode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"2位小数"));
+        SendMessageW(cacheMode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"90+紧凑"));
+        SendMessageW(cacheMode, CB_SETCURSEL, static_cast<WPARAM>(cacheDisplayMode_), 0);
+
         CreateWindowW(L"STATIC", L"会话来源：", WS_CHILD | WS_VISIBLE,
-            24, 241, 100, 22, hwnd, nullptr, instance_, nullptr);
+            24, 296, 100, 22, hwnd, nullptr, instance_, nullptr);
 
         HWND manualRadio = CreateWindowW(
             L"BUTTON", L"手动绑定 Thread ID", WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON | WS_GROUP,
-            24, 265, 180, 22, hwnd,
+            24, 320, 180, 22, hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kRadioManualThread)), instance_, nullptr);
         HWND autoRadio = CreateWindowW(
             L"BUTTON", L"自动跟随活动任务（实验）", WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON,
-            210, 265, 240, 22, hwnd,
+            210, 320, 240, 22, hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kRadioAutoThread)), instance_, nullptr);
         SendMessageW(manualRadio, BM_SETCHECK, automaticThreadMode_ ? BST_UNCHECKED : BST_CHECKED, 0);
         SendMessageW(autoRadio, BM_SETCHECK, automaticThreadMode_ ? BST_CHECKED : BST_UNCHECKED, 0);
 
         CreateWindowW(L"STATIC", L"Thread ID：", WS_CHILD | WS_VISIBLE,
-            24, 301, 80, 22, hwnd, nullptr, instance_, nullptr);
+            24, 356, 80, 22, hwnd, nullptr, instance_, nullptr);
         CreateWindowExW(
             WS_EX_CLIENTEDGE, L"EDIT", manualThreadId_.c_str(),
             WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-            104, 297, 346, 26, hwnd,
+            104, 352, 346, 26, hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kEditThreadId)), instance_, nullptr);
 
-        checkbox(kCheckAutoStart, L"开机自动启动", 24, 343, autoStart_);
+        checkbox(kCheckAutoStart, L"开机自动启动", 24, 398, autoStart_);
 
         CreateWindowW(
             L"STATIC",
-            L"提示：隐藏的项目仍会在鼠标悬浮提示中显示完整信息。",
+            L"提示：隐藏项目仍会在悬浮提示中显示；自动微缩不会超过你设置的字号。",
             WS_CHILD | WS_VISIBLE,
-            24, 377, 430, 22, hwnd, nullptr, instance_, nullptr);
+            24, 432, 440, 38, hwnd, nullptr, instance_, nullptr);
 
         CreateWindowW(
             L"BUTTON", L"确定", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            300, 419, 76, 28, hwnd,
+            300, 492, 76, 28, hwnd,
             reinterpret_cast<HMENU>(IDOK), instance_, nullptr);
         CreateWindowW(
             L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            388, 419, 76, 28, hwnd,
+            388, 492, 76, 28, hwnd,
             reinterpret_cast<HMENU>(IDCANCEL), instance_, nullptr);
 
         EnumChildWindows(
             hwnd,
             [](HWND child, LPARAM) -> BOOL {
-                // DarkMode_Explorer is available on supported Windows 10 builds;
-                // WM_CTLCOLOR below is the fallback for controls that ignore it.
                 SetWindowTheme(child, L"DarkMode_Explorer", nullptr);
                 return TRUE;
             },
@@ -1426,6 +1534,16 @@ public:
         quotaWarningColors_ = checked(kCheckQuotaWarningColors);
         durationUnits_ = checked(kCheckDurationUnits);
         blinkOnUserInput_ = checked(kCheckBlinkOnUserInput);
+        hidePercentSigns_ = checked(kCheckHidePercentSigns);
+        narrowFont_ = checked(kCheckNarrowFont);
+        autoFitFont_ = checked(kCheckAutoFitFont);
+
+        const LRESULT cacheSelection =
+            SendDlgItemMessageW(hwnd, kComboCacheDisplayMode, CB_GETCURSEL, 0, 0);
+        cacheDisplayMode_ = cacheSelection == CB_ERR
+            ? 0
+            : std::clamp(static_cast<int>(cacheSelection), 0, 3);
+
         const bool previousAutomaticMode = automaticThreadMode_;
         automaticThreadMode_ = checked(kRadioAutoThread);
         if (previousAutomaticMode != automaticThreadMode_) {
@@ -1435,14 +1553,16 @@ public:
         wchar_t threadText[256]{};
         GetDlgItemTextW(hwnd, kEditThreadId, threadText, static_cast<int>(std::size(threadText)));
         manualThreadId_ = threadText;
-        while (!manualThreadId_.empty() && iswspace(manualThreadId_.front())) manualThreadId_.erase(manualThreadId_.begin());
-        while (!manualThreadId_.empty() && iswspace(manualThreadId_.back())) manualThreadId_.pop_back();
+        while (!manualThreadId_.empty() && iswspace(manualThreadId_.front())) {
+            manualThreadId_.erase(manualThreadId_.begin());
+        }
+        while (!manualThreadId_.empty() && iswspace(manualThreadId_.back())) {
+            manualThreadId_.pop_back();
+        }
 
         const int fontSizeTenths = static_cast<int>(std::lround(fontSize_ * 10.0));
         WriteRegistryDword(L"FontSizeTenths", static_cast<DWORD>(fontSizeTenths));
-        WriteRegistryDword(
-            L"FontSize",
-            static_cast<DWORD>(std::lround(fontSize_)));
+        WriteRegistryDword(L"FontSize", static_cast<DWORD>(std::lround(fontSize_)));
         WriteRegistryDword(L"AutoStart", autoStart_ ? 1u : 0u);
         WriteRegistryDword(L"ShowFiveHourPercent", showFiveHourPercent_ ? 1u : 0u);
         WriteRegistryDword(L"ShowFiveHourTime", showFiveHourTime_ ? 1u : 0u);
@@ -1457,6 +1577,10 @@ public:
         WriteRegistryDword(L"QuotaWarningColors", quotaWarningColors_ ? 1u : 0u);
         WriteRegistryDword(L"DurationUnits", durationUnits_ ? 1u : 0u);
         WriteRegistryDword(L"BlinkOnUserInput", blinkOnUserInput_ ? 1u : 0u);
+        WriteRegistryDword(L"HidePercentSigns", hidePercentSigns_ ? 1u : 0u);
+        WriteRegistryDword(L"NarrowFont", narrowFont_ ? 1u : 0u);
+        WriteRegistryDword(L"AutoFitFont", autoFitFont_ ? 1u : 0u);
+        WriteRegistryDword(L"CacheDisplayMode", static_cast<DWORD>(cacheDisplayMode_));
         WriteRegistryDword(L"AutomaticThreadMode", automaticThreadMode_ ? 1u : 0u);
         WriteRegistryString(L"ManualThreadId", manualThreadId_);
         SetAutoStartRegistry(autoStart_);
@@ -1822,12 +1946,7 @@ private:
         return true;
     }
 
-    void RecreateFont() {
-        if (font_) {
-            DeleteObject(font_);
-            font_ = nullptr;
-        }
-
+    UINT FontDpi() const {
         UINT dpi = 96;
         HWND dpiWindow = nullptr;
         if (widgetWindow_ && IsWindow(widgetWindow_)) {
@@ -1839,21 +1958,25 @@ private:
         }
         if (dpiWindow) {
             const UINT windowDpi = GetDpiForWindow(dpiWindow);
-            if (windowDpi > 0) {
-                dpi = windowDpi;
-            }
+            if (windowDpi > 0) dpi = windowDpi;
         }
+        return dpi;
+    }
 
+    HFONT CreatePointFont(double pointSize, bool widgetFont) const {
+        const UINT dpi = FontDpi();
         const int height = -std::max(
             1,
             static_cast<int>(std::lround(
-                fontSize_ * static_cast<double>(dpi) / 72.0)));
-        font_ = CreateFontW(
+                pointSize * static_cast<double>(dpi) / 72.0)));
+
+        const bool narrow = widgetFont && narrowFont_;
+        return CreateFontW(
             height,
             0,
             0,
             0,
-            FW_SEMIBOLD,
+            narrow ? FW_NORMAL : FW_SEMIBOLD,
             FALSE,
             FALSE,
             FALSE,
@@ -1862,7 +1985,157 @@ private:
             CLIP_DEFAULT_PRECIS,
             CLEARTYPE_QUALITY,
             DEFAULT_PITCH | FF_DONTCARE,
-            L"Segoe UI");
+            narrow ? L"Bahnschrift SemiCondensed" : L"Segoe UI");
+    }
+
+    void ReplaceWidgetFont(double pointSize) {
+        HFONT replacement = CreatePointFont(pointSize, true);
+        if (!replacement) return;
+        if (widgetFont_ && widgetFont_ != font_) {
+            DeleteObject(widgetFont_);
+        }
+        widgetFont_ = replacement;
+        effectiveWidgetFontSize_ = pointSize;
+    }
+
+    void RecreateFont() {
+        if (font_) {
+            DeleteObject(font_);
+            font_ = nullptr;
+        }
+        if (widgetFont_) {
+            DeleteObject(widgetFont_);
+            widgetFont_ = nullptr;
+        }
+
+        font_ = CreatePointFont(fontSize_, false);
+        effectiveWidgetFontSize_ = fontSize_;
+        widgetFont_ = CreatePointFont(effectiveWidgetFontSize_, true);
+        if (!widgetFont_) {
+            widgetFont_ = CreatePointFont(effectiveWidgetFontSize_, false);
+        }
+
+        lastAutoFitWidth_ = -1;
+        lastAutoFitSignature_.clear();
+    }
+
+    int MeasureTextWidth(HDC dc, const std::wstring& text) const {
+        if (!dc || text.empty()) return 0;
+        SIZE size{};
+        GetTextExtentPoint32W(
+            dc,
+            text.c_str(),
+            static_cast<int>(text.size()),
+            &size);
+        return size.cx;
+    }
+
+    std::wstring WidgetFitSignature() const {
+        std::wstring signature = verticalTaskbar_ ? L"V|" : L"H|";
+        signature += FirstLine();
+        signature += L"|";
+        signature += SecondLine();
+        signature += L"|";
+        signature += std::to_wstring(TaskDurationLine().size());
+        signature += L"|";
+        if (IsDiffRowVisible()) {
+            if (showDiffFiles_) {
+                signature += std::to_wstring(
+                    std::to_wstring(threadMetrics_.changedFiles).size());
+            }
+            signature += L":";
+            signature += std::to_wstring(
+                std::to_wstring(threadMetrics_.addedLines).size());
+            signature += L":";
+            signature += std::to_wstring(
+                std::to_wstring(threadMetrics_.removedLines).size());
+        }
+        return signature;
+    }
+
+    int MeasureWidgetContentWidth(HDC dc) const {
+        if (!dc) return 0;
+        if (!verticalTaskbar_) {
+            return MeasureTextWidth(dc, HorizontalLine());
+        }
+
+        int widest = 0;
+        widest = std::max(widest, MeasureTextWidth(dc, FirstLine()));
+        widest = std::max(widest, MeasureTextWidth(dc, SecondLine()));
+        widest = std::max(widest, MeasureTextWidth(dc, TaskDurationLine()));
+
+        if (IsDiffRowVisible()) {
+            std::wstring diff;
+            if (showDiffFiles_) diff += std::to_wstring(threadMetrics_.changedFiles);
+            diff += std::to_wstring(threadMetrics_.addedLines);
+            diff += std::to_wstring(threadMetrics_.removedLines);
+            widest = std::max(widest, MeasureTextWidth(dc, diff));
+        }
+        return widest;
+    }
+
+    void UpdateAutoFitFont(int availableWidth) {
+        availableWidth = std::max(1, availableWidth);
+        const std::wstring signature = WidgetFitSignature();
+
+        if (!autoFitFont_) {
+            if (std::abs(effectiveWidgetFontSize_ - fontSize_) > 0.04) {
+                ReplaceWidgetFont(fontSize_);
+            }
+            lastAutoFitWidth_ = availableWidth;
+            lastAutoFitSignature_ = signature;
+            return;
+        }
+
+        if (availableWidth == lastAutoFitWidth_ &&
+            signature == lastAutoFitSignature_) {
+            return;
+        }
+        lastAutoFitWidth_ = availableWidth;
+        lastAutoFitSignature_ = signature;
+
+        HDC dc = GetDC(widgetWindow_);
+        if (!dc) return;
+
+        HFONT baseFont = CreatePointFont(fontSize_, true);
+        if (!baseFont) {
+            ReleaseDC(widgetWindow_, dc);
+            return;
+        }
+
+        HFONT oldFont = static_cast<HFONT>(SelectObject(dc, baseFont));
+        const int baseWidth = MeasureWidgetContentWidth(dc);
+        const int fitWidth = std::max(1, availableWidth - 2);
+        double target = fontSize_;
+
+        if (baseWidth > fitWidth) {
+            const double minimum = std::max(8.0, fontSize_ - 2.0);
+            const double ratio =
+                static_cast<double>(fitWidth) /
+                static_cast<double>(std::max(1, baseWidth));
+            target = std::floor(
+                std::clamp(fontSize_ * ratio, minimum, fontSize_) * 10.0) / 10.0;
+
+            while (target > minimum + 0.04) {
+                HFONT candidate = CreatePointFont(target, true);
+                if (!candidate) break;
+                SelectObject(dc, candidate);
+                const int candidateWidth = MeasureWidgetContentWidth(dc);
+                SelectObject(dc, baseFont);
+                DeleteObject(candidate);
+                if (candidateWidth <= fitWidth) break;
+                target = std::max(minimum, target - 0.1);
+                target = std::round(target * 10.0) / 10.0;
+            }
+        }
+
+        SelectObject(dc, oldFont);
+        DeleteObject(baseFont);
+        ReleaseDC(widgetWindow_, dc);
+
+        if (std::abs(target - effectiveWidgetFontSize_) > 0.04) {
+            ReplaceWidgetFont(target);
+        }
     }
 
     void AddTrayIcon() {
@@ -1978,29 +2251,38 @@ private:
         RECT rebarClient{};
         GetClientRect(rebarWindow_, &rebarClient);
 
-        HDC dc = GetDC(widgetWindow_);
-        HFONT oldFont = dc ? static_cast<HFONT>(SelectObject(dc, font_)) : nullptr;
-        TEXTMETRICW metrics{};
-        if (dc) {
-            GetTextMetricsW(dc, &metrics);
-            if (oldFont) {
-                SelectObject(dc, oldFont);
-            }
-            ReleaseDC(widgetWindow_, dc);
-        }
-
-        const int lineHeight = std::max(14, static_cast<int>(metrics.tmHeight) + 1);
         int width = 0;
-        int height = 0;
-
         if (verticalTaskbar_) {
             width = std::max(40, static_cast<int>(rebarClient.right - rebarClient.left) - 4);
-            height = lineHeight * std::max(1, VisibleRowCount()) + 4;
         } else {
             width = std::max(
                 150,
                 static_cast<int>(std::lround(fontSize_ * 15.0)));
-            height = std::max(24, std::min(static_cast<int>(rebarClient.bottom - rebarClient.top), lineHeight + 6));
+        }
+
+        UpdateAutoFitFont(std::max(1, width - 2));
+
+        HDC dc = GetDC(widgetWindow_);
+        HFONT oldFont = dc ? static_cast<HFONT>(SelectObject(
+            dc,
+            widgetFont_ ? widgetFont_ : font_)) : nullptr;
+        TEXTMETRICW metrics{};
+        if (dc) {
+            GetTextMetricsW(dc, &metrics);
+            if (oldFont) SelectObject(dc, oldFont);
+            ReleaseDC(widgetWindow_, dc);
+        }
+
+        const int lineHeight = std::max(14, static_cast<int>(metrics.tmHeight) + 1);
+        int height = 0;
+        if (verticalTaskbar_) {
+            height = lineHeight * std::max(1, VisibleRowCount()) + 4;
+        } else {
+            height = std::max(
+                24,
+                std::min(
+                    static_cast<int>(rebarClient.bottom - rebarClient.top),
+                    lineHeight + 6));
         }
 
         HWND trafficMonitor = FindDescendantByTitle(taskbarWindow_, kTrafficMonitorTitle);
@@ -2018,10 +2300,11 @@ private:
             }
 
             const int y = std::max(static_cast<int>(rebarClient.top), anchorTop - height - 1);
-            const int x = std::max(0, (static_cast<int>(rebarClient.right - rebarClient.left) - width) / 2);
+            const int x = std::max(
+                0,
+                (static_cast<int>(rebarClient.right - rebarClient.left) - width) / 2);
 
-            // Never resize or reposition the Windows task-list region. This widget is
-            // deliberately overlay-only so a layout mistake cannot hide task buttons.
+            // Never resize or reposition the Windows task-list region.
             SetWindowPos(
                 widgetWindow_,
                 HWND_TOP,
@@ -2038,7 +2321,9 @@ private:
                 x = trayRect.left - width - 2;
             }
             x = std::max(static_cast<int>(rebarClient.left), x);
-            const int y = std::max(static_cast<int>(rebarClient.top), (static_cast<int>(rebarClient.bottom - rebarClient.top) - height) / 2);
+            const int y = std::max(
+                static_cast<int>(rebarClient.top),
+                (static_cast<int>(rebarClient.bottom - rebarClient.top) - height) / 2);
             SetWindowPos(
                 widgetWindow_,
                 HWND_TOP,
@@ -2064,19 +2349,20 @@ private:
     std::wstring FirstLine() const {
         std::wstring line;
         if (showFiveHourPercent_) {
-            line += quotaValid_ && quota_.fiveHour.valid
-                ? std::to_wstring(quota_.fiveHour.remainingPercent) + L"%"
-                : L"--%";
+            line += TaskbarPercentText(
+                quota_.fiveHour.remainingPercent,
+                quotaValid_ && quota_.fiveHour.valid);
         }
         if (showFiveHourTime_) {
+            if (hidePercentSigns_ && !line.empty()) line.push_back(L' ');
             line += quotaValid_ && quota_.fiveHour.valid
                 ? FormatResetTime(quota_.fiveHour.resetsAtUnix)
                 : L"--:--";
         } else if (showSevenDayPercent_) {
             if (!line.empty()) line.push_back(L' ');
-            line += quotaValid_ && quota_.sevenDay.valid
-                ? std::to_wstring(quota_.sevenDay.remainingPercent) + L"%"
-                : L"--%";
+            line += TaskbarPercentText(
+                quota_.sevenDay.remainingPercent,
+                quotaValid_ && quota_.sevenDay.valid);
         }
         return line;
     }
@@ -2085,22 +2371,17 @@ private:
         std::vector<std::wstring> values;
 
         if (showSevenDayPercent_ && !SevenDayOnFirstLine()) {
-            values.push_back(
-                quotaValid_ && quota_.sevenDay.valid
-                    ? std::to_wstring(quota_.sevenDay.remainingPercent) + L"%"
-                    : L"--%");
+            values.push_back(TaskbarPercentText(
+                quota_.sevenDay.remainingPercent,
+                quotaValid_ && quota_.sevenDay.valid));
         }
         if (showContext_) {
-            values.push_back(
-                threadMetrics_.hasContext
-                    ? std::to_wstring(threadMetrics_.contextPercent) + L"%"
-                    : L"--%");
+            values.push_back(TaskbarPercentText(
+                threadMetrics_.contextPercent,
+                threadMetrics_.hasContext));
         }
         if (showCache_) {
-            values.push_back(
-                threadMetrics_.hasCache
-                    ? std::to_wstring(threadMetrics_.cachePercent) + L"%"
-                    : L"--%");
+            values.push_back(CacheTaskbarText());
         }
 
         std::wstring line;
@@ -2506,7 +2787,7 @@ private:
         case kMenuAbout:
             MessageBoxW(
                 mainWindow_,
-                L"CodexTaskbar v0.3.3\n\n"
+                L"CodexTaskbar v0.3.4\n\n"
                 L"在 Windows 10 任务栏显示 Codex 配额、绑定会话上下文/缓存和本轮代码改动。\n"
                 L"配额来自官方 app-server；会话指标通过只读 Codex Desktop IPC follower 获取。",
                 L"关于 CodexTaskbar",
@@ -2646,6 +2927,7 @@ private:
     HWND rebarWindow_{nullptr};
     HWND hoverWindow_{nullptr};
     HFONT font_{nullptr};
+    HFONT widgetFont_{nullptr};
     HBRUSH darkBackgroundBrush_{nullptr};
     HBRUSH darkControlBrush_{nullptr};
     HBRUSH darkMenuBrush_{nullptr};
@@ -2678,8 +2960,15 @@ private:
     bool durationUnits_{false};
     bool blinkOnUserInput_{true};
     bool lastWaitingInputBlinkHidden_{false};
+    bool hidePercentSigns_{false};
+    bool narrowFont_{false};
+    bool autoFitFont_{false};
+    int cacheDisplayMode_{0};
     bool automaticThreadMode_{false};
     double fontSize_{10.0};
+    double effectiveWidgetFontSize_{10.0};
+    int lastAutoFitWidth_{-1};
+    std::wstring lastAutoFitSignature_;
     unsigned tickCount_{0};
 
     QuotaSnapshot quota_{};
