@@ -516,6 +516,9 @@ public:
         if (font_) {
             DeleteObject(font_);
         }
+        if (widgetFont_ && widgetFont_ != font_) {
+            DeleteObject(widgetFont_);
+        }
         if (darkBackgroundBrush_) {
             DeleteObject(darkBackgroundBrush_);
         }
@@ -957,7 +960,9 @@ public:
 
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, RGB(255, 255, 255));
-        HFONT oldFont = static_cast<HFONT>(SelectObject(dc, font_));
+        HFONT oldFont = static_cast<HFONT>(SelectObject(
+            dc,
+            widgetFont_ ? widgetFont_ : font_));
 
         if (verticalTaskbar_) {
             const std::wstring first = FirstLine();
@@ -1896,12 +1901,7 @@ private:
         return true;
     }
 
-    void RecreateFont() {
-        if (font_) {
-            DeleteObject(font_);
-            font_ = nullptr;
-        }
-
+    UINT FontDpi() const {
         UINT dpi = 96;
         HWND dpiWindow = nullptr;
         if (widgetWindow_ && IsWindow(widgetWindow_)) {
@@ -1913,21 +1913,25 @@ private:
         }
         if (dpiWindow) {
             const UINT windowDpi = GetDpiForWindow(dpiWindow);
-            if (windowDpi > 0) {
-                dpi = windowDpi;
-            }
+            if (windowDpi > 0) dpi = windowDpi;
         }
+        return dpi;
+    }
 
+    HFONT CreatePointFont(double pointSize, bool widgetFont) const {
+        const UINT dpi = FontDpi();
         const int height = -std::max(
             1,
             static_cast<int>(std::lround(
-                fontSize_ * static_cast<double>(dpi) / 72.0)));
-        font_ = CreateFontW(
+                pointSize * static_cast<double>(dpi) / 72.0)));
+
+        const bool narrow = widgetFont && narrowFont_;
+        return CreateFontW(
             height,
             0,
             0,
             0,
-            FW_SEMIBOLD,
+            narrow ? FW_NORMAL : FW_SEMIBOLD,
             FALSE,
             FALSE,
             FALSE,
@@ -1936,7 +1940,148 @@ private:
             CLIP_DEFAULT_PRECIS,
             CLEARTYPE_QUALITY,
             DEFAULT_PITCH | FF_DONTCARE,
-            L"Segoe UI");
+            narrow ? L"Bahnschrift SemiCondensed" : L"Segoe UI");
+    }
+
+    void ReplaceWidgetFont(double pointSize) {
+        HFONT replacement = CreatePointFont(pointSize, true);
+        if (!replacement) return;
+        if (widgetFont_ && widgetFont_ != font_) {
+            DeleteObject(widgetFont_);
+        }
+        widgetFont_ = replacement;
+        effectiveWidgetFontSize_ = pointSize;
+    }
+
+    void RecreateFont() {
+        if (font_) {
+            DeleteObject(font_);
+            font_ = nullptr;
+        }
+        if (widgetFont_) {
+            DeleteObject(widgetFont_);
+            widgetFont_ = nullptr;
+        }
+
+        font_ = CreatePointFont(fontSize_, false);
+        effectiveWidgetFontSize_ = fontSize_;
+        widgetFont_ = CreatePointFont(effectiveWidgetFontSize_, true);
+        if (!widgetFont_) widgetFont_ = font_;
+
+        lastAutoFitWidth_ = -1;
+        lastAutoFitSignature_.clear();
+    }
+
+    int MeasureTextWidth(HDC dc, const std::wstring& text) const {
+        if (!dc || text.empty()) return 0;
+        SIZE size{};
+        GetTextExtentPoint32W(
+            dc,
+            text.c_str(),
+            static_cast<int>(text.size()),
+            &size);
+        return size.cx;
+    }
+
+    std::wstring WidgetFitSignature() const {
+        std::wstring signature = verticalTaskbar_ ? L"V|" : L"H|";
+        signature += FirstLine();
+        signature += L"|";
+        signature += SecondLine();
+        signature += L"|";
+        signature += TaskDurationLine();
+        signature += L"|";
+        if (IsDiffRowVisible()) {
+            if (showDiffFiles_) signature += std::to_wstring(threadMetrics_.changedFiles);
+            signature += std::to_wstring(threadMetrics_.addedLines);
+            signature += std::to_wstring(threadMetrics_.removedLines);
+        }
+        return signature;
+    }
+
+    int MeasureWidgetContentWidth(HDC dc) const {
+        if (!dc) return 0;
+        if (!verticalTaskbar_) {
+            return MeasureTextWidth(dc, HorizontalLine());
+        }
+
+        int widest = 0;
+        widest = std::max(widest, MeasureTextWidth(dc, FirstLine()));
+        widest = std::max(widest, MeasureTextWidth(dc, SecondLine()));
+        widest = std::max(widest, MeasureTextWidth(dc, TaskDurationLine()));
+
+        if (IsDiffRowVisible()) {
+            std::wstring diff;
+            if (showDiffFiles_) diff += std::to_wstring(threadMetrics_.changedFiles);
+            diff += std::to_wstring(threadMetrics_.addedLines);
+            diff += std::to_wstring(threadMetrics_.removedLines);
+            widest = std::max(widest, MeasureTextWidth(dc, diff));
+        }
+        return widest;
+    }
+
+    void UpdateAutoFitFont(int availableWidth) {
+        availableWidth = std::max(1, availableWidth);
+        const std::wstring signature = WidgetFitSignature();
+
+        if (!autoFitFont_) {
+            if (std::abs(effectiveWidgetFontSize_ - fontSize_) > 0.04) {
+                ReplaceWidgetFont(fontSize_);
+            }
+            lastAutoFitWidth_ = availableWidth;
+            lastAutoFitSignature_ = signature;
+            return;
+        }
+
+        if (availableWidth == lastAutoFitWidth_ &&
+            signature == lastAutoFitSignature_) {
+            return;
+        }
+        lastAutoFitWidth_ = availableWidth;
+        lastAutoFitSignature_ = signature;
+
+        HDC dc = GetDC(widgetWindow_);
+        if (!dc) return;
+
+        HFONT baseFont = CreatePointFont(fontSize_, true);
+        if (!baseFont) {
+            ReleaseDC(widgetWindow_, dc);
+            return;
+        }
+
+        HFONT oldFont = static_cast<HFONT>(SelectObject(dc, baseFont));
+        const int baseWidth = MeasureWidgetContentWidth(dc);
+        const int fitWidth = std::max(1, availableWidth - 2);
+        double target = fontSize_;
+
+        if (baseWidth > fitWidth) {
+            const double minimum = std::max(8.0, fontSize_ - 2.0);
+            const double ratio =
+                static_cast<double>(fitWidth) /
+                static_cast<double>(std::max(1, baseWidth));
+            target = std::floor(
+                std::clamp(fontSize_ * ratio, minimum, fontSize_) * 10.0) / 10.0;
+
+            while (target > minimum + 0.04) {
+                HFONT candidate = CreatePointFont(target, true);
+                if (!candidate) break;
+                SelectObject(dc, candidate);
+                const int candidateWidth = MeasureWidgetContentWidth(dc);
+                SelectObject(dc, baseFont);
+                DeleteObject(candidate);
+                if (candidateWidth <= fitWidth) break;
+                target = std::max(minimum, target - 0.1);
+                target = std::round(target * 10.0) / 10.0;
+            }
+        }
+
+        SelectObject(dc, oldFont);
+        DeleteObject(baseFont);
+        ReleaseDC(widgetWindow_, dc);
+
+        if (std::abs(target - effectiveWidgetFontSize_) > 0.04) {
+            ReplaceWidgetFont(target);
+        }
     }
 
     void AddTrayIcon() {
@@ -2052,29 +2197,38 @@ private:
         RECT rebarClient{};
         GetClientRect(rebarWindow_, &rebarClient);
 
-        HDC dc = GetDC(widgetWindow_);
-        HFONT oldFont = dc ? static_cast<HFONT>(SelectObject(dc, font_)) : nullptr;
-        TEXTMETRICW metrics{};
-        if (dc) {
-            GetTextMetricsW(dc, &metrics);
-            if (oldFont) {
-                SelectObject(dc, oldFont);
-            }
-            ReleaseDC(widgetWindow_, dc);
-        }
-
-        const int lineHeight = std::max(14, static_cast<int>(metrics.tmHeight) + 1);
         int width = 0;
-        int height = 0;
-
         if (verticalTaskbar_) {
             width = std::max(40, static_cast<int>(rebarClient.right - rebarClient.left) - 4);
-            height = lineHeight * std::max(1, VisibleRowCount()) + 4;
         } else {
             width = std::max(
                 150,
                 static_cast<int>(std::lround(fontSize_ * 15.0)));
-            height = std::max(24, std::min(static_cast<int>(rebarClient.bottom - rebarClient.top), lineHeight + 6));
+        }
+
+        UpdateAutoFitFont(std::max(1, width - 2));
+
+        HDC dc = GetDC(widgetWindow_);
+        HFONT oldFont = dc ? static_cast<HFONT>(SelectObject(
+            dc,
+            widgetFont_ ? widgetFont_ : font_)) : nullptr;
+        TEXTMETRICW metrics{};
+        if (dc) {
+            GetTextMetricsW(dc, &metrics);
+            if (oldFont) SelectObject(dc, oldFont);
+            ReleaseDC(widgetWindow_, dc);
+        }
+
+        const int lineHeight = std::max(14, static_cast<int>(metrics.tmHeight) + 1);
+        int height = 0;
+        if (verticalTaskbar_) {
+            height = lineHeight * std::max(1, VisibleRowCount()) + 4;
+        } else {
+            height = std::max(
+                24,
+                std::min(
+                    static_cast<int>(rebarClient.bottom - rebarClient.top),
+                    lineHeight + 6));
         }
 
         HWND trafficMonitor = FindDescendantByTitle(taskbarWindow_, kTrafficMonitorTitle);
@@ -2092,10 +2246,11 @@ private:
             }
 
             const int y = std::max(static_cast<int>(rebarClient.top), anchorTop - height - 1);
-            const int x = std::max(0, (static_cast<int>(rebarClient.right - rebarClient.left) - width) / 2);
+            const int x = std::max(
+                0,
+                (static_cast<int>(rebarClient.right - rebarClient.left) - width) / 2);
 
-            // Never resize or reposition the Windows task-list region. This widget is
-            // deliberately overlay-only so a layout mistake cannot hide task buttons.
+            // Never resize or reposition the Windows task-list region.
             SetWindowPos(
                 widgetWindow_,
                 HWND_TOP,
@@ -2112,7 +2267,9 @@ private:
                 x = trayRect.left - width - 2;
             }
             x = std::max(static_cast<int>(rebarClient.left), x);
-            const int y = std::max(static_cast<int>(rebarClient.top), (static_cast<int>(rebarClient.bottom - rebarClient.top) - height) / 2);
+            const int y = std::max(
+                static_cast<int>(rebarClient.top),
+                (static_cast<int>(rebarClient.bottom - rebarClient.top) - height) / 2);
             SetWindowPos(
                 widgetWindow_,
                 HWND_TOP,
