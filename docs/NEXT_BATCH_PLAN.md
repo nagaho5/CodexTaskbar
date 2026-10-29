@@ -1,6 +1,6 @@
 # Next batch plan
 
-This document records the next planned CodexTaskbar batch. It is design-only; no runtime behavior is changed by this document.
+Status: implemented in the v0.3.8 branch / PR #22; real-device validation is still required for taskbar placement, secondary-display reparenting, TrafficMonitor readiness, and SmartScreen/update behavior.
 
 ## 1. Startup taskbar anchoring / TrafficMonitor readiness
 

@@ -23,6 +23,7 @@
 #include <iterator>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <utility>
@@ -47,12 +48,15 @@ constexpr UINT kThreadMetricsMessage = WM_APP + 4;
 constexpr UINT_PTR kTickTimer = 1;
 constexpr UINT_PTR kHoverTimer = 2;
 constexpr UINT_PTR kBlinkTimer = 3;
+constexpr UINT_PTR kAnchorReadyTimer = 4;
 
 constexpr UINT kMenuSettings = 1001;
 constexpr UINT kMenuAutoStart = 1002;
 constexpr UINT kMenuReconnect = 1003;
 constexpr UINT kMenuAbout = 1004;
 constexpr UINT kMenuExit = 1005;
+constexpr UINT kMenuDisplayPrimary = 1050;
+constexpr UINT kMenuDisplaySecondary = 1051;
 constexpr UINT kMenuThreadBase = 1100;
 constexpr UINT kMenuThreadLimit = 50;
 
@@ -82,6 +86,8 @@ constexpr int kComboCacheDisplayMode = 2023;
 constexpr int kCheckShowGenerationSpeed = 2024;
 constexpr int kComboFontChoice = 2025;
 constexpr int kEditSavedThreads = 2026;
+constexpr int kComboGenerationSpeedMode = 2027;
+constexpr int kCheckCompactHourUnderline = 2028;
 
 constexpr COLORREF kDefaultWorkingColor = RGB(79, 195, 247);
 constexpr COLORREF kWarningYellow = RGB(255, 196, 64);
@@ -107,6 +113,17 @@ struct QuotaPayload {
 struct SavedThreadEntry {
     std::wstring name;
     std::wstring id;
+};
+
+struct GenerationSpeedSample {
+    double speed{0.0};
+    std::int64_t intervalMs{0};
+};
+
+struct TaskbarCandidate {
+    HWND window{nullptr};
+    bool primary{false};
+    std::wstring deviceName;
 };
 
 std::vector<SavedThreadEntry> ParseSavedThreads(const std::wstring& value) {
@@ -234,6 +251,52 @@ bool IsCodexDesktopRunning() {
     // minimized, while still hiding it when the window is closed even if
     // ChatGPT.exe/Codex.exe background processes remain alive.
     return FindCodexMainWindow() != nullptr;
+}
+
+std::vector<TaskbarCandidate> EnumerateTaskbars() {
+    std::vector<TaskbarCandidate> result;
+
+    EnumWindows(
+        [](HWND hwnd, LPARAM value) -> BOOL {
+            auto* result =
+                reinterpret_cast<std::vector<TaskbarCandidate>*>(value);
+
+            wchar_t className[128]{};
+            if (!GetClassNameW(
+                    hwnd,
+                    className,
+                    static_cast<int>(std::size(className)))) {
+                return TRUE;
+            }
+
+            const bool taskbarClass =
+                wcscmp(className, L"Shell_TrayWnd") == 0 ||
+                wcscmp(className, L"Shell_SecondaryTrayWnd") == 0;
+            if (!taskbarClass) return TRUE;
+
+            HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL);
+            if (!monitor) return TRUE;
+
+            MONITORINFOEXW info{};
+            info.cbSize = sizeof(info);
+            if (!GetMonitorInfoW(monitor, &info)) return TRUE;
+
+            result->push_back({
+                hwnd,
+                (info.dwFlags & MONITORINFOF_PRIMARY) != 0,
+                info.szDevice});
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&result));
+
+    std::sort(
+        result.begin(),
+        result.end(),
+        [](const TaskbarCandidate& left, const TaskbarCandidate& right) {
+            if (left.primary != right.primary) return left.primary > right.primary;
+            return left.deviceName < right.deviceName;
+        });
+    return result;
 }
 
 HWND FindDescendantByTitle(HWND root, const wchar_t* title) {
@@ -630,6 +693,9 @@ public:
         autoFitFont_ = ReadRegistryDword(L"AutoFitFont", 0) != 0;
         cacheDisplayMode_ = std::clamp(ReadRegistryDword(L"CacheDisplayMode", 0), 0, 3);
         showGenerationSpeed_ = ReadRegistryDword(L"ShowGenerationSpeed", 0) != 0;
+        generationSpeedMode_ = std::clamp(ReadRegistryDword(L"GenerationSpeedMode", 0), 0, 1);
+        compactHourUnderline_ = ReadRegistryDword(L"CompactHourUnderline", 0) != 0;
+        displayTarget_ = std::clamp(ReadRegistryDword(L"DisplayTarget", 0), 0, 1);
         automaticThreadMode_ = ReadRegistryDword(L"AutomaticThreadMode", 0) != 0;
         manualThreadId_ = ReadRegistryString(L"ManualThreadId");
         savedThreads_ = ParseSavedThreads(ReadRegistryString(L"SavedThreads"));
@@ -721,11 +787,7 @@ public:
                 }
 
                 if (running) {
-                    EnsureWidget();
-                    PositionWidget();
-                    ShowWindow(widgetWindow_, SW_SHOWNOACTIVATE);
-                    widgetVisible_ = true;
-                    UpdateBlinkTimer();
+                    BeginAnchorReadiness();
                 } else {
                     HideWidget();
                     quotaValid_ = false;
@@ -744,8 +806,9 @@ public:
         // Taskbar geometry almost never changes. Keep a low-frequency fallback
         // for Explorer/TrafficMonitor changes instead of repositioning every
         // second.
-        if (codexRunning_ && widgetVisible_ && (tickCount_ % 10) == 0) {
-            PositionWidget();
+        if (codexRunning_ && widgetVisible_ && !anchorReadyActive_ &&
+            (tickCount_ % 10) == 0) {
+            PositionWidget(false);
         }
     }
 
@@ -791,25 +854,28 @@ public:
         std::int64_t nowMs) {
         (void)nowMs;
 
-        // Do not start timing at turn/started. Codex can spend a long time
-        // connecting/initializing before real work begins. The canonical Turn
-        // exposes the first work-item timestamp specifically for this boundary.
+        // The rate baseline must be an actually observed pair: quota
+        // percentage + the timestamp of that same quota snapshot. Never pair a
+        // current percentage with a historical task-start timestamp.
         if (!metrics.activeTurn ||
             metrics.firstTurnWorkItemStartedAtMs <= 0 ||
             !quotaValid_ ||
-            !quota_.fiveHour.valid) {
+            !quota_.fiveHour.valid ||
+            lastQuotaSuccessMs_ <= 0 ||
+            lastQuotaSuccessMs_ < metrics.firstTurnWorkItemStartedAtMs) {
             return;
         }
 
         fiveHourRateBaselineValid_ = true;
         fiveHourRateStartRemaining_ = quota_.fiveHour.remainingPercent;
         fiveHourRateResetAtUnix_ = quota_.fiveHour.resetsAtUnix;
-        fiveHourRateStartMs_ = metrics.firstTurnWorkItemStartedAtMs;
+        fiveHourRateStartMs_ = lastQuotaSuccessMs_;
         fiveHourRateThreadId_ = metrics.threadId;
         fiveHourRateTurnId_ = metrics.turnId;
 
-        // A new task has genuinely started doing work. Only now retire the
-        // previous task's frozen final rate.
+        // A new task has now reached real work and CodexTaskbar has observed a
+        // post-work quota snapshot. Only at this matched baseline do we retire
+        // the previous task's frozen final rate.
         fiveHourRateStoredValid_ = false;
     }
 
@@ -851,6 +917,53 @@ public:
         return std::nullopt;
     }
 
+    std::int64_t GenerationGapThresholdMs() const {
+        if (generationSpeedRecent_.size() < 3) {
+            return 5000;
+        }
+
+        std::vector<std::int64_t> intervals;
+        intervals.reserve(generationSpeedRecent_.size());
+        for (const auto& sample : generationSpeedRecent_) {
+            if (sample.intervalMs > 0) {
+                intervals.push_back(sample.intervalMs);
+            }
+        }
+        if (intervals.size() < 3) return 5000;
+
+        std::sort(intervals.begin(), intervals.end());
+        const std::int64_t median =
+            intervals[intervals.size() / 2];
+        return std::max<std::int64_t>(3000, median * 4);
+    }
+
+    std::optional<double> RecentGenerationAverage() const {
+        if (generationSpeedRecent_.size() < 5) {
+            return std::nullopt;
+        }
+
+        std::vector<double> speeds;
+        speeds.reserve(generationSpeedRecent_.size());
+        for (const auto& sample : generationSpeedRecent_) {
+            speeds.push_back(sample.speed);
+        }
+        std::sort(speeds.begin(), speeds.end());
+
+        std::size_t begin = 0;
+        std::size_t end = speeds.size();
+        if (speeds.size() >= 5) {
+            begin = 1;
+            end = speeds.size() - 1;
+        }
+        if (begin >= end) return std::nullopt;
+
+        double sum = 0.0;
+        for (std::size_t i = begin; i < end; ++i) {
+            sum += speeds[i];
+        }
+        return sum / static_cast<double>(end - begin);
+    }
+
     void ApplyThreadMetrics(const ThreadMetrics& metrics) {
         const int oldRows = VisibleRowCount();
         const std::int64_t nowMs = CurrentUnixMilliseconds();
@@ -886,8 +999,6 @@ public:
             generationSpeedTurnId_ = metrics.turnId;
             generationSpeedValid_ = false;
             generationSpeed_ = 0.0;
-            generationSpeedSampleSum_ = 0.0;
-            generationSpeedSampleCount_ = 0;
             generationSpeedRecent_.clear();
             generationSpeedLastOutputTokens_ =
                 metrics.hasTokenUsage ? metrics.outputTokens : 0;
@@ -895,6 +1006,7 @@ public:
         } else if (metrics.activeTurn && metrics.hasTokenUsage) {
             if (metrics.outputTokens < generationSpeedLastOutputTokens_) {
                 generationSpeedValid_ = false;
+                generationSpeedRecent_.clear();
                 generationSpeedLastOutputTokens_ = metrics.outputTokens;
                 generationSpeedLastSampleMs_ = nowMs;
             } else if (metrics.outputTokens > generationSpeedLastOutputTokens_) {
@@ -902,20 +1014,31 @@ public:
                     metrics.outputTokens - generationSpeedLastOutputTokens_;
                 const std::int64_t deltaMs =
                     nowMs - generationSpeedLastSampleMs_;
-                if (deltaMs > 0) {
+                const std::int64_t longGapThreshold =
+                    GenerationGapThresholdMs();
+
+                // Buffered IPC frames can arrive almost back-to-back and create
+                // absurd multi-thousand token/s spikes. Tool/network pauses do
+                // the opposite. Both are baseline-only events.
+                const bool timingValid =
+                    deltaMs >= 250 &&
+                    deltaMs <= longGapThreshold;
+
+                if (timingValid && deltaTokens > 0) {
                     generationSpeed_ =
                         static_cast<double>(deltaTokens) * 1000.0 /
                         static_cast<double>(deltaMs);
                     generationSpeedValid_ = true;
 
-                    generationSpeedSampleSum_ += generationSpeed_;
-                    ++generationSpeedSampleCount_;
-                    generationSpeedRecent_.push_back(generationSpeed_);
-                    if (generationSpeedRecent_.size() > 5) {
+                    generationSpeedRecent_.push_back({
+                        generationSpeed_,
+                        deltaMs});
+                    if (generationSpeedRecent_.size() > 8) {
                         generationSpeedRecent_.erase(
                             generationSpeedRecent_.begin());
                     }
                 }
+
                 generationSpeedLastOutputTokens_ = metrics.outputTokens;
                 generationSpeedLastSampleMs_ = nowMs;
             }
@@ -1241,13 +1364,10 @@ public:
                 } else if (rows[index].kind == 3) {
                     DrawCenteredSegments(dc, row, SecondLineSegments());
                 } else {
-                    SetTextColor(dc, RGB(255, 255, 255));
-                    DrawTextW(
+                    DrawCenteredSegments(
                         dc,
-                        rows[index].text.c_str(),
-                        -1,
-                        &row,
-                        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                        row,
+                        TaskDurationSegments());
                 }
 
                 if (prior) SelectObject(dc, prior);
@@ -1281,9 +1401,9 @@ public:
                 appendGroup(diffSegments);
             }
 
-            const std::wstring duration = TaskDurationLine();
-            if (!duration.empty()) {
-                appendGroup({{duration, RGB(255, 255, 255)}});
+            const auto durationSegments = TaskDurationSegments();
+            if (!durationSegments.empty()) {
+                appendGroup(durationSegments);
             }
 
             const std::wstring wholeLine = HorizontalLine();
@@ -1366,8 +1486,6 @@ public:
 
         generationSpeedValid_ = false;
         generationSpeed_ = 0.0;
-        generationSpeedSampleSum_ = 0.0;
-        generationSpeedSampleCount_ = 0;
         generationSpeedRecent_.clear();
         generationSpeedThreadId_.clear();
         generationSpeedTurnId_.clear();
@@ -1385,6 +1503,20 @@ public:
 
         UpdateTooltipText();
         UpdateTrayTip();
+    }
+
+    void SelectDisplayTarget(int target) {
+        target = std::clamp(target, 0, 1);
+        if (target == 1 && !SecondaryTaskbarAvailable()) return;
+
+        displayTarget_ = target;
+        WriteRegistryDword(
+            L"DisplayTarget",
+            static_cast<DWORD>(displayTarget_));
+
+        if (codexRunning_) {
+            BeginAnchorReadiness();
+        }
     }
 
     void ShowContextMenu() {
@@ -1445,6 +1577,35 @@ public:
             AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         }
 
+        HMENU displayMenu = CreatePopupMenu();
+        if (displayMenu) {
+            MENUINFO childInfo{};
+            childInfo.cbSize = sizeof(childInfo);
+            childInfo.fMask = MIM_BACKGROUND;
+            childInfo.hbrBack = darkMenuBrush_;
+            SetMenuInfo(displayMenu, &childInfo);
+
+            AppendMenuW(
+                displayMenu,
+                MF_OWNERDRAW |
+                    (displayTarget_ == 0 ? MF_CHECKED : MF_UNCHECKED),
+                kMenuDisplayPrimary,
+                reinterpret_cast<LPCWSTR>(L"主屏"));
+            AppendMenuW(
+                displayMenu,
+                MF_OWNERDRAW |
+                    (displayTarget_ == 1 ? MF_CHECKED : MF_UNCHECKED) |
+                    (SecondaryTaskbarAvailable() ? MF_ENABLED : MF_GRAYED),
+                kMenuDisplaySecondary,
+                reinterpret_cast<LPCWSTR>(L"副屏"));
+
+            AppendMenuW(
+                menu,
+                MF_POPUP | MF_OWNERDRAW,
+                reinterpret_cast<UINT_PTR>(displayMenu),
+                reinterpret_cast<LPCWSTR>(L"显示位置  ▶"));
+            AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        }
 
         AppendMenuW(
             menu,
@@ -1495,13 +1656,9 @@ public:
 
     void HandleTaskbarCreated() {
         AddTrayIcon();
-        taskbarWindow_ = nullptr;
-        rebarWindow_ = nullptr;
+        ResetTaskbarHandles();
         if (codexRunning_) {
-            EnsureWidget();
-            PositionWidget();
-            ShowWindow(widgetWindow_, SW_SHOWNOACTIVATE);
-            widgetVisible_ = true;
+            BeginAnchorReadiness();
         }
     }
 
@@ -1597,6 +1754,25 @@ public:
         checkbox(kCheckShowTaskDuration, L"任务耗时", 24, 256, showTaskDuration_, 130);
         checkbox(kCheckShowGenerationSpeed, L"生成速度", 164, 256, showGenerationSpeed_, 130);
 
+        CreateWindowW(L"STATIC", L"速度显示：", WS_CHILD | WS_VISIBLE,
+            24, 292, 80, 24, hwnd, nullptr, instance_, nullptr);
+        HWND speedMode = CreateWindowExW(
+            WS_EX_CLIENTEDGE, L"COMBOBOX", nullptr,
+            WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+            106, 287, 180, 120, hwnd,
+            reinterpret_cast<HMENU>(
+                static_cast<INT_PTR>(kComboGenerationSpeedMode)),
+            instance_, nullptr);
+        SendMessageW(
+            speedMode, CB_ADDSTRING, 0,
+            reinterpret_cast<LPARAM>(L"实时速度"));
+        SendMessageW(
+            speedMode, CB_ADDSTRING, 0,
+            reinterpret_cast<LPARAM>(L"最近平均"));
+        SendMessageW(
+            speedMode, CB_SETCURSEL,
+            static_cast<WPARAM>(generationSpeedMode_), 0);
+
         // Right column: presentation and alert behavior.
         CreateWindowW(L"STATIC", L"显示样式与提醒", WS_CHILD | WS_VISIBLE,
             400, 62, 200, 24, hwnd, nullptr, instance_, nullptr);
@@ -1638,58 +1814,63 @@ public:
         SendMessageW(cacheMode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"90+紧凑"));
         SendMessageW(cacheMode, CB_SETCURSEL, static_cast<WPARAM>(cacheDisplayMode_), 0);
 
+        checkbox(
+            kCheckCompactHourUnderline,
+            L"小时用下划线压缩",
+            400, 322, compactHourUnderline_, 250);
+
         // Session section spans the whole lower half.
         CreateWindowW(L"STATIC", L"会话来源", WS_CHILD | WS_VISIBLE,
-            24, 338, 180, 24, hwnd, nullptr, instance_, nullptr);
+            24, 350, 180, 24, hwnd, nullptr, instance_, nullptr);
 
         HWND manualRadio = CreateWindowW(
             L"BUTTON", L"手动绑定 Thread ID",
             WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON | WS_GROUP,
-            24, 364, 220, 24, hwnd,
+            24, 376, 220, 24, hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kRadioManualThread)), instance_, nullptr);
         HWND autoRadio = CreateWindowW(
             L"BUTTON", L"自动跟随活动任务（实验）",
             WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON,
-            270, 364, 250, 24, hwnd,
+            270, 376, 250, 24, hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kRadioAutoThread)), instance_, nullptr);
         SendMessageW(manualRadio, BM_SETCHECK, automaticThreadMode_ ? BST_UNCHECKED : BST_CHECKED, 0);
         SendMessageW(autoRadio, BM_SETCHECK, automaticThreadMode_ ? BST_CHECKED : BST_UNCHECKED, 0);
 
         CreateWindowW(L"STATIC", L"当前 Thread ID：", WS_CHILD | WS_VISIBLE,
-            24, 400, 112, 24, hwnd, nullptr, instance_, nullptr);
+            24, 412, 112, 24, hwnd, nullptr, instance_, nullptr);
         CreateWindowExW(
             WS_EX_CLIENTEDGE, L"EDIT", manualThreadId_.c_str(),
             WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-            138, 396, 600, 28, hwnd,
+            138, 408, 600, 28, hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kEditThreadId)), instance_, nullptr);
 
         CreateWindowW(
             L"STATIC",
             L"保存的对话（供右键“选择对话”使用；每行：名称|Thread ID）：",
             WS_CHILD | WS_VISIBLE,
-            24, 438, 620, 24, hwnd, nullptr, instance_, nullptr);
+            24, 450, 620, 24, hwnd, nullptr, instance_, nullptr);
         const std::wstring savedText = SerializeSavedThreads(savedThreads_);
         CreateWindowExW(
             WS_EX_CLIENTEDGE, L"EDIT", savedText.c_str(),
             WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL,
-            24, 464, 714, 104, hwnd,
+            24, 476, 714, 104, hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kEditSavedThreads)), instance_, nullptr);
 
         CreateWindowW(
             L"STATIC",
             L"右键“选择对话”会在右侧展开保存清单；切换时只跟踪选中的一个 Thread，其它保存项不产生后台开销。",
             WS_CHILD | WS_VISIBLE,
-            24, 574, 714, 42, hwnd, nullptr, instance_, nullptr);
+            24, 586, 714, 42, hwnd, nullptr, instance_, nullptr);
 
-        checkbox(kCheckAutoStart, L"开机自动启动", 24, 618, autoStart_, 180);
+        checkbox(kCheckAutoStart, L"开机自动启动", 24, 630, autoStart_, 180);
 
         CreateWindowW(
             L"BUTTON", L"确定", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            574, 614, 78, 30, hwnd,
+            574, 626, 78, 30, hwnd,
             reinterpret_cast<HMENU>(IDOK), instance_, nullptr);
         CreateWindowW(
             L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            660, 614, 78, 30, hwnd,
+            660, 626, 78, 30, hwnd,
             reinterpret_cast<HMENU>(IDCANCEL), instance_, nullptr);
 
         EnumChildWindows(
@@ -1866,6 +2047,8 @@ public:
         showDiffFiles_ = checked(kCheckShowDiffFiles);
         showTaskDuration_ = checked(kCheckShowTaskDuration);
         showGenerationSpeed_ = checked(kCheckShowGenerationSpeed);
+        compactHourUnderline_ =
+            checked(kCheckCompactHourUnderline);
         workingColor_ = pendingWorkingColor_;
         contextWarningColors_ = checked(kCheckContextWarningColors);
         quotaWarningColors_ = checked(kCheckQuotaWarningColors);
@@ -1885,6 +2068,17 @@ public:
         cacheDisplayMode_ = cacheSelection == CB_ERR
             ? 0
             : std::clamp(static_cast<int>(cacheSelection), 0, 3);
+
+        const LRESULT speedSelection =
+            SendDlgItemMessageW(
+                hwnd,
+                kComboGenerationSpeedMode,
+                CB_GETCURSEL,
+                0,
+                0);
+        generationSpeedMode_ = speedSelection == CB_ERR
+            ? 0
+            : std::clamp(static_cast<int>(speedSelection), 0, 1);
 
         const bool previousAutomaticMode = automaticThreadMode_;
         automaticThreadMode_ = checked(kRadioAutoThread);
@@ -1919,6 +2113,12 @@ public:
         WriteRegistryDword(L"ShowDiffFiles", showDiffFiles_ ? 1u : 0u);
         WriteRegistryDword(L"ShowTaskDuration", showTaskDuration_ ? 1u : 0u);
         WriteRegistryDword(L"ShowGenerationSpeed", showGenerationSpeed_ ? 1u : 0u);
+        WriteRegistryDword(
+            L"GenerationSpeedMode",
+            static_cast<DWORD>(generationSpeedMode_));
+        WriteRegistryDword(
+            L"CompactHourUnderline",
+            compactHourUnderline_ ? 1u : 0u);
         WriteRegistryDword(L"WorkingColor", static_cast<DWORD>(workingColor_));
         WriteRegistryDword(L"ContextWarningColors", contextWarningColors_ ? 1u : 0u);
         WriteRegistryDword(L"QuotaWarningColors", quotaWarningColors_ ? 1u : 0u);
@@ -2005,7 +2205,17 @@ private:
                 app->UpdateWaitingInputBlink();
                 return 0;
             }
+            if (app && wParam == kAnchorReadyTimer) {
+                app->TryAnchorReadiness();
+                return 0;
+            }
             break;
+
+        case WM_DISPLAYCHANGE:
+            if (app && app->codexRunning_) {
+                app->BeginAnchorReadiness();
+            }
+            return 0;
 
         case kTrayMessage:
             if (app) {
@@ -2055,6 +2265,7 @@ private:
             KillTimer(hwnd, kTickTimer);
             KillTimer(hwnd, kHoverTimer);
             KillTimer(hwnd, kBlinkTimer);
+            KillTimer(hwnd, kAnchorReadyTimer);
             PostQuitMessage(0);
             return 0;
         }
@@ -2551,18 +2762,62 @@ private:
         Shell_NotifyIconW(NIM_MODIFY, &data);
     }
 
-    void EnsureWidget() {
-        taskbarWindow_ = FindWindowW(L"Shell_TrayWnd", nullptr);
-        if (!taskbarWindow_) {
-            return;
+    TaskbarCandidate ResolveTaskbarCandidate() const {
+        const auto candidates = EnumerateTaskbars();
+        if (candidates.empty()) return {};
+
+        if (displayTarget_ == 1) {
+            for (const auto& candidate : candidates) {
+                if (!candidate.primary) return candidate;
+            }
         }
 
-        rebarWindow_ = FindWindowExW(taskbarWindow_, nullptr, L"ReBarWindow32", nullptr);
-        if (!rebarWindow_) {
-            rebarWindow_ = FindWindowExW(taskbarWindow_, nullptr, L"WorkerW", nullptr);
+        for (const auto& candidate : candidates) {
+            if (candidate.primary) return candidate;
         }
-        if (!rebarWindow_) {
-            rebarWindow_ = taskbarWindow_;
+        return candidates.front();
+    }
+
+    bool SecondaryTaskbarAvailable() const {
+        const auto candidates = EnumerateTaskbars();
+        return std::any_of(
+            candidates.begin(),
+            candidates.end(),
+            [](const TaskbarCandidate& candidate) {
+                return !candidate.primary;
+            });
+    }
+
+    void ResetTaskbarHandles() {
+        taskbarWindow_ = nullptr;
+        rebarWindow_ = nullptr;
+        activeTaskbarDevice_.clear();
+    }
+
+    void EnsureWidget() {
+        const TaskbarCandidate target = ResolveTaskbarCandidate();
+        if (!target.window) return;
+
+        const bool taskbarChanged =
+            taskbarWindow_ != target.window ||
+            activeTaskbarDevice_ != target.deviceName;
+        taskbarWindow_ = target.window;
+        activeTaskbarDevice_ = target.deviceName;
+
+        if (taskbarChanged) {
+            rebarWindow_ = nullptr;
+        }
+
+        if (!rebarWindow_ || !IsWindow(rebarWindow_)) {
+            rebarWindow_ =
+                FindWindowExW(taskbarWindow_, nullptr, L"ReBarWindow32", nullptr);
+            if (!rebarWindow_) {
+                rebarWindow_ =
+                    FindWindowExW(taskbarWindow_, nullptr, L"WorkerW", nullptr);
+            }
+            if (!rebarWindow_) {
+                rebarWindow_ = taskbarWindow_;
+            }
         }
 
         bool dpiContextChanged = false;
@@ -2586,31 +2841,31 @@ private:
             dpiContextChanged = true;
         }
 
-        // SetParent can move a PerMonitorV2 child into Explorer's DPI context.
-        // Rebuild the font only after the widget has its final taskbar parent.
         if (dpiContextChanged) {
             RecreateFont();
         }
-
     }
 
-    void PositionWidget() {
+    bool PositionWidget(bool requireTrafficMonitor = false) {
         EnsureWidget();
-        if (!widgetWindow_ || !rebarWindow_) {
-            return;
+        if (!widgetWindow_ || !rebarWindow_ || !taskbarWindow_) {
+            return false;
         }
 
         RECT taskbarRect{};
         GetWindowRect(taskbarWindow_, &taskbarRect);
         verticalTaskbar_ =
-            (taskbarRect.bottom - taskbarRect.top) > (taskbarRect.right - taskbarRect.left);
+            (taskbarRect.bottom - taskbarRect.top) >
+            (taskbarRect.right - taskbarRect.left);
 
         RECT rebarClient{};
         GetClientRect(rebarWindow_, &rebarClient);
 
         int width = 0;
         if (verticalTaskbar_) {
-            width = std::max(40, static_cast<int>(rebarClient.right - rebarClient.left) - 4);
+            width = std::max(
+                40,
+                static_cast<int>(rebarClient.right - rebarClient.left) - 4);
         } else {
             width = std::max(
                 150,
@@ -2628,38 +2883,49 @@ private:
             ReleaseDC(widgetWindow_, dc);
         }
 
-        const int lineHeight = std::max(14, static_cast<int>(metrics.tmHeight) + 1);
+        const int lineHeight =
+            std::max(14, static_cast<int>(metrics.tmHeight) + 1);
         int height = 0;
         if (verticalTaskbar_) {
-            height = lineHeight * std::max(1, VisibleRowCount()) + 4;
+            height =
+                lineHeight * std::max(1, VisibleRowCount()) + 4;
         } else {
             height = std::max(
                 24,
                 std::min(
-                    static_cast<int>(rebarClient.bottom - rebarClient.top),
+                    static_cast<int>(
+                        rebarClient.bottom - rebarClient.top),
                     lineHeight + 6));
         }
 
-        HWND trafficMonitor = FindDescendantByTitle(taskbarWindow_, kTrafficMonitorTitle);
-        HWND trayNotify = FindDescendantByClass(taskbarWindow_, L"TrayNotifyWnd");
+        HWND trafficMonitor =
+            FindDescendantByTitle(taskbarWindow_, kTrafficMonitorTitle);
+        HWND trayNotify =
+            FindDescendantByClass(taskbarWindow_, L"TrayNotifyWnd");
 
         if (verticalTaskbar_) {
-            int anchorTop = rebarClient.bottom;
+            if (requireTrafficMonitor && !trafficMonitor) {
+                return false;
+            }
 
+            int anchorTop = rebarClient.bottom;
             HWND anchor = trafficMonitor ? trafficMonitor : trayNotify;
             if (anchor) {
                 RECT anchorRect{};
                 GetWindowRect(anchor, &anchorRect);
-                anchorRect = ScreenRectToClient(rebarWindow_, anchorRect);
+                anchorRect =
+                    ScreenRectToClient(rebarWindow_, anchorRect);
                 anchorTop = anchorRect.top;
             }
 
-            const int y = std::max(static_cast<int>(rebarClient.top), anchorTop - height - 1);
+            const int y = std::max(
+                static_cast<int>(rebarClient.top),
+                anchorTop - height - 1);
             const int x = std::max(
                 0,
-                (static_cast<int>(rebarClient.right - rebarClient.left) - width) / 2);
+                (static_cast<int>(
+                    rebarClient.right - rebarClient.left) - width) / 2);
 
-            // Never resize or reposition the Windows task-list region.
             SetWindowPos(
                 widgetWindow_,
                 HWND_TOP,
@@ -2672,13 +2938,15 @@ private:
             RECT trayRect{};
             int x = rebarClient.right - width - 2;
             if (trayNotify && GetWindowRect(trayNotify, &trayRect)) {
-                trayRect = ScreenRectToClient(rebarWindow_, trayRect);
+                trayRect =
+                    ScreenRectToClient(rebarWindow_, trayRect);
                 x = trayRect.left - width - 2;
             }
             x = std::max(static_cast<int>(rebarClient.left), x);
             const int y = std::max(
                 static_cast<int>(rebarClient.top),
-                (static_cast<int>(rebarClient.bottom - rebarClient.top) - height) / 2);
+                (static_cast<int>(
+                    rebarClient.bottom - rebarClient.top) - height) / 2);
             SetWindowPos(
                 widgetWindow_,
                 HWND_TOP,
@@ -2690,6 +2958,51 @@ private:
         }
 
         InvalidateWidget();
+        return true;
+    }
+
+    void StopAnchorReadiness() {
+        if (mainWindow_) {
+            KillTimer(mainWindow_, kAnchorReadyTimer);
+        }
+        anchorReadyActive_ = false;
+    }
+
+    void TryAnchorReadiness() {
+        if (!anchorReadyActive_ || !codexRunning_) return;
+
+        if (PositionWidget(true)) {
+            StopAnchorReadiness();
+            ShowWindow(widgetWindow_, SW_SHOWNOACTIVATE);
+            widgetVisible_ = true;
+            UpdateBlinkTimer();
+            return;
+        }
+
+        if (GetTickCount64() >= anchorReadyDeadline_) {
+            PositionWidget(false);
+            StopAnchorReadiness();
+            if (widgetWindow_) {
+                ShowWindow(widgetWindow_, SW_SHOWNOACTIVATE);
+                widgetVisible_ = true;
+                UpdateBlinkTimer();
+            }
+        }
+    }
+
+    void BeginAnchorReadiness() {
+        StopAnchorReadiness();
+        ResetTaskbarHandles();
+
+        if (widgetWindow_ && IsWindow(widgetWindow_)) {
+            ShowWindow(widgetWindow_, SW_HIDE);
+        }
+        widgetVisible_ = false;
+
+        anchorReadyActive_ = true;
+        anchorReadyDeadline_ = GetTickCount64() + 5000;
+        SetTimer(mainWindow_, kAnchorReadyTimer, 200, nullptr);
+        TryAnchorReadiness();
     }
 
     void HideWidget() {
@@ -2764,24 +3077,100 @@ private:
 
     std::wstring GenerationSpeedText() const {
         if (!generationSpeedValid_) return L"--";
+
+        double value = generationSpeed_;
+        if (generationSpeedMode_ == 1) {
+            if (const auto average = RecentGenerationAverage()) {
+                value = *average;
+            }
+        }
+
         wchar_t text[32]{};
-        swprintf_s(text, L"%.1f", generationSpeed_);
+        swprintf_s(text, L"%.1f", value);
         return text;
     }
 
-    std::wstring TaskDurationLine() const {
-        if (!threadMetrics_.activeTurn) return {};
+    std::vector<ColoredSegment> TaskDurationSegments() const {
+        std::vector<ColoredSegment> segments;
+        if (!threadMetrics_.activeTurn) return segments;
 
-        std::wstring line;
         if (showTaskDuration_) {
             const std::int64_t durationMs = CurrentTaskDurationMs();
-            line = durationUnits_
-                ? FormatDurationUnits(durationMs)
-                : FormatDurationCompact(durationMs);
+            const std::int64_t totalSeconds =
+                durationMs >= 0 ? durationMs / 1000 : -1;
+            const std::int64_t hours =
+                totalSeconds >= 0 ? totalSeconds / 3600 : -1;
+            const std::int64_t minutes =
+                totalSeconds >= 0 ? (totalSeconds / 60) % 60 : -1;
+            const std::int64_t seconds =
+                totalSeconds >= 0 ? totalSeconds % 60 : -1;
+
+            if (compactHourUnderline_ &&
+                hours >= 1 &&
+                hours <= 2 &&
+                minutes >= 0 &&
+                seconds >= 0) {
+                wchar_t secondsText[8]{};
+                swprintf_s(
+                    secondsText,
+                    L"%02lld",
+                    static_cast<long long>(seconds));
+
+                if (durationUnits_) {
+                    segments.push_back({
+                        std::to_wstring(minutes),
+                        RGB(255, 255, 255),
+                        hours == 1});
+                    segments.push_back({
+                        L"m",
+                        RGB(255, 255, 255)});
+                    segments.push_back({
+                        secondsText,
+                        RGB(255, 255, 255),
+                        hours == 2});
+                } else {
+                    segments.push_back({
+                        std::to_wstring(minutes),
+                        RGB(255, 255, 255),
+                        hours == 1});
+                    segments.push_back({
+                        L":",
+                        RGB(255, 255, 255)});
+                    segments.push_back({
+                        secondsText,
+                        RGB(255, 255, 255),
+                        hours == 2});
+                }
+            } else {
+                const std::wstring durationText = durationUnits_
+                    ? FormatDurationUnits(durationMs)
+                    : FormatDurationCompact(durationMs);
+                if (!durationText.empty()) {
+                    segments.push_back({
+                        durationText,
+                        RGB(255, 255, 255)});
+                }
+            }
         }
+
         if (showGenerationSpeed_) {
-            if (!line.empty()) line.push_back(L' ');
-            line += GenerationSpeedText();
+            if (!segments.empty()) {
+                segments.push_back({
+                    L" ",
+                    RGB(255, 255, 255)});
+            }
+            segments.push_back({
+                GenerationSpeedText(),
+                RGB(255, 255, 255)});
+        }
+
+        return segments;
+    }
+
+    std::wstring TaskDurationLine() const {
+        std::wstring line;
+        for (const auto& segment : TaskDurationSegments()) {
+            line += segment.text;
         }
         return line;
     }
@@ -3108,17 +3497,16 @@ private:
             text += L"暂无";
         }
 
-        text += L"\r\n本轮平均：";
-        if (generationSpeedSampleCount_ > 0) {
+        text += L"\r\n最近平均：";
+        if (const auto averageValue = RecentGenerationAverage()) {
             wchar_t average[32]{};
             swprintf_s(
                 average,
                 L"%.1f token/s",
-                generationSpeedSampleSum_ /
-                    static_cast<double>(generationSpeedSampleCount_));
+                *averageValue);
             text += average;
         } else {
-            text += L"暂无";
+            text += L"样本不足";
         }
 
         text += L"\r\n最近速度：";
@@ -3126,7 +3514,10 @@ private:
             for (std::size_t i = 0; i < generationSpeedRecent_.size(); ++i) {
                 if (i > 0) text += L" / ";
                 wchar_t sample[24]{};
-                swprintf_s(sample, L"%.1f", generationSpeedRecent_[i]);
+                swprintf_s(
+                    sample,
+                    L"%.1f",
+                    generationSpeedRecent_[i].speed);
                 text += sample;
             }
         } else {
@@ -3241,6 +3632,14 @@ private:
             OpenSettings();
             break;
 
+        case kMenuDisplayPrimary:
+            SelectDisplayTarget(0);
+            break;
+
+        case kMenuDisplaySecondary:
+            SelectDisplayTarget(1);
+            break;
+
         case kMenuAutoStart:
             autoStart_ = !autoStart_;
             WriteRegistryDword(L"AutoStart", autoStart_ ? 1u : 0u);
@@ -3254,7 +3653,7 @@ private:
         case kMenuAbout:
             MessageBoxW(
                 mainWindow_,
-                L"CodexTaskbar v0.3.7\n\n"
+                L"CodexTaskbar v0.3.8\n\n"
                 L"在 Windows 10 任务栏显示 Codex 配额、绑定会话上下文/缓存和本轮代码改动。\n"
                 L"配额来自官方 app-server；会话指标通过只读 Codex Desktop IPC follower 获取。",
                 L"关于 CodexTaskbar",
@@ -3379,6 +3778,10 @@ private:
             reconnectRequested_ = true;
         }
         quotaValid_ = false;
+        // A manual reconnect starts a new observation interval. Preserve the
+        // previous final value in hover, but require a fresh matched quota/time
+        // pair before reporting a new live 5h rate.
+        fiveHourRateBaselineValid_ = false;
         if (threadMonitor_) {
             threadMonitor_->UpdateConfig(WideToUtf8(manualThreadId_), automaticThreadMode_);
         }
@@ -3393,6 +3796,9 @@ private:
     HWND taskbarWindow_{nullptr};
     HWND rebarWindow_{nullptr};
     HWND hoverWindow_{nullptr};
+    std::wstring activeTaskbarDevice_;
+    bool anchorReadyActive_{false};
+    ULONGLONG anchorReadyDeadline_{0};
     HFONT font_{nullptr};
     HFONT widgetFont_{nullptr};
     HBRUSH darkBackgroundBrush_{nullptr};
@@ -3433,6 +3839,9 @@ private:
     bool autoFitFont_{false};
     int cacheDisplayMode_{0};
     bool showGenerationSpeed_{false};
+    int generationSpeedMode_{0};
+    bool compactHourUnderline_{false};
+    int displayTarget_{0};
     bool automaticThreadMode_{false};
     double fontSize_{10.0};
     std::array<RowFitCache, 5> rowFitCaches_{};
@@ -3445,9 +3854,7 @@ private:
 
     bool generationSpeedValid_{false};
     double generationSpeed_{0.0};
-    double generationSpeedSampleSum_{0.0};
-    std::size_t generationSpeedSampleCount_{0};
-    std::vector<double> generationSpeedRecent_;
+    std::vector<GenerationSpeedSample> generationSpeedRecent_;
     std::int64_t generationSpeedLastOutputTokens_{0};
     std::int64_t generationSpeedLastSampleMs_{0};
     std::string generationSpeedThreadId_;
