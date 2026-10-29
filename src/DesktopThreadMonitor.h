@@ -32,6 +32,10 @@ struct ThreadMetrics {
     std::int64_t inputTokens{0};
     std::int64_t cachedInputTokens{0};
 
+    bool hasTokenUsage{false};
+    std::int64_t totalTokens{0};
+    std::int64_t outputTokens{0};
+
     bool hasTurnTiming{false};
     std::int64_t turnStartedAtMs{0};
     std::int64_t turnDurationMs{-1};
