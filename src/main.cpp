@@ -847,12 +847,10 @@ public:
         fiveHourRateResetAtUnix_ = 0;
         fiveHourRateThreadId_ = metrics.threadId;
 
-        // Reuse the latest quota snapshot only when it was actually observed
-        // after this task began. Otherwise wait for the next normal quota read.
-        if (quotaValid_ &&
-            quota_.fiveHour.valid &&
-            metrics.turnStartedAtMs > 0 &&
-            lastQuotaSuccessMs_ >= metrics.turnStartedAtMs) {
+        // Seed the task with the currently displayed 5h quota value. This
+        // makes the next normal quota refresh enough to produce a live rate,
+        // while all later samples still come from the task's active period.
+        if (quotaValid_ && quota_.fiveHour.valid) {
             ObserveFiveHourQuota(quota_);
         }
     }
@@ -939,6 +937,7 @@ public:
         const bool taskNowActive = metrics.activeTurn;
         const bool rateThreadChanged =
             !fiveHourRateThreadId_.empty() &&
+            !metrics.threadId.empty() &&
             metrics.threadId != fiveHourRateThreadId_;
 
         // Finalize the task that just ended (or the previously selected active
