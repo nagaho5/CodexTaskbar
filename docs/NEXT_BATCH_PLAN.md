@@ -211,7 +211,7 @@ No extra polling/request requirement:
 - If no post-work/attach quota snapshot is available yet, show no live estimate and retain the previous final value where applicable.
 
 
-## 7. Mid-task startup optimization for the v0.3.11 5h-rate model
+## 7. Mid-task startup optimization for the v0.3.11 5h-rate model (implemented in v0.3.12)
 
 Current v0.3.11 behavior:
 
@@ -236,10 +236,10 @@ Required optimization:
 - If the 5h quota window rolls over during the task, establish a new matched remaining-percentage/task-duration pair for the new window.
 - No extra quota polling is required; reuse the existing quota snapshots.
 
-This is an optimization item only; do not implement it until separately scheduled.
+Status: implemented in v0.3.12; real-device validation still required.
 
 
-## 8. Hover popup: show 5h-rate calculation details
+## 8. Hover popup: show 5h-rate calculation details (implemented in v0.3.12)
 
 Goal:
 
@@ -258,7 +258,7 @@ Preferred compact presentation:
 - When showing the frozen previous-task rate, retain the corresponding frozen consumed percentage and duration so the calculation details remain meaningful after task completion.
 - Keep the wording compact; do not add another hover row just for the calculation details unless width/legibility testing proves necessary.
 
-## 9. Hover popup: show 7-day quota reset time
+## 9. Hover popup: show 7-day quota reset time (implemented in v0.3.12)
 
 Goal:
 
@@ -271,4 +271,4 @@ Goal:
 - If the 7-day quota is valid but its reset timestamp is unavailable/invalid, keep the percentage and omit or gracefully mark the reset-time portion rather than hiding the whole row.
 - This is hover-only display work; it must not add extra quota polling or requests.
 
-These are display optimization items only; do not implement them until separately scheduled.
+Status: implemented in v0.3.12; real-device validation still required.
