@@ -2769,9 +2769,33 @@ private:
                 ? app->HoverHitTest(hwnd, lParam)
                 : HTTRANSPARENT;
 
+        case WM_SETCURSOR:
+            if (app && app->HandleHoverSetCursor(hwnd)) {
+                return TRUE;
+            }
+            break;
+
+        case WM_LBUTTONDOWN:
+            if (app && app->HandleHoverLeftButtonDown(hwnd, lParam)) {
+                return 0;
+            }
+            break;
+
+        case WM_MOUSEMOVE:
+            if (app && app->HandleHoverMouseMove(hwnd)) {
+                return 0;
+            }
+            break;
+
         case WM_LBUTTONUP:
             if (app && app->HandleHoverLeftButtonUp(hwnd, lParam)) {
                 return 0;
+            }
+            break;
+
+        case WM_CAPTURECHANGED:
+            if (app) {
+                app->HandleHoverCaptureChanged();
             }
             break;
         }
@@ -4699,7 +4723,6 @@ private:
         if (hoverPopupVisible_ &&
             hoverWindow_ &&
             IsWindow(hoverWindow_)) {
-            FitVisibleHoverPopup();
             InvalidateRect(hoverWindow_, nullptr, FALSE);
         }
     }
