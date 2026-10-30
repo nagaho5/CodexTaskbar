@@ -1,3 +1,3 @@
-tag=v0.3.16
-source_commit=c0247f31cd500082870b24b86297e36bc35b6813
-reason=fit hover content naturally, preserve pinned aspect ratio, and show conversation names
+tag=v0.3.17
+source_commit=9a5cc264008807696f525a52d3ae2431000a8a9f
+reason=keep 5h estimates sticky, stabilize pinned 5h rows, and add precise reset countdown
