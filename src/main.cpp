@@ -3953,7 +3953,9 @@ private:
                     static_cast<int>(segment.text.size()),
                     &size);
                 widestSegment =
-                    std::max(widestSegment, size.cx);
+                    std::max(
+                        widestSegment,
+                        static_cast<int>(size.cx));
             }
         }
 
