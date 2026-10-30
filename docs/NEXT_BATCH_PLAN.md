@@ -345,3 +345,27 @@ Implemented fix:
 - No new timers, quota reads, Desktop IPC reads or background polling were added.
 
 Status: implemented in v0.3.16; real-device validation is required for the natural-size choice, full-content visibility, and proportional edge/corner drag feel.
+
+
+## 13. Sticky per-task 5h estimate and pinned-row stability (implemented in v0.3.17)
+
+Failure observed on v0.3.16:
+
+- A long active task could suddenly show `5h消耗速度（估算）：暂无`, then reappear minutes later as a fresh near-zero interval such as `0%/1分13秒`.
+- The pinned popup's 5h-rate row could alternate between one and two visual rows as live values changed by a few characters.
+
+Implemented rules:
+
+- Once a task starts tracking 5h quota, its observed max/min history is sticky for that logical task.
+- A small change in the backend 5h `resetsAtUnix` timestamp no longer resets samples.
+- One valid 5h snapshot is sufficient: after elapsed time starts advancing, the estimate can show `0.000%/分钟` instead of waiting for a second quota sample.
+- If the latest quota refresh fails, a new task can seed from the last known valid 5h snapshot rather than starting as unavailable.
+- While a task is active, temporary task-duration regressions are ignored; the denominator uses the monotonic last-known active duration.
+- A same-thread task reset based on duration is accepted only after an actual idle -> active boundary and a clearly smaller duration. This prevents one bad active IPC frame from clearing the round.
+- A true 5h-window rollover does not clear the task. Consumption from the completed quota-window segment is banked, then the new window continues under the original task-duration baseline.
+- Hover keeps displaying the last known 5h/7d quota snapshot during a temporary quota-refresh failure; connection health remains visible separately.
+- The pinned natural-layout calculation reserves extra width for the dynamic 5h status/rate rows so changing seconds/percentages do not sit on the one-line/two-line boundary.
+- 5h reset display now includes a live precise countdown: `恢复 HH:MM（x时x分xx秒）`.
+- No new polling, quota requests, timers, Desktop IPC reads, or disk I/O were added.
+
+Status: implemented in v0.3.17; real-device validation should focus on long-task 5h continuity and pinned 5h-row wrapping stability.
