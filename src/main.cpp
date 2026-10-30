@@ -4142,21 +4142,77 @@ private:
 
         UpdateTooltipText();
 
-        const int width = pinHover_
-            ? hoverPinnedWidth_
-            : kHoverDefaultWidth;
-        const int height = pinHover_
-            ? hoverPinnedHeight_
-            : kHoverDefaultHeight;
-        RecreateHoverFontForSize(width, height);
-
-        MONITORINFO monitorInfo{};
-        monitorInfo.cbSize = sizeof(monitorInfo);
         HMONITOR monitor =
             MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO monitorInfo{};
+        monitorInfo.cbSize = sizeof(monitorInfo);
         if (!GetMonitorInfoW(monitor, &monitorInfo)) {
             return false;
         }
+
+        const HoverLayout natural =
+            CalculateNaturalHoverLayout(
+                monitor,
+                pinHover_);
+
+        int width = natural.width;
+        int height = natural.height;
+
+        if (pinHover_) {
+            if (!hoverPinnedBaseValid_) {
+                hoverPinnedBaseWidth_ = natural.width;
+                hoverPinnedBaseHeight_ = natural.height;
+                hoverPinnedBaseValid_ =
+                    hoverPinnedBaseWidth_ > 0 &&
+                    hoverPinnedBaseHeight_ > 0;
+            }
+
+            if (hoverPinnedBaseValid_) {
+                const int workWidth = std::max(
+                    1,
+                    static_cast<int>(
+                        monitorInfo.rcWork.right -
+                        monitorInfo.rcWork.left) - 8);
+                const int workHeight = std::max(
+                    1,
+                    static_cast<int>(
+                        monitorInfo.rcWork.bottom -
+                        monitorInfo.rcWork.top) - 8);
+
+                const double screenMaxScale = std::min(
+                    static_cast<double>(workWidth) /
+                        static_cast<double>(
+                            hoverPinnedBaseWidth_),
+                    static_cast<double>(workHeight) /
+                        static_cast<double>(
+                            hoverPinnedBaseHeight_));
+                const double maxScale =
+                    std::max(
+                        0.75,
+                        std::min(1.75, screenMaxScale));
+                const double requestedScale =
+                    static_cast<double>(
+                        hoverPinnedScalePermille_) /
+                    1000.0;
+                const double scale = std::clamp(
+                    requestedScale,
+                    0.75,
+                    maxScale);
+
+                width = std::clamp(
+                    static_cast<int>(std::lround(
+                        hoverPinnedBaseWidth_ * scale)),
+                    kHoverMinWidth,
+                    kHoverMaxWidth);
+                height = std::clamp(
+                    static_cast<int>(std::lround(
+                        hoverPinnedBaseHeight_ * scale)),
+                    kHoverMinHeight,
+                    kHoverMaxHeight);
+            }
+        }
+
+        RecreateHoverFontForSize(width, height);
 
         RECT widgetRect{};
         RECT taskbarRect{};
@@ -4203,16 +4259,18 @@ private:
 
         x = std::clamp(
             x,
-            static_cast<int>(monitorInfo.rcMonitor.left),
+            static_cast<int>(monitorInfo.rcWork.left),
             std::max(
-                static_cast<int>(monitorInfo.rcMonitor.left),
-                static_cast<int>(monitorInfo.rcMonitor.right) - width));
+                static_cast<int>(monitorInfo.rcWork.left),
+                static_cast<int>(monitorInfo.rcWork.right) -
+                    width));
         y = std::clamp(
             y,
-            static_cast<int>(monitorInfo.rcMonitor.top),
+            static_cast<int>(monitorInfo.rcWork.top),
             std::max(
-                static_cast<int>(monitorInfo.rcMonitor.top),
-                static_cast<int>(monitorInfo.rcMonitor.bottom) - height));
+                static_cast<int>(monitorInfo.rcWork.top),
+                static_cast<int>(monitorInfo.rcWork.bottom) -
+                    height));
 
         SetWindowPos(
             hoverWindow_,
@@ -4284,12 +4342,11 @@ private:
         WriteRegistryDword(L"PinHover", pinHover_ ? 1u : 0u);
 
         if (pinHover_) {
-            RecreateHoverFontForSize(
-                hoverPinnedWidth_,
-                hoverPinnedHeight_);
+            hoverPinnedBaseValid_ = false;
             ShowPinnedHoverPopup();
         } else {
             HideHoverPopup();
+            hoverPinnedBaseValid_ = false;
             RecreateHoverFontForSize(
                 kHoverDefaultWidth,
                 kHoverDefaultHeight);
