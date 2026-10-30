@@ -22,6 +22,7 @@
 #include <cwchar>
 #include <cwctype>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -3838,6 +3839,172 @@ private:
         if (top) return HTTOP;
         if (bottom) return HTBOTTOM;
         return HTNOWHERE;
+    }
+
+    HoverLayout MeasureHoverLayoutAtWidth(
+        HDC dc,
+        int windowWidth,
+        bool reserveClose) const {
+        const int padding = 10;
+        const int closeGap = reserveClose ? 24 : 0;
+        const int normalLimit =
+            std::max(1, windowWidth - padding * 2);
+
+        TEXTMETRICW tm{};
+        GetTextMetricsW(dc, &tm);
+        const int lineHeight =
+            std::max(1, static_cast<int>(tm.tmHeight) + 1);
+
+        int rows = 0;
+        for (std::size_t lineIndex = 0;
+             lineIndex < hoverLines_.size();
+             ++lineIndex) {
+            const int lineLimit = std::max(
+                1,
+                normalLimit -
+                    ((reserveClose && lineIndex == 0)
+                        ? closeGap
+                        : 0));
+            int x = 0;
+            int lineRows = 1;
+
+            for (const auto& segment : hoverLines_[lineIndex]) {
+                if (segment.text.empty()) continue;
+
+                SIZE size{};
+                GetTextExtentPoint32W(
+                    dc,
+                    segment.text.c_str(),
+                    static_cast<int>(segment.text.size()),
+                    &size);
+
+                // A segment is never split internally. Width search therefore
+                // rejects candidates that cannot contain the widest segment.
+                if (size.cx > lineLimit) {
+                    return HoverLayout{windowWidth, INT_MAX};
+                }
+
+                if (x > 0 && x + size.cx > lineLimit) {
+                    x = 0;
+                    ++lineRows;
+                }
+                x += size.cx;
+            }
+
+            rows += lineRows;
+        }
+
+        return HoverLayout{
+            windowWidth,
+            rows * lineHeight + padding * 2};
+    }
+
+    HoverLayout CalculateNaturalHoverLayout(
+        HMONITOR monitor,
+        bool reserveClose) {
+        MONITORINFO info{};
+        info.cbSize = sizeof(info);
+        if (!monitor || !GetMonitorInfoW(monitor, &info)) {
+            return HoverLayout{
+                kHoverDefaultWidth,
+                kHoverDefaultHeight};
+        }
+
+        const int workWidth = std::max(
+            kHoverMinWidth,
+            static_cast<int>(
+                info.rcWork.right - info.rcWork.left) - 16);
+        const int workHeight = std::max(
+            kHoverMinHeight,
+            static_cast<int>(
+                info.rcWork.bottom - info.rcWork.top) - 16);
+        const int maxWidth = std::min(
+            kHoverMaxWidth,
+            workWidth);
+        const int maxHeight = std::min(
+            kHoverMaxHeight,
+            workHeight);
+
+        HDC dc = GetDC(hoverWindow_);
+        if (!dc) {
+            return HoverLayout{
+                std::min(kHoverDefaultWidth, maxWidth),
+                std::min(kHoverDefaultHeight, maxHeight)};
+        }
+
+        HFONT baseFont = font_;
+        HFONT oldFont = baseFont
+            ? static_cast<HFONT>(SelectObject(dc, baseFont))
+            : nullptr;
+
+        int widestSegment = 0;
+        for (const auto& line : hoverLines_) {
+            for (const auto& segment : line) {
+                if (segment.text.empty()) continue;
+                SIZE size{};
+                GetTextExtentPoint32W(
+                    dc,
+                    segment.text.c_str(),
+                    static_cast<int>(segment.text.size()),
+                    &size);
+                widestSegment =
+                    std::max(widestSegment, size.cx);
+            }
+        }
+
+        const int closeGap = reserveClose ? 24 : 0;
+        const int minWidth = std::clamp(
+            widestSegment + 20 + closeGap,
+            kHoverMinWidth,
+            maxWidth);
+
+        HoverLayout best{
+            maxWidth,
+            maxHeight};
+        long long bestArea =
+            std::numeric_limits<long long>::max();
+        bool found = false;
+
+        // Search a small finite range only when the popup is shown/pinned.
+        // This is UI layout work, not a background polling path.
+        for (int width = minWidth;
+             width <= maxWidth;
+             width += 4) {
+            const HoverLayout layout =
+                MeasureHoverLayoutAtWidth(
+                    dc,
+                    width,
+                    reserveClose);
+            if (layout.height <= 0 ||
+                layout.height > maxHeight) {
+                continue;
+            }
+
+            const long long area =
+                static_cast<long long>(layout.width) *
+                static_cast<long long>(layout.height);
+            if (!found || area < bestArea ||
+                (area == bestArea &&
+                 layout.width < best.width)) {
+                found = true;
+                best = layout;
+                bestArea = area;
+            }
+        }
+
+        if (oldFont) SelectObject(dc, oldFont);
+        ReleaseDC(hoverWindow_, dc);
+
+        if (!found) {
+            // Extremely small work areas fall back to the largest allowed
+            // rectangle. Normal desktop layouts should always take the fitted
+            // path above.
+            return HoverLayout{
+                maxWidth,
+                maxHeight};
+        }
+
+        return best;
     }
 
     void DrawHoverContent(
