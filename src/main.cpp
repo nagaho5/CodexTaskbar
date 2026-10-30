@@ -2992,6 +2992,43 @@ private:
             face);
     }
 
+    double HoverFontScaleForSize(int width, int height) const {
+        if (!pinHover_) return 1.0;
+        const double widthScale =
+            static_cast<double>(width) /
+            static_cast<double>(kHoverDefaultWidth);
+        const double heightScale =
+            static_cast<double>(height) /
+            static_cast<double>(kHoverDefaultHeight);
+        return std::clamp(
+            std::min(widthScale, heightScale),
+            0.75,
+            1.75);
+    }
+
+    void RecreateHoverFontForSize(int width, int height) {
+        const double targetPointSize =
+            std::round(
+                fontSize_ *
+                HoverFontScaleForSize(width, height) *
+                10.0) / 10.0;
+        if (hoverFont_ &&
+            std::abs(targetPointSize - hoverFontPointSize_) < 0.05) {
+            return;
+        }
+
+        if (hoverFont_) {
+            DeleteObject(hoverFont_);
+            hoverFont_ = nullptr;
+        }
+        hoverFont_ = CreatePointFont(targetPointSize, false);
+        hoverFontPointSize_ = targetPointSize;
+    }
+
+    HFONT HoverFont() const {
+        return hoverFont_ ? hoverFont_ : font_;
+    }
+
     void ClearRowFitCaches() {
         for (auto& cache : rowFitCaches_) {
             if (cache.font) {
@@ -3020,6 +3057,10 @@ private:
         if (!widgetFont_) {
             widgetFont_ = CreatePointFont(fontSize_, false);
         }
+
+        RecreateHoverFontForSize(
+            pinHover_ ? hoverPinnedWidth_ : kHoverDefaultWidth,
+            pinHover_ ? hoverPinnedHeight_ : kHoverDefaultHeight);
     }
 
     int MeasureTextWidth(HDC dc, const std::wstring& text) const {
@@ -4714,6 +4755,8 @@ private:
     ULONGLONG anchorReadyDeadline_{0};
     HFONT font_{nullptr};
     HFONT widgetFont_{nullptr};
+    HFONT hoverFont_{nullptr};
+    double hoverFontPointSize_{0.0};
     HBRUSH darkBackgroundBrush_{nullptr};
     HBRUSH darkControlBrush_{nullptr};
     HBRUSH darkMenuBrush_{nullptr};
@@ -4731,6 +4774,13 @@ private:
     std::int64_t lastQuotaSuccessMs_{0};
     bool autoStart_{true};
     bool pinHover_{false};
+    bool hideWidgetWhenPinned_{false};
+    int hoverPinnedWidth_{kHoverDefaultWidth};
+    int hoverPinnedHeight_{kHoverDefaultHeight};
+    bool hoverResizing_{false};
+    int hoverResizeHit_{HTNOWHERE};
+    POINT hoverResizeStartCursor_{};
+    RECT hoverResizeStartRect_{};
     bool showFiveHourPercent_{true};
     bool showFiveHourTime_{true};
     bool showSevenDayPercent_{true};
