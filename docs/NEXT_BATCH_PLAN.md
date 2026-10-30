@@ -272,3 +272,25 @@ Goal:
 - This is hover-only display work; it must not add extra quota polling or requests.
 
 Status: implemented in v0.3.12; real-device validation still required.
+
+
+## 10. Hover dashboard and simple current-turn speed average (implemented in v0.3.13)
+
+Implemented together:
+
+- 7-day quota hover row now shows both the absolute reset date/time and a compact relative countdown such as `3天4小时后`.
+- Right-click menu adds `固定显示悬浮窗` (default off, persisted). When enabled, the popup stays visible after the pointer leaves the taskbar widget, remains topmost/no-activate, and shows a small white `×` in the upper-right corner. Clicking the `×` closes the popup and clears the pin setting.
+- Hover rendering is segmented and colored instead of one all-white DrawText block:
+  - 5h quota and context reuse the taskbar's existing warning/working color rules;
+  - quota/session connection success uses green and failure uses red;
+  - running task status uses the configured working color, waiting-for-input uses yellow;
+  - code additions are green and removals are red.
+- Generation-speed display mode adds `本轮平均`.
+  - This is intentionally a plain arithmetic mean of **all accepted generation-speed samples in the current Turn**: `sum / count`.
+  - No trimming, sorting, outlier removal, weighting, or extra filters are applied for the current-Turn average.
+  - It becomes available after 5 accepted samples, matching the existing recent-average visibility threshold.
+  - Before 5 samples, taskbar `本轮平均` mode falls back to the current speed.
+  - Hover always shows `本轮平均` while active; after completion it freezes as `上轮平均`.
+- No new quota polling, IPC polling, renderer-log reads, or permanent timers were added.
+
+Status: implemented in v0.3.13; real-device validation still required for pin/close hit-testing, popup resizing, color appearance, 7-day formatting, and current-turn average behavior.
