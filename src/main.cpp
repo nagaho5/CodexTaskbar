@@ -3698,70 +3698,84 @@ private:
             nullptr,
             instance_,
             this);
+        if (hoverWindow_) {
+            ApplyDarkWindowTheme(hoverWindow_);
+        }
     }
 
-    SIZE MeasureHoverContent(
-        HDC dc,
-        int maxContentWidth) const {
-        TEXTMETRICW tm{};
-        GetTextMetricsW(dc, &tm);
-        const int lineHeight = std::max(1, static_cast<int>(tm.tmHeight) + 1);
+    RECT HoverCloseRect(HWND hwnd) const {
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        const int size = 20;
+        const int right = std::max(
+            static_cast<int>(client.left) + size,
+            static_cast<int>(client.right) - 8);
+        const int top = static_cast<int>(client.top) + 4;
+        return RECT{
+            right - size,
+            top,
+            right,
+            std::min(
+                static_cast<int>(client.bottom),
+                top + size)};
+    }
 
-        int widest = 0;
-        int rows = 0;
-        bool wrapped = false;
+    int HoverResizeHitFromClient(HWND hwnd, POINT point) const {
+        if (!pinHover_) return HTNOWHERE;
 
-        for (const auto& line : hoverLines_) {
-            int x = 0;
-            int lineRows = 1;
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        const bool left =
+            point.x >= client.left &&
+            point.x < client.left + kHoverResizeMargin;
+        const bool right =
+            point.x <= client.right &&
+            point.x > client.right - kHoverResizeMargin;
+        const bool top =
+            point.y >= client.top &&
+            point.y < client.top + kHoverResizeMargin;
+        const bool bottom =
+            point.y <= client.bottom &&
+            point.y > client.bottom - kHoverResizeMargin;
 
-            for (const auto& segment : line) {
-                if (segment.text.empty()) continue;
-                SIZE size{};
-                GetTextExtentPoint32W(
-                    dc,
-                    segment.text.c_str(),
-                    static_cast<int>(segment.text.size()),
-                    &size);
-
-                if (x > 0 && x + size.cx > maxContentWidth) {
-                    widest = std::max(widest, x);
-                    x = 0;
-                    ++lineRows;
-                    wrapped = true;
-                }
-                x += size.cx;
-            }
-
-            widest = std::max(widest, x);
-            rows += lineRows;
-        }
-
-        return SIZE{
-            wrapped
-                ? maxContentWidth
-                : std::min(maxContentWidth, widest),
-            rows * lineHeight};
+        if (top && left) return HTTOPLEFT;
+        if (top && right) return HTTOPRIGHT;
+        if (bottom && left) return HTBOTTOMLEFT;
+        if (bottom && right) return HTBOTTOMRIGHT;
+        if (left) return HTLEFT;
+        if (right) return HTRIGHT;
+        if (top) return HTTOP;
+        if (bottom) return HTBOTTOM;
+        return HTNOWHERE;
     }
 
     void DrawHoverContent(
         HDC dc,
         const RECT& client) const {
         const int padding = 10;
-        const int closeReserve = pinHover_ ? 22 : 0;
         const int left = client.left + padding;
-        const int right = std::max(
-            left + 1,
-            static_cast<int>(client.right) - padding - closeReserve);
 
         TEXTMETRICW tm{};
         GetTextMetricsW(dc, &tm);
-        const int lineHeight = std::max(1, static_cast<int>(tm.tmHeight) + 1);
+        const int lineHeight =
+            std::max(1, static_cast<int>(tm.tmHeight) + 1);
 
         int y = client.top + padding;
-        for (const auto& line : hoverLines_) {
-            int x = left;
+        for (std::size_t lineIndex = 0;
+             lineIndex < hoverLines_.size();
+             ++lineIndex) {
+            const auto& line = hoverLines_[lineIndex];
+            int right = std::max(
+                left + 1,
+                static_cast<int>(client.right) - padding);
+            if (pinHover_ && lineIndex == 0) {
+                const RECT close = HoverCloseRect(hoverWindow_);
+                right = std::max(
+                    left + 1,
+                    static_cast<int>(close.left) - 4);
+            }
 
+            int x = left;
             for (const auto& segment : line) {
                 if (segment.text.empty()) continue;
 
@@ -3788,76 +3802,6 @@ private:
             }
 
             y += lineHeight;
-        }
-    }
-
-    void FitVisibleHoverPopup() {
-        if (!hoverPopupVisible_ ||
-            !hoverWindow_ ||
-            !IsWindow(hoverWindow_)) {
-            return;
-        }
-
-        HDC dc = GetDC(hoverWindow_);
-        if (!dc) return;
-        HFONT oldFont = font_
-            ? static_cast<HFONT>(SelectObject(dc, font_))
-            : nullptr;
-
-        const int closeReserve = pinHover_ ? 22 : 0;
-        const SIZE measure = MeasureHoverContent(
-            dc,
-            std::max(260, 520 - closeReserve));
-
-        if (oldFont) SelectObject(dc, oldFont);
-        ReleaseDC(hoverWindow_, dc);
-
-        const int padding = 10;
-        const int width = std::clamp(
-            static_cast<int>(measure.cx) + padding * 2 + closeReserve,
-            280,
-            560);
-        const int height = std::max(
-            80,
-            static_cast<int>(measure.cy) + padding * 2);
-
-        RECT current{};
-        if (!GetWindowRect(hoverWindow_, &current)) return;
-
-        MONITORINFO monitorInfo{};
-        monitorInfo.cbSize = sizeof(monitorInfo);
-        const HMONITOR monitor = MonitorFromWindow(
-            hoverWindow_,
-            MONITOR_DEFAULTTONEAREST);
-        GetMonitorInfoW(monitor, &monitorInfo);
-
-        const int x = std::clamp(
-            static_cast<int>(current.left),
-            static_cast<int>(monitorInfo.rcMonitor.left),
-            std::max(
-                static_cast<int>(monitorInfo.rcMonitor.left),
-                static_cast<int>(monitorInfo.rcMonitor.right) - width));
-        const int y = std::clamp(
-            static_cast<int>(current.top),
-            static_cast<int>(monitorInfo.rcMonitor.top),
-            std::max(
-                static_cast<int>(monitorInfo.rcMonitor.top),
-                static_cast<int>(monitorInfo.rcMonitor.bottom) - height));
-
-        const int currentWidth = current.right - current.left;
-        const int currentHeight = current.bottom - current.top;
-        if (x != current.left ||
-            y != current.top ||
-            width != currentWidth ||
-            height != currentHeight) {
-            SetWindowPos(
-                hoverWindow_,
-                HWND_TOPMOST,
-                x,
-                y,
-                width,
-                height,
-                SWP_NOACTIVATE | SWP_NOOWNERZORDER);
         }
     }
 
@@ -3895,8 +3839,9 @@ private:
         if (border) DeleteObject(border);
 
         SetBkMode(target, TRANSPARENT);
-        HFONT oldFont = font_
-            ? static_cast<HFONT>(SelectObject(target, font_))
+        HFONT hoverFont = HoverFont();
+        HFONT oldFont = hoverFont
+            ? static_cast<HFONT>(SelectObject(target, hoverFont))
             : nullptr;
 
         DrawHoverContent(target, client);
@@ -3933,54 +3878,51 @@ private:
         EndPaint(hwnd, &ps);
     }
 
-    void ShowHoverPopup(const POINT& cursor) {
+    bool ShowHoverPopup(const POINT& cursor) {
         EnsureHoverPopup();
-        if (!hoverWindow_ || !IsWindow(hoverWindow_)) return;
+        if (!hoverWindow_ || !IsWindow(hoverWindow_)) return false;
 
         UpdateTooltipText();
 
-        HDC dc = GetDC(hoverWindow_);
-        if (!dc) return;
-        HFONT oldFont = font_
-            ? static_cast<HFONT>(SelectObject(dc, font_))
-            : nullptr;
-        const int closeReserve = pinHover_ ? 22 : 0;
-        const SIZE measure = MeasureHoverContent(
-            dc,
-            std::max(260, 520 - closeReserve));
-        if (oldFont) SelectObject(dc, oldFont);
-        ReleaseDC(hoverWindow_, dc);
-
-        const int padding = 10;
-        const int width = std::clamp(
-            static_cast<int>(measure.cx) + padding * 2 + closeReserve,
-            280,
-            560);
-        const int height = std::max(
-            80,
-            static_cast<int>(measure.cy) + padding * 2);
+        const int width = pinHover_
+            ? hoverPinnedWidth_
+            : kHoverDefaultWidth;
+        const int height = pinHover_
+            ? hoverPinnedHeight_
+            : kHoverDefaultHeight;
+        RecreateHoverFontForSize(width, height);
 
         MONITORINFO monitorInfo{};
         monitorInfo.cbSize = sizeof(monitorInfo);
-        HMONITOR monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
-        GetMonitorInfoW(monitor, &monitorInfo);
+        HMONITOR monitor =
+            MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
+        if (!GetMonitorInfoW(monitor, &monitorInfo)) {
+            return false;
+        }
 
         RECT widgetRect{};
         RECT taskbarRect{};
-        GetWindowRect(widgetWindow_, &widgetRect);
-        GetWindowRect(taskbarWindow_, &taskbarRect);
+        if (!widgetWindow_ ||
+            !GetWindowRect(widgetWindow_, &widgetRect) ||
+            !taskbarWindow_ ||
+            !GetWindowRect(taskbarWindow_, &taskbarRect)) {
+            return false;
+        }
 
         int x = cursor.x + 12;
         int y = cursor.y + 12;
 
         const bool vertical =
-            (taskbarRect.bottom - taskbarRect.top) > (taskbarRect.right - taskbarRect.left);
+            (taskbarRect.bottom - taskbarRect.top) >
+            (taskbarRect.right - taskbarRect.left);
         if (vertical) {
             const int taskbarCenter =
-                taskbarRect.left + (taskbarRect.right - taskbarRect.left) / 2;
+                taskbarRect.left +
+                (taskbarRect.right - taskbarRect.left) / 2;
             const int monitorCenter =
                 monitorInfo.rcMonitor.left +
-                (monitorInfo.rcMonitor.right - monitorInfo.rcMonitor.left) / 2;
+                (monitorInfo.rcMonitor.right -
+                    monitorInfo.rcMonitor.left) / 2;
             if (taskbarCenter <= monitorCenter) {
                 x = widgetRect.right + 8;
             } else {
@@ -3989,10 +3931,12 @@ private:
             y = cursor.y + 8;
         } else {
             const int taskbarCenter =
-                taskbarRect.top + (taskbarRect.bottom - taskbarRect.top) / 2;
+                taskbarRect.top +
+                (taskbarRect.bottom - taskbarRect.top) / 2;
             const int monitorCenter =
                 monitorInfo.rcMonitor.top +
-                (monitorInfo.rcMonitor.bottom - monitorInfo.rcMonitor.top) / 2;
+                (monitorInfo.rcMonitor.bottom -
+                    monitorInfo.rcMonitor.top) / 2;
             x = cursor.x + 8;
             y = taskbarCenter >= monitorCenter
                 ? widgetRect.top - height - 8
@@ -4002,13 +3946,15 @@ private:
         x = std::clamp(
             x,
             static_cast<int>(monitorInfo.rcMonitor.left),
-            std::max(static_cast<int>(monitorInfo.rcMonitor.left),
-                     static_cast<int>(monitorInfo.rcMonitor.right) - width));
+            std::max(
+                static_cast<int>(monitorInfo.rcMonitor.left),
+                static_cast<int>(monitorInfo.rcMonitor.right) - width));
         y = std::clamp(
             y,
             static_cast<int>(monitorInfo.rcMonitor.top),
-            std::max(static_cast<int>(monitorInfo.rcMonitor.top),
-                     static_cast<int>(monitorInfo.rcMonitor.bottom) - height));
+            std::max(
+                static_cast<int>(monitorInfo.rcMonitor.top),
+                static_cast<int>(monitorInfo.rcMonitor.bottom) - height));
 
         SetWindowPos(
             hoverWindow_,
@@ -4020,6 +3966,7 @@ private:
             SWP_NOACTIVATE | SWP_SHOWWINDOW);
         hoverPopupVisible_ = true;
         InvalidateRect(hoverWindow_, nullptr, FALSE);
+        return true;
     }
 
     void HideHoverPopup() {
@@ -4027,20 +3974,51 @@ private:
             ShowWindow(hoverWindow_, SW_HIDE);
         }
         hoverPopupVisible_ = false;
+        hoverResizing_ = false;
+        hoverResizeHit_ = HTNOWHERE;
+        if (GetCapture() == hoverWindow_) {
+            ReleaseCapture();
+        }
     }
 
-    void ShowPinnedHoverPopup() {
-        if (!pinHover_ || !codexRunning_ || !widgetVisible_ ||
-            !widgetWindow_ || !IsWindowVisible(widgetWindow_)) {
+    void ApplyPinnedWidgetVisibility() {
+        if (!widgetVisible_ ||
+            !widgetWindow_ ||
+            !IsWindow(widgetWindow_)) {
             return;
         }
 
+        const bool shouldHide =
+            pinHover_ &&
+            hideWidgetWhenPinned_ &&
+            hoverPopupVisible_;
+        ShowWindow(
+            widgetWindow_,
+            shouldHide ? SW_HIDE : SW_SHOWNOACTIVATE);
+    }
+
+    bool ShowPinnedHoverPopup() {
+        if (!pinHover_ ||
+            !codexRunning_ ||
+            !widgetVisible_ ||
+            !widgetWindow_ ||
+            !IsWindow(widgetWindow_)) {
+            return false;
+        }
+
         RECT widgetRect{};
-        if (!GetWindowRect(widgetWindow_, &widgetRect)) return;
+        if (!GetWindowRect(widgetWindow_, &widgetRect)) return false;
         POINT anchor{
-            widgetRect.left + (widgetRect.right - widgetRect.left) / 2,
-            widgetRect.top + (widgetRect.bottom - widgetRect.top) / 2};
-        ShowHoverPopup(anchor);
+            widgetRect.left +
+                (widgetRect.right - widgetRect.left) / 2,
+            widgetRect.top +
+                (widgetRect.bottom - widgetRect.top) / 2};
+
+        const bool shown = ShowHoverPopup(anchor);
+        if (shown) {
+            ApplyPinnedWidgetVisibility();
+        }
+        return shown;
     }
 
     void SetPinHover(bool enabled) {
@@ -4048,25 +4026,21 @@ private:
         WriteRegistryDword(L"PinHover", pinHover_ ? 1u : 0u);
 
         if (pinHover_) {
+            RecreateHoverFontForSize(
+                hoverPinnedWidth_,
+                hoverPinnedHeight_);
             ShowPinnedHoverPopup();
         } else {
             HideHoverPopup();
+            RecreateHoverFontForSize(
+                kHoverDefaultWidth,
+                kHoverDefaultHeight);
+            ApplyPinnedWidgetVisibility();
         }
     }
 
     bool PinHoverEnabled() const {
         return pinHover_;
-    }
-
-    RECT HoverCloseRect(HWND hwnd) const {
-        RECT client{};
-        GetClientRect(hwnd, &client);
-        const int size = 22;
-        return RECT{
-            std::max(client.left, client.right - size - 2),
-            client.top + 2,
-            client.right - 2,
-            std::min(client.bottom, client.top + size + 2)};
     }
 
     LRESULT HoverHitTest(HWND hwnd, LPARAM lParam) const {
@@ -4076,12 +4050,173 @@ private:
             GET_X_LPARAM(lParam),
             GET_Y_LPARAM(lParam)};
         ScreenToClient(hwnd, &point);
+
         const RECT close = HoverCloseRect(hwnd);
-        return PtInRect(&close, point) ? HTCLIENT : HTTRANSPARENT;
+        if (PtInRect(&close, point)) {
+            return HTCLIENT;
+        }
+        return HoverResizeHitFromClient(hwnd, point) != HTNOWHERE
+            ? HTCLIENT
+            : HTTRANSPARENT;
+    }
+
+    bool HandleHoverSetCursor(HWND hwnd) const {
+        if (!pinHover_ || hoverResizing_) return false;
+
+        POINT point{};
+        if (!GetCursorPos(&point)) return false;
+        ScreenToClient(hwnd, &point);
+
+        const int hit = HoverResizeHitFromClient(hwnd, point);
+        LPCWSTR cursorId = nullptr;
+        switch (hit) {
+        case HTLEFT:
+        case HTRIGHT:
+            cursorId = IDC_SIZEWE;
+            break;
+        case HTTOP:
+        case HTBOTTOM:
+            cursorId = IDC_SIZENS;
+            break;
+        case HTTOPLEFT:
+        case HTBOTTOMRIGHT:
+            cursorId = IDC_SIZENWSE;
+            break;
+        case HTTOPRIGHT:
+        case HTBOTTOMLEFT:
+            cursorId = IDC_SIZENESW;
+            break;
+        default:
+            return false;
+        }
+
+        SetCursor(LoadCursorW(nullptr, cursorId));
+        return true;
+    }
+
+    bool HandleHoverLeftButtonDown(HWND hwnd, LPARAM lParam) {
+        if (!pinHover_) return false;
+
+        POINT point{
+            GET_X_LPARAM(lParam),
+            GET_Y_LPARAM(lParam)};
+        const RECT close = HoverCloseRect(hwnd);
+        if (PtInRect(&close, point)) {
+            return true;
+        }
+
+        const int hit = HoverResizeHitFromClient(hwnd, point);
+        if (hit == HTNOWHERE) return false;
+
+        if (!GetCursorPos(&hoverResizeStartCursor_) ||
+            !GetWindowRect(hwnd, &hoverResizeStartRect_)) {
+            return false;
+        }
+
+        hoverResizing_ = true;
+        hoverResizeHit_ = hit;
+        SetCapture(hwnd);
+        return true;
+    }
+
+    bool HandleHoverMouseMove(HWND hwnd) {
+        if (!pinHover_ || !hoverResizing_) return false;
+
+        POINT cursor{};
+        if (!GetCursorPos(&cursor)) return true;
+        const int dx = cursor.x - hoverResizeStartCursor_.x;
+        const int dy = cursor.y - hoverResizeStartCursor_.y;
+
+        RECT rect = hoverResizeStartRect_;
+        switch (hoverResizeHit_) {
+        case HTLEFT:
+        case HTTOPLEFT:
+        case HTBOTTOMLEFT:
+            rect.left += dx;
+            break;
+        case HTRIGHT:
+        case HTTOPRIGHT:
+        case HTBOTTOMRIGHT:
+            rect.right += dx;
+            break;
+        }
+        switch (hoverResizeHit_) {
+        case HTTOP:
+        case HTTOPLEFT:
+        case HTTOPRIGHT:
+            rect.top += dy;
+            break;
+        case HTBOTTOM:
+        case HTBOTTOMLEFT:
+        case HTBOTTOMRIGHT:
+            rect.bottom += dy;
+            break;
+        }
+
+        const bool resizeLeft =
+            hoverResizeHit_ == HTLEFT ||
+            hoverResizeHit_ == HTTOPLEFT ||
+            hoverResizeHit_ == HTBOTTOMLEFT;
+        const bool resizeTop =
+            hoverResizeHit_ == HTTOP ||
+            hoverResizeHit_ == HTTOPLEFT ||
+            hoverResizeHit_ == HTTOPRIGHT;
+
+        int width = rect.right - rect.left;
+        int height = rect.bottom - rect.top;
+        width = std::clamp(
+            width,
+            kHoverMinWidth,
+            kHoverMaxWidth);
+        height = std::clamp(
+            height,
+            kHoverMinHeight,
+            kHoverMaxHeight);
+
+        if (resizeLeft) {
+            rect.left = rect.right - width;
+        } else {
+            rect.right = rect.left + width;
+        }
+        if (resizeTop) {
+            rect.top = rect.bottom - height;
+        } else {
+            rect.bottom = rect.top + height;
+        }
+
+        hoverPinnedWidth_ = width;
+        hoverPinnedHeight_ = height;
+        RecreateHoverFontForSize(width, height);
+
+        SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            rect.left,
+            rect.top,
+            width,
+            height,
+            SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return true;
     }
 
     bool HandleHoverLeftButtonUp(HWND hwnd, LPARAM lParam) {
         if (!pinHover_) return false;
+
+        if (hoverResizing_) {
+            hoverResizing_ = false;
+            hoverResizeHit_ = HTNOWHERE;
+            if (GetCapture() == hwnd) {
+                ReleaseCapture();
+            }
+            WriteRegistryDword(
+                L"HoverPinnedWidth",
+                static_cast<DWORD>(hoverPinnedWidth_));
+            WriteRegistryDword(
+                L"HoverPinnedHeight",
+                static_cast<DWORD>(hoverPinnedHeight_));
+            return true;
+        }
 
         POINT point{
             GET_X_LPARAM(lParam),
@@ -4091,6 +4226,11 @@ private:
 
         SetPinHover(false);
         return true;
+    }
+
+    void HandleHoverCaptureChanged() {
+        hoverResizing_ = false;
+        hoverResizeHit_ = HTNOWHERE;
     }
 
     void ResetHoverState(bool forceHide = false) {
