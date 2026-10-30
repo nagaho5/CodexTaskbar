@@ -320,3 +320,27 @@ Implemented design:
 - No extra Desktop IPC requests, quota reads, renderer-log reads, timers, or task-time disk reads were added.
 
 Status: implemented in v0.3.15; real-device validation is required for hover edge hit-testing, remembered size/font scaling, taskbar auto-hide/restore, and current-task cache deltas.
+
+
+## 12. Natural complete hover layout and proportional pinned resizing (implemented in v0.3.16)
+
+Problem found in v0.3.15:
+
+- A hard-coded 560×520 ordinary hover can clip lower rows even though substantial width is unused.
+- Independent pinned width/height resizing can create stretched shapes with unnecessary empty space.
+
+Implemented fix:
+
+- Ordinary hover measures the current rendered content when it is opened and searches the available monitor work area for a minimum-area rectangle that contains every hover row.
+- Layout search wraps only at existing colored-segment boundaries and rejects widths that cannot contain the widest indivisible segment.
+- The chosen ordinary-hover size is applied once when that popup is shown; live numeric updates repaint inside it rather than continuously resizing it.
+- Pinned mode uses the same fitted complete layout as its 100% natural base and locks that base aspect ratio for the pin session.
+- Dragging any edge or corner changes one scale factor; width, height and hover font all scale together.
+  - Horizontal edge drag keeps the opposite horizontal edge fixed and scales vertically around the center.
+  - Vertical edge drag keeps the opposite vertical edge fixed and scales horizontally around the center.
+  - Corner drag keeps the opposite corner fixed.
+- Pinned scale is persisted as a single permille value (75%-175%). v0.3.15 stored width/height are used only as a one-time migration hint.
+- Font or display-setting changes invalidate the pinned natural base so the next show recalculates a complete ratio.
+- No new timers, quota reads, Desktop IPC reads or background polling were added.
+
+Status: implemented in v0.3.16; real-device validation is required for the natural-size choice, full-content visibility, and proportional edge/corner drag feel.
