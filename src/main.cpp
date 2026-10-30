@@ -404,6 +404,31 @@ std::wstring FormatResetTime(std::int64_t unixSeconds) {
     return text;
 }
 
+std::wstring FormatFiveHourReset(std::int64_t unixSeconds) {
+    if (unixSeconds <= 0) {
+        return L"--:--";
+    }
+
+    const std::wstring absolute = FormatResetTime(unixSeconds);
+    const std::int64_t now =
+        static_cast<std::int64_t>(time(nullptr));
+    const std::int64_t remaining =
+        std::max<std::int64_t>(0, unixSeconds - now);
+
+    const std::int64_t hours = remaining / 3600;
+    const std::int64_t minutes = (remaining % 3600) / 60;
+    const std::int64_t seconds = remaining % 60;
+
+    wchar_t relative[64]{};
+    swprintf_s(
+        relative,
+        L"%lld时%lld分%02lld秒",
+        static_cast<long long>(hours),
+        static_cast<long long>(minutes),
+        static_cast<long long>(seconds));
+    return absolute + L"（" + relative + L"）";
+}
+
 std::wstring FormatSevenDayReset(std::int64_t unixSeconds) {
     if (unixSeconds <= 0) {
         return L"--";
@@ -978,25 +1003,47 @@ public:
         }
 
         const int remaining = snapshot.fiveHour.remainingPercent;
-        if (fiveHourRateSampleCount_ == 0 ||
-            snapshot.fiveHour.resetsAtUnix != fiveHourRateResetAtUnix_) {
-            // First observed sample for this tracking interval, or the 5h
-            // quota window rolled over. Pair the quota value with the task
-            // duration observed at the same moment so mid-task attachment
-            // never divides post-attach consumption by earlier unobserved time.
+        if (fiveHourRateSampleCount_ == 0) {
             fiveHourRateMaxRemaining_ = remaining;
             fiveHourRateMinRemaining_ = remaining;
+            fiveHourRateLastRemaining_ = remaining;
             fiveHourRateSampleCount_ = 1;
-            fiveHourRateResetAtUnix_ = snapshot.fiveHour.resetsAtUnix;
-            fiveHourRateStartTaskDurationMs_ =
-                std::max<std::int64_t>(0, taskDurationMs);
+            fiveHourRateResetAtUnix_ =
+                snapshot.fiveHour.resetsAtUnix;
             return;
         }
 
-        fiveHourRateMaxRemaining_ =
-            std::max(fiveHourRateMaxRemaining_, remaining);
-        fiveHourRateMinRemaining_ =
-            std::min(fiveHourRateMinRemaining_, remaining);
+        const bool resetTimeAdvanced =
+            fiveHourRateResetAtUnix_ > 0 &&
+            snapshot.fiveHour.resetsAtUnix >
+                fiveHourRateResetAtUnix_ + 300;
+        const bool remainingJumped =
+            fiveHourRateLastRemaining_ >= 0 &&
+            remaining > fiveHourRateLastRemaining_ + 5;
+
+        if (resetTimeAdvanced || remainingJumped) {
+            // A real 5h-window rollover must not erase the current task.
+            // Bank the already-observed segment and continue with the new
+            // window while keeping the original task-duration baseline.
+            fiveHourRateAccumulatedConsumed_ +=
+                std::max(
+                    0,
+                    fiveHourRateMaxRemaining_ -
+                        fiveHourRateMinRemaining_);
+            fiveHourRateMaxRemaining_ = remaining;
+            fiveHourRateMinRemaining_ = remaining;
+        } else {
+            // Small reset-timestamp drift is ignored. Within one task the
+            // existing max/min history is sticky until a genuinely new task.
+            fiveHourRateMaxRemaining_ =
+                std::max(fiveHourRateMaxRemaining_, remaining);
+            fiveHourRateMinRemaining_ =
+                std::min(fiveHourRateMinRemaining_, remaining);
+        }
+
+        fiveHourRateLastRemaining_ = remaining;
+        fiveHourRateResetAtUnix_ =
+            snapshot.fiveHour.resetsAtUnix;
         ++fiveHourRateSampleCount_;
     }
 
@@ -1011,6 +1058,8 @@ public:
         fiveHourRateSampleCount_ = 0;
         fiveHourRateMaxRemaining_ = 0;
         fiveHourRateMinRemaining_ = 0;
+        fiveHourRateAccumulatedConsumed_ = 0;
+        fiveHourRateLastRemaining_ = -1;
         fiveHourRateResetAtUnix_ = 0;
         fiveHourRateStartTaskDurationMs_ =
             std::max<std::int64_t>(0, taskDurationMs);
@@ -1018,10 +1067,10 @@ public:
             std::max<std::int64_t>(0, taskDurationMs);
         fiveHourRateThreadId_ = metrics.threadId;
 
-        // Seed from the currently displayed quota value. For a normal task
-        // start, taskDurationMs is approximately zero. If CodexTaskbar attaches
-        // mid-task, this same pair becomes the temporary attach baseline.
-        if (quotaValid_ && quota_.fiveHour.valid) {
+        // Seed from the last known valid 5h snapshot even when the latest
+        // refresh is temporarily unavailable. One sample is enough to show
+        // 0.000%/min once elapsed time starts advancing.
+        if (quota_.fiveHour.valid) {
             ObserveFiveHourQuota(quota_, taskDurationMs);
         }
     }
@@ -1055,7 +1104,7 @@ public:
     FiveHourConsumptionRateAtDuration(
         std::int64_t currentDurationMs) const {
         if (!fiveHourRateTracking_ ||
-            fiveHourRateSampleCount_ < 2 ||
+            fiveHourRateSampleCount_ < 1 ||
             currentDurationMs < 0) {
             return std::nullopt;
         }
@@ -1065,8 +1114,11 @@ public:
         if (elapsedMs <= 0) return std::nullopt;
 
         const int consumed =
-            fiveHourRateMaxRemaining_ - fiveHourRateMinRemaining_;
-        if (consumed < 0) return std::nullopt;
+            fiveHourRateAccumulatedConsumed_ +
+            std::max(
+                0,
+                fiveHourRateMaxRemaining_ -
+                    fiveHourRateMinRemaining_);
 
         const double elapsedMinutes =
             static_cast<double>(elapsedMs) / 60000.0;
@@ -1082,8 +1134,12 @@ public:
         if (!threadMetrics_.activeTurn) {
             return std::nullopt;
         }
+        const std::int64_t currentDurationMs =
+            CurrentTaskDurationMs();
         return FiveHourConsumptionRateAtDuration(
-            CurrentTaskDurationMs());
+            std::max(
+                currentDurationMs,
+                fiveHourRateLastTaskDurationMs_));
     }
 
     std::optional<TurnCacheEstimate>
@@ -1229,6 +1285,7 @@ public:
         // value. Small timing jitter must not reset the 5h history.
         const bool taskDurationRestarted =
             fiveHourRateTracking_ &&
+            !taskWasActive &&
             taskNowActive &&
             incomingTaskDurationMs >= 0 &&
             fiveHourRateLastTaskDurationMs_ >= 0 &&
@@ -1258,7 +1315,9 @@ public:
                    fiveHourRateTracking_ &&
                    incomingTaskDurationMs >= 0) {
             fiveHourRateLastTaskDurationMs_ =
-                incomingTaskDurationMs;
+                std::max(
+                    fiveHourRateLastTaskDurationMs_,
+                    incomingTaskDurationMs);
         }
 
         const bool cacheThreadChanged =
@@ -4763,7 +4822,7 @@ private:
             hoverLines_.push_back(std::move(line));
         };
 
-        if (quotaValid_ && quota_.fiveHour.valid) {
+        if (quota_.fiveHour.valid) {
             addLine({
                 {L"5小时：剩余 ", white},
                 {std::to_wstring(quota_.fiveHour.remainingPercent),
@@ -4771,7 +4830,7 @@ private:
                         quota_.fiveHour.remainingPercent,
                         true,
                         true)},
-                {L"% · 恢复 " + FormatResetTime(
+                {L"% · 恢复 " + FormatFiveHourReset(
                     quota_.fiveHour.resetsAtUnix), white}});
         } else {
             addLine({
@@ -4827,7 +4886,7 @@ private:
             addLine(std::move(line));
         }
 
-        if (quotaValid_ && quota_.sevenDay.valid) {
+        if (quota_.sevenDay.valid) {
             addLine({
                 {L"7天：剩余 ", white},
                 {std::to_wstring(quota_.sevenDay.remainingPercent),
@@ -5452,6 +5511,8 @@ private:
     int fiveHourRateSampleCount_{0};
     int fiveHourRateMaxRemaining_{0};
     int fiveHourRateMinRemaining_{0};
+    int fiveHourRateAccumulatedConsumed_{0};
+    int fiveHourRateLastRemaining_{-1};
     std::int64_t fiveHourRateResetAtUnix_{0};
     std::int64_t fiveHourRateStartTaskDurationMs_{0};
     std::int64_t fiveHourRateLastTaskDurationMs_{0};
