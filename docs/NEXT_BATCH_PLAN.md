@@ -209,3 +209,31 @@ No extra polling/request requirement:
 - Reuse the existing quota snapshots.
 - Do not issue additional quota reads solely to establish the baseline.
 - If no post-work/attach quota snapshot is available yet, show no live estimate and retain the previous final value where applicable.
+
+
+## 7. Mid-task startup optimization for the v0.3.11 5h-rate model
+
+Current v0.3.11 behavior:
+
+- During a task, the live 5h consumption estimate uses the task's observed maximum/minimum 5h remaining percentage and divides by the task duration.
+- This is simple and robust when CodexTaskbar was already running at or before task start.
+- If CodexTaskbar itself starts while a task has already been running for some time, the program cannot know the historical 5h quota value from the true task start.
+
+Required optimization:
+
+- Detect the attach-mid-task case when CodexTaskbar first sees an already-active task whose displayed task duration is greater than zero.
+- At attach time, save a matched pair:
+  - attach remaining 5h percentage;
+  - attach task elapsed duration.
+- While that already-running task continues, temporarily calculate the observed rate from the attach point:
+  - consumed = attachRemaining - currentRemaining (or equivalently max/min over samples observed since attach);
+  - elapsed = currentTaskDuration - attachTaskDuration;
+  - rate = consumed / elapsedMinutes.
+- Do **not** divide post-attach consumption by the full historical task duration, because CodexTaskbar did not observe the earlier quota consumption.
+- Turn-ID changes caused by user follow-up messages must not reset this attach baseline as long as it is still the same active bound thread/task.
+- Once the current task ends, freeze the final observed rate in the existing "previous 5h consumption rate" display.
+- The next task that starts while CodexTaskbar is already running should return to the normal full-task v0.3.11 calculation.
+- If the 5h quota window rolls over during the task, establish a new matched remaining-percentage/task-duration pair for the new window.
+- No extra quota polling is required; reuse the existing quota snapshots.
+
+This is an optimization item only; do not implement it until separately scheduled.
