@@ -1096,6 +1096,8 @@ public:
                     generationSpeedTurnSampleSum_ /
                     static_cast<double>(generationSpeedTurnSampleCount_);
                 generationSpeedStoredTurnAverageValid_ = true;
+            } else {
+                generationSpeedStoredTurnAverageValid_ = false;
             }
 
             generationSpeedThreadId_ = metrics.threadId;
@@ -1112,6 +1114,8 @@ public:
             if (metrics.outputTokens < generationSpeedLastOutputTokens_) {
                 generationSpeedValid_ = false;
                 generationSpeedRecent_.clear();
+                generationSpeedTurnSampleSum_ = 0.0;
+                generationSpeedTurnSampleCount_ = 0;
                 generationSpeedLastOutputTokens_ = metrics.outputTokens;
                 generationSpeedLastSampleMs_ = nowMs;
             } else if (metrics.outputTokens > generationSpeedLastOutputTokens_) {
@@ -1157,12 +1161,15 @@ public:
             }
         }
 
-        if (taskWasActive && !taskNowActive &&
-            generationSpeedTurnSampleCount_ >= 5) {
-            generationSpeedStoredTurnAverage_ =
-                generationSpeedTurnSampleSum_ /
-                static_cast<double>(generationSpeedTurnSampleCount_);
-            generationSpeedStoredTurnAverageValid_ = true;
+        if (taskWasActive && !taskNowActive) {
+            if (generationSpeedTurnSampleCount_ >= 5) {
+                generationSpeedStoredTurnAverage_ =
+                    generationSpeedTurnSampleSum_ /
+                    static_cast<double>(generationSpeedTurnSampleCount_);
+                generationSpeedStoredTurnAverageValid_ = true;
+            } else {
+                generationSpeedStoredTurnAverageValid_ = false;
+            }
         }
 
         threadMetrics_ = metrics;
@@ -3899,7 +3906,7 @@ private:
                     L")",
                     white}});
         } else {
-            addLine({{{L"缓存：暂无数据", white}}});
+            addLine({{L"缓存：暂无数据", white}});
         }
 
         if (threadMetrics_.hasTokenUsage) {
@@ -3909,7 +3916,7 @@ private:
                     FormatInteger(threadMetrics_.outputTokens),
                     white}});
         } else {
-            addLine({{{L"总 Token：暂无数据", white}}});
+            addLine({{L"总 Token：暂无数据", white}});
         }
 
         {
@@ -4045,7 +4052,7 @@ private:
                 }
                 addLine(std::move(line));
             } else {
-                addLine({{{L"任务耗时：暂无", white}}});
+                addLine({{L"任务耗时：暂无", white}});
             }
         }
 
@@ -4065,7 +4072,7 @@ private:
                     kWarningRed}};
             addLine(std::move(line));
         } else {
-            addLine({{{L"代码改动：本轮暂无", white}}});
+            addLine({{L"代码改动：本轮暂无", white}});
         }
 
         {
