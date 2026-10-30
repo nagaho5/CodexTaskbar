@@ -119,6 +119,12 @@ struct GenerationSpeedSample {
     double speed{0.0};
 };
 
+struct FiveHourRateEstimate {
+    double ratePerMinute{0.0};
+    int consumedPercent{0};
+    std::int64_t elapsedMs{0};
+};
+
 struct TaskbarCandidate {
     HWND window{nullptr};
     bool primary{false};
@@ -538,6 +544,36 @@ std::wstring FormatDurationVerbose(std::int64_t milliseconds) {
     return result;
 }
 
+std::wstring FormatRateDurationCompact(std::int64_t milliseconds) {
+    if (milliseconds < 0) return {};
+
+    const std::int64_t totalSeconds = milliseconds / 1000;
+    const std::int64_t hours = totalSeconds / 3600;
+    const std::int64_t minutes = (totalSeconds % 3600) / 60;
+    const std::int64_t seconds = totalSeconds % 60;
+
+    if (hours > 0) {
+        std::wstring result = std::to_wstring(hours) + L"小时";
+        if (minutes > 0) {
+            result += std::to_wstring(minutes) + L"分";
+        }
+        if (seconds > 0) {
+            result += std::to_wstring(seconds) + L"秒";
+        }
+        return result;
+    }
+
+    if (minutes > 0) {
+        if (seconds == 0) {
+            return std::to_wstring(minutes) + L"分钟";
+        }
+        return std::to_wstring(minutes) + L"分" +
+            std::to_wstring(seconds) + L"秒";
+    }
+
+    return std::to_wstring(seconds) + L"秒";
+}
+
 std::wstring FormatDurationUnits(std::int64_t milliseconds) {
     if (milliseconds < 0) return {};
     const std::int64_t totalSeconds = milliseconds / 1000;
@@ -813,7 +849,9 @@ public:
         }
     }
 
-    void ObserveFiveHourQuota(const QuotaSnapshot& snapshot) {
+    void ObserveFiveHourQuota(
+        const QuotaSnapshot& snapshot,
+        std::int64_t taskDurationMs) {
         if (!fiveHourRateTracking_ || !snapshot.fiveHour.valid) {
             return;
         }
@@ -821,12 +859,16 @@ public:
         const int remaining = snapshot.fiveHour.remainingPercent;
         if (fiveHourRateSampleCount_ == 0 ||
             snapshot.fiveHour.resetsAtUnix != fiveHourRateResetAtUnix_) {
-            // First sample for this task, or the 5h window rolled over.
-            // Never mix percentages from two different quota windows.
+            // First observed sample for this tracking interval, or the 5h
+            // quota window rolled over. Pair the quota value with the task
+            // duration observed at the same moment so mid-task attachment
+            // never divides post-attach consumption by earlier unobserved time.
             fiveHourRateMaxRemaining_ = remaining;
             fiveHourRateMinRemaining_ = remaining;
             fiveHourRateSampleCount_ = 1;
             fiveHourRateResetAtUnix_ = snapshot.fiveHour.resetsAtUnix;
+            fiveHourRateStartTaskDurationMs_ =
+                std::max<std::int64_t>(0, taskDurationMs);
             return;
         }
 
@@ -840,18 +882,24 @@ public:
     void BeginFiveHourRateTracking(const ThreadMetrics& metrics) {
         if (!metrics.activeTurn) return;
 
+        const std::int64_t nowMs = CurrentUnixMilliseconds();
+        const std::int64_t taskDurationMs =
+            TaskDurationMsForMetrics(metrics, nowMs);
+
         fiveHourRateTracking_ = true;
         fiveHourRateSampleCount_ = 0;
         fiveHourRateMaxRemaining_ = 0;
         fiveHourRateMinRemaining_ = 0;
         fiveHourRateResetAtUnix_ = 0;
+        fiveHourRateStartTaskDurationMs_ =
+            std::max<std::int64_t>(0, taskDurationMs);
         fiveHourRateThreadId_ = metrics.threadId;
 
-        // Seed the task with the currently displayed 5h quota value. This
-        // makes the next normal quota refresh enough to produce a live rate,
-        // while all later samples still come from the task's active period.
+        // Seed from the currently displayed quota value. For a normal task
+        // start, taskDurationMs is approximately zero. If CodexTaskbar attaches
+        // mid-task, this same pair becomes the temporary attach baseline.
         if (quotaValid_ && quota_.fiveHour.valid) {
-            ObserveFiveHourQuota(quota_);
+            ObserveFiveHourQuota(quota_, taskDurationMs);
         }
     }
 
@@ -863,7 +911,9 @@ public:
         lastQuotaSuccessMs_ = nowMs;
 
         if (threadMetrics_.activeTurn && fiveHourRateTracking_) {
-            ObserveFiveHourQuota(snapshot);
+            ObserveFiveHourQuota(
+                snapshot,
+                CurrentTaskDurationMs());
         }
 
         InvalidateWidget();
@@ -878,24 +928,32 @@ public:
         UpdateTrayTip();
     }
 
-    std::optional<double> CurrentFiveHourConsumptionRate() const {
+    std::optional<FiveHourRateEstimate>
+    CurrentFiveHourConsumptionRate() const {
         if (!fiveHourRateTracking_ ||
             !threadMetrics_.activeTurn ||
             fiveHourRateSampleCount_ < 2) {
             return std::nullopt;
         }
 
-        const std::int64_t durationMs = CurrentTaskDurationMs();
-        if (durationMs <= 0) return std::nullopt;
+        const std::int64_t currentDurationMs = CurrentTaskDurationMs();
+        if (currentDurationMs < 0) return std::nullopt;
+
+        const std::int64_t elapsedMs =
+            currentDurationMs - fiveHourRateStartTaskDurationMs_;
+        if (elapsedMs <= 0) return std::nullopt;
 
         const int consumed =
             fiveHourRateMaxRemaining_ - fiveHourRateMinRemaining_;
         if (consumed < 0) return std::nullopt;
 
         const double elapsedMinutes =
-            static_cast<double>(durationMs) / 60000.0;
-        return static_cast<double>(consumed) /
-            std::max(0.001, elapsedMinutes);
+            static_cast<double>(elapsedMs) / 60000.0;
+        return FiveHourRateEstimate{
+            static_cast<double>(consumed) /
+                std::max(0.001, elapsedMinutes),
+            consumed,
+            elapsedMs};
     }
 
     std::optional<double> RecentGenerationAverage() const {
@@ -947,8 +1005,11 @@ public:
         if (fiveHourRateTracking_ &&
             taskWasActive &&
             ((metrics.valid && !taskNowActive) || rateThreadChanged)) {
-            if (const auto rate = CurrentFiveHourConsumptionRate()) {
-                fiveHourRateStoredValue_ = *rate;
+            if (const auto estimate = CurrentFiveHourConsumptionRate()) {
+                fiveHourRateStoredValue_ = estimate->ratePerMinute;
+                fiveHourRateStoredConsumedPercent_ =
+                    estimate->consumedPercent;
+                fiveHourRateStoredElapsedMs_ = estimate->elapsedMs;
                 fiveHourRateStoredValid_ = true;
             } else {
                 fiveHourRateStoredValid_ = false;
@@ -3032,19 +3093,27 @@ private:
         return line;
     }
 
-    std::int64_t CurrentTaskDurationMs() const {
-        if (!threadMetrics_.hasTurnTiming) return -1;
+    std::int64_t TaskDurationMsForMetrics(
+        const ThreadMetrics& metrics,
+        std::int64_t nowMs) const {
+        if (!metrics.hasTurnTiming) return -1;
 
-        if (threadMetrics_.activeTurn && threadMetrics_.turnStartedAtMs > 0) {
+        if (metrics.activeTurn && metrics.turnStartedAtMs > 0) {
             return std::max<std::int64_t>(
                 0,
-                CurrentUnixMilliseconds() - threadMetrics_.turnStartedAtMs);
+                nowMs - metrics.turnStartedAtMs);
         }
 
-        if (threadMetrics_.turnDurationMs >= 0) {
-            return threadMetrics_.turnDurationMs;
+        if (metrics.turnDurationMs >= 0) {
+            return metrics.turnDurationMs;
         }
         return -1;
+    }
+
+    std::int64_t CurrentTaskDurationMs() const {
+        return TaskDurationMsForMetrics(
+            threadMetrics_,
+            CurrentUnixMilliseconds());
     }
 
     std::wstring GenerationSpeedText() const {
@@ -3450,22 +3519,36 @@ private:
 
         if (threadMetrics_.activeTurn) {
             text += L"\r\n5h消耗速度（估算）：";
-            if (const auto rate = CurrentFiveHourConsumptionRate()) {
-                wchar_t rateText[48]{};
-                swprintf_s(rateText, L"%.3f%%/分钟", *rate);
+            if (const auto estimate = CurrentFiveHourConsumptionRate()) {
+                wchar_t rateText[64]{};
+                swprintf_s(
+                    rateText,
+                    L"%.3f%%/分钟",
+                    estimate->ratePerMinute);
                 text += rateText;
+                text += L"（" +
+                    std::to_wstring(estimate->consumedPercent) +
+                    L"%/" +
+                    FormatRateDurationCompact(estimate->elapsedMs) +
+                    L"）";
             } else {
                 text += L"暂无";
             }
         } else {
             text += L"\r\n上次5h消耗速度（估算）：";
             if (fiveHourRateStoredValid_) {
-                wchar_t rateText[48]{};
+                wchar_t rateText[64]{};
                 swprintf_s(
                     rateText,
                     L"%.3f%%/分钟",
                     fiveHourRateStoredValue_);
                 text += rateText;
+                text += L"（" +
+                    std::to_wstring(fiveHourRateStoredConsumedPercent_) +
+                    L"%/" +
+                    FormatRateDurationCompact(
+                        fiveHourRateStoredElapsedMs_) +
+                    L"）";
             } else {
                 text += L"暂无";
             }
@@ -3473,7 +3556,10 @@ private:
 
         text += L"\r\n";
         if (quotaValid_ && quota_.sevenDay.valid) {
-            text += L"7天：剩余 " + std::to_wstring(quota_.sevenDay.remainingPercent) + L"%";
+            text += L"7天：剩余 " +
+                std::to_wstring(quota_.sevenDay.remainingPercent) +
+                L"% · 恢复 " +
+                FormatResetTime(quota_.sevenDay.resetsAtUnix);
         } else {
             text += L"7天：暂无数据";
         }
@@ -3671,7 +3757,7 @@ private:
         case kMenuAbout:
             MessageBoxW(
                 mainWindow_,
-                L"CodexTaskbar v0.3.11\n\n"
+                L"CodexTaskbar v0.3.12\n\n"
                 L"在 Windows 10 任务栏显示 Codex 配额、绑定会话上下文/缓存和本轮代码改动。\n"
                 L"配额来自官方 app-server；会话指标通过只读 Codex Desktop IPC follower 获取。",
                 L"关于 CodexTaskbar",
@@ -3880,10 +3966,13 @@ private:
     bool fiveHourRateTracking_{false};
     bool fiveHourRateStoredValid_{false};
     double fiveHourRateStoredValue_{0.0};
+    int fiveHourRateStoredConsumedPercent_{0};
+    std::int64_t fiveHourRateStoredElapsedMs_{0};
     int fiveHourRateSampleCount_{0};
     int fiveHourRateMaxRemaining_{0};
     int fiveHourRateMinRemaining_{0};
     std::int64_t fiveHourRateResetAtUnix_{0};
+    std::int64_t fiveHourRateStartTaskDurationMs_{0};
     std::string fiveHourRateThreadId_;
 
     std::array<wchar_t, 1024> tooltipBuffer_{};
