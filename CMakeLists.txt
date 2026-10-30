@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(CodexTaskbar VERSION 0.3.10 LANGUAGES CXX)
+project(CodexTaskbar VERSION 0.3.11 LANGUAGES CXX)
 
 add_executable(CodexTaskbar WIN32
     src/main.cpp
