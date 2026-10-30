@@ -3550,14 +3550,21 @@ private:
                 static_cast<int>(monitorInfo.rcMonitor.top),
                 static_cast<int>(monitorInfo.rcMonitor.bottom) - height));
 
-        SetWindowPos(
-            hoverWindow_,
-            HWND_TOPMOST,
-            x,
-            y,
-            width,
-            height,
-            SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+        const int currentWidth = current.right - current.left;
+        const int currentHeight = current.bottom - current.top;
+        if (x != current.left ||
+            y != current.top ||
+            width != currentWidth ||
+            height != currentHeight) {
+            SetWindowPos(
+                hoverWindow_,
+                HWND_TOPMOST,
+                x,
+                y,
+                width,
+                height,
+                SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+        }
     }
 
     void PaintHoverPopup(HWND hwnd) {
