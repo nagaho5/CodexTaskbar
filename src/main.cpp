@@ -90,6 +90,16 @@ constexpr int kComboFontChoice = 2025;
 constexpr int kEditSavedThreads = 2026;
 constexpr int kComboGenerationSpeedMode = 2027;
 constexpr int kCheckCompactHourUnderline = 2028;
+constexpr int kCheckHideWidgetWhenPinned = 2029;
+constexpr int kComboCacheScope = 2030;
+
+constexpr int kHoverDefaultWidth = 560;
+constexpr int kHoverDefaultHeight = 520;
+constexpr int kHoverMinWidth = 320;
+constexpr int kHoverMinHeight = 240;
+constexpr int kHoverMaxWidth = 1200;
+constexpr int kHoverMaxHeight = 1000;
+constexpr int kHoverResizeMargin = 7;
 
 constexpr COLORREF kDefaultWorkingColor = RGB(79, 195, 247);
 constexpr COLORREF kWarningYellow = RGB(255, 196, 64);
@@ -133,6 +143,12 @@ struct FiveHourRateEstimate {
     double ratePerMinute{0.0};
     int consumedPercent{0};
     std::int64_t elapsedMs{0};
+};
+
+struct TurnCacheEstimate {
+    double percent{0.0};
+    std::int64_t cachedDelta{0};
+    std::int64_t inputDelta{0};
 };
 
 struct TaskbarCandidate {
@@ -739,6 +755,9 @@ public:
         if (widgetFont_ && widgetFont_ != font_) {
             DeleteObject(widgetFont_);
         }
+        if (hoverFont_) {
+            DeleteObject(hoverFont_);
+        }
         if (darkBackgroundBrush_) {
             DeleteObject(darkBackgroundBrush_);
         }
@@ -763,6 +782,16 @@ public:
             240)) / 10.0;
         autoStart_ = ReadRegistryDword(L"AutoStart", 1) != 0;
         pinHover_ = ReadRegistryDword(L"PinHover", 0) != 0;
+        hideWidgetWhenPinned_ =
+            ReadRegistryDword(L"HideWidgetWhenPinned", 0) != 0;
+        hoverPinnedWidth_ = std::clamp(
+            ReadRegistryDword(L"HoverPinnedWidth", kHoverDefaultWidth),
+            kHoverMinWidth,
+            kHoverMaxWidth);
+        hoverPinnedHeight_ = std::clamp(
+            ReadRegistryDword(L"HoverPinnedHeight", kHoverDefaultHeight),
+            kHoverMinHeight,
+            kHoverMaxHeight);
         showFiveHourPercent_ = ReadRegistryDword(L"ShowFiveHourPercent", 1) != 0;
         showFiveHourTime_ = ReadRegistryDword(L"ShowFiveHourTime", 1) != 0;
         showSevenDayPercent_ = ReadRegistryDword(L"ShowSevenDayPercent", 1) != 0;
@@ -784,7 +813,10 @@ public:
             ? std::clamp(savedFontChoice, 0, 4)
             : (ReadRegistryDword(L"NarrowFont", 0) != 0 ? 4 : 0);
         autoFitFont_ = ReadRegistryDword(L"AutoFitFont", 0) != 0;
-        cacheDisplayMode_ = std::clamp(ReadRegistryDword(L"CacheDisplayMode", 0), 0, 3);
+        cacheDisplayMode_ = std::clamp(
+            ReadRegistryDword(L"CacheDisplayMode", 0), 0, 3);
+        cacheScopeMode_ = std::clamp(
+            ReadRegistryDword(L"CacheScopeMode", 0), 0, 1);
         showGenerationSpeed_ = ReadRegistryDword(L"ShowGenerationSpeed", 0) != 0;
         generationSpeedMode_ = std::clamp(ReadRegistryDword(L"GenerationSpeedMode", 0), 0, 2);
         compactHourUnderline_ = ReadRegistryDword(L"CompactHourUnderline", 0) != 0;
@@ -890,6 +922,9 @@ public:
                     fiveHourRateSampleCount_ = 0;
                     fiveHourRateStoredValid_ = false;
                     fiveHourRateThreadId_.clear();
+                    turnCacheTracking_ = false;
+                    turnCacheStoredValid_ = false;
+                    turnCacheThreadId_.clear();
                     rendererActivityMonitor_.Reset();
                     UpdateBlinkTimer();
                     InvalidateWidget();
@@ -1023,6 +1058,70 @@ public:
             CurrentTaskDurationMs());
     }
 
+    std::optional<TurnCacheEstimate>
+    TurnCacheEstimateForMetrics(const ThreadMetrics& metrics) const {
+        if (!turnCacheTracking_ || !metrics.hasCache) {
+            return std::nullopt;
+        }
+
+        const std::int64_t inputDelta =
+            metrics.inputTokens - turnCacheStartInputTokens_;
+        const std::int64_t cachedDelta =
+            metrics.cachedInputTokens - turnCacheStartCachedInputTokens_;
+        if (inputDelta <= 0 || cachedDelta < 0 || cachedDelta > inputDelta) {
+            return std::nullopt;
+        }
+
+        return TurnCacheEstimate{
+            std::clamp(
+                100.0 * static_cast<double>(cachedDelta) /
+                    static_cast<double>(inputDelta),
+                0.0,
+                100.0),
+            cachedDelta,
+            inputDelta};
+    }
+
+    std::optional<TurnCacheEstimate> CurrentTurnCacheEstimate() const {
+        if (!threadMetrics_.activeTurn) {
+            return std::nullopt;
+        }
+        return TurnCacheEstimateForMetrics(threadMetrics_);
+    }
+
+    void FreezeTurnCacheEstimate(const ThreadMetrics& metrics) {
+        if (const auto estimate = TurnCacheEstimateForMetrics(metrics)) {
+            turnCacheStoredPercent_ = estimate->percent;
+            turnCacheStoredCachedDelta_ = estimate->cachedDelta;
+            turnCacheStoredInputDelta_ = estimate->inputDelta;
+            turnCacheStoredValid_ = true;
+        } else {
+            turnCacheStoredValid_ = false;
+        }
+    }
+
+    void BeginTurnCacheTracking(
+        const ThreadMetrics& metrics,
+        std::int64_t taskDurationMs,
+        const ThreadMetrics* baselineMetrics = nullptr) {
+        if (!metrics.activeTurn || !metrics.hasCache) {
+            return;
+        }
+
+        const ThreadMetrics* baseline =
+            baselineMetrics && baselineMetrics->hasCache
+                ? baselineMetrics
+                : &metrics;
+
+        turnCacheTracking_ = true;
+        turnCacheStartInputTokens_ = baseline->inputTokens;
+        turnCacheStartCachedInputTokens_ =
+            baseline->cachedInputTokens;
+        turnCacheLastTaskDurationMs_ =
+            std::max<std::int64_t>(0, taskDurationMs);
+        turnCacheThreadId_ = metrics.threadId;
+    }
+
     std::optional<double> RecentGenerationAverage() const {
         if (generationSpeedRecent_.size() < 5) {
             return std::nullopt;
@@ -1132,6 +1231,70 @@ public:
                    incomingTaskDurationMs >= 0) {
             fiveHourRateLastTaskDurationMs_ =
                 incomingTaskDurationMs;
+        }
+
+        const bool cacheThreadChanged =
+            !turnCacheThreadId_.empty() &&
+            !metrics.threadId.empty() &&
+            metrics.threadId != turnCacheThreadId_;
+        const bool cacheDurationRestarted =
+            turnCacheTracking_ &&
+            taskNowActive &&
+            incomingTaskDurationMs >= 0 &&
+            turnCacheLastTaskDurationMs_ >= 0 &&
+            incomingTaskDurationMs + 5000 <
+                turnCacheLastTaskDurationMs_;
+        const bool startNewCacheTask =
+            cacheThreadChanged || cacheDurationRestarted;
+
+        // Like the 5h estimator, keep the cache baseline alive across brief
+        // activeTurn=false gaps. Freeze a snapshot for idle display, but only
+        // start over when the thread changes or task duration clearly restarts.
+        if (turnCacheTracking_ &&
+            taskWasActive &&
+            metrics.valid &&
+            !taskNowActive) {
+            FreezeTurnCacheEstimate(threadMetrics_);
+        }
+
+        if (turnCacheTracking_ && startNewCacheTask) {
+            FreezeTurnCacheEstimate(threadMetrics_);
+            turnCacheTracking_ = false;
+            turnCacheThreadId_.clear();
+        }
+
+        if (taskNowActive &&
+            metrics.hasCache &&
+            !turnCacheTracking_) {
+            const bool sameObservedThread =
+                threadMetrics_.threadId.empty() ||
+                metrics.threadId.empty() ||
+                threadMetrics_.threadId == metrics.threadId;
+            const ThreadMetrics* baselineMetrics =
+                !taskWasActive &&
+                threadMetrics_.hasCache &&
+                sameObservedThread
+                    ? &threadMetrics_
+                    : nullptr;
+            BeginTurnCacheTracking(
+                metrics,
+                std::max<std::int64_t>(0, incomingTaskDurationMs),
+                baselineMetrics);
+        } else if (taskNowActive &&
+                   turnCacheTracking_ &&
+                   incomingTaskDurationMs >= 0) {
+            // Cumulative counters should never move backwards inside one task.
+            // If Codex refreshes/replaces the cumulative usage snapshot, reset
+            // only this cache baseline rather than showing a negative delta.
+            if (metrics.hasCache &&
+                (metrics.inputTokens < turnCacheStartInputTokens_ ||
+                 metrics.cachedInputTokens <
+                     turnCacheStartCachedInputTokens_)) {
+                BeginTurnCacheTracking(metrics, incomingTaskDurationMs);
+            } else {
+                turnCacheLastTaskDurationMs_ =
+                    incomingTaskDurationMs;
+            }
         }
 
         if (identityChanged) {
@@ -1326,12 +1489,13 @@ public:
         return result;
     }
 
-    std::wstring CacheTaskbarText() const {
-        if (!threadMetrics_.hasCache) {
+    std::wstring FormatCacheTaskbarValue(
+        double exact,
+        bool valid) const {
+        if (!valid) {
             return hidePercentSigns_ ? L"--" : L"--%";
         }
 
-        const double exact = ExactCachePercent();
         if (cacheDisplayMode_ == 1) {
             return FixedCachePercent(exact, 1);
         }
@@ -1352,11 +1516,37 @@ public:
             if (hundredths >= 10000) {
                 return L"100";
             }
-            // Below 90%, fall back to an unambiguous two-decimal display.
             return FixedCachePercent(exact, 2);
         }
+
         return TaskbarPercentText(
-            threadMetrics_.cachePercent,
+            static_cast<int>(std::lround(exact)),
+            true);
+    }
+
+    std::optional<double> DisplayTurnCachePercent() const {
+        if (threadMetrics_.activeTurn) {
+            if (const auto estimate = CurrentTurnCacheEstimate()) {
+                return estimate->percent;
+            }
+            return std::nullopt;
+        }
+        if (turnCacheStoredValid_) {
+            return turnCacheStoredPercent_;
+        }
+        return std::nullopt;
+    }
+
+    std::wstring CacheTaskbarText() const {
+        if (cacheScopeMode_ == 1) {
+            const auto turnPercent = DisplayTurnCachePercent();
+            return FormatCacheTaskbarValue(
+                turnPercent.value_or(0.0),
+                turnPercent.has_value());
+        }
+
+        return FormatCacheTaskbarValue(
+            ExactCachePercent(),
             threadMetrics_.hasCache);
     }
 
@@ -1668,6 +1858,9 @@ public:
         fiveHourRateSampleCount_ = 0;
         fiveHourRateStoredValid_ = false;
         fiveHourRateThreadId_.clear();
+        turnCacheTracking_ = false;
+        turnCacheStoredValid_ = false;
+        turnCacheThreadId_.clear();
 
         WriteRegistryDword(L"AutomaticThreadMode", 0);
         WriteRegistryString(L"ManualThreadId", manualThreadId_);
@@ -1956,6 +2149,11 @@ public:
             speedMode, CB_SETCURSEL,
             static_cast<WPARAM>(generationSpeedMode_), 0);
 
+        checkbox(
+            kCheckHideWidgetWhenPinned,
+            L"固定悬浮窗时隐藏任务栏信息区",
+            24, 322, hideWidgetWhenPinned_, 320);
+
         // Right column: presentation and alert behavior.
         CreateWindowW(L"STATIC", L"显示样式与提醒", WS_CHILD | WS_VISIBLE,
             400, 62, 200, 24, hwnd, nullptr, instance_, nullptr);
@@ -1984,18 +2182,29 @@ public:
         checkbox(kCheckAutoFitFont, L"溢出时逐行微缩 (最多 2pt)",
             400, 262, autoFitFont_, 280);
 
-        CreateWindowW(L"STATIC", L"Cache显示：", WS_CHILD | WS_VISIBLE,
-            400, 294, 92, 24, hwnd, nullptr, instance_, nullptr);
+        CreateWindowW(L"STATIC", L"Cache格式：", WS_CHILD | WS_VISIBLE,
+            400, 294, 88, 24, hwnd, nullptr, instance_, nullptr);
         HWND cacheMode = CreateWindowExW(
             WS_EX_CLIENTEDGE, L"COMBOBOX", nullptr,
             WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
-            494, 289, 170, 150, hwnd,
+            488, 289, 110, 150, hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kComboCacheDisplayMode)), instance_, nullptr);
         SendMessageW(cacheMode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"整数"));
         SendMessageW(cacheMode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"1位小数"));
         SendMessageW(cacheMode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"2位小数"));
         SendMessageW(cacheMode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"90+紧凑"));
         SendMessageW(cacheMode, CB_SETCURSEL, static_cast<WPARAM>(cacheDisplayMode_), 0);
+
+        CreateWindowW(L"STATIC", L"范围：", WS_CHILD | WS_VISIBLE,
+            610, 294, 48, 24, hwnd, nullptr, instance_, nullptr);
+        HWND cacheScope = CreateWindowExW(
+            WS_EX_CLIENTEDGE, L"COMBOBOX", nullptr,
+            WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+            658, 289, 80, 90, hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kComboCacheScope)), instance_, nullptr);
+        SendMessageW(cacheScope, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"本对话"));
+        SendMessageW(cacheScope, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"本轮"));
+        SendMessageW(cacheScope, CB_SETCURSEL, static_cast<WPARAM>(cacheScopeMode_), 0);
 
         checkbox(
             kCheckCompactHourUnderline,
@@ -2239,6 +2448,8 @@ public:
         blinkOnUserInput_ = checked(kCheckBlinkOnUserInput);
         hidePercentSigns_ = checked(kCheckHidePercentSigns);
         autoFitFont_ = checked(kCheckAutoFitFont);
+        hideWidgetWhenPinned_ =
+            checked(kCheckHideWidgetWhenPinned);
 
         const LRESULT fontSelection =
             SendDlgItemMessageW(hwnd, kComboFontChoice, CB_GETCURSEL, 0, 0);
@@ -2251,6 +2462,17 @@ public:
         cacheDisplayMode_ = cacheSelection == CB_ERR
             ? 0
             : std::clamp(static_cast<int>(cacheSelection), 0, 3);
+
+        const LRESULT cacheScopeSelection =
+            SendDlgItemMessageW(
+                hwnd,
+                kComboCacheScope,
+                CB_GETCURSEL,
+                0,
+                0);
+        cacheScopeMode_ = cacheScopeSelection == CB_ERR
+            ? 0
+            : std::clamp(static_cast<int>(cacheScopeSelection), 0, 1);
 
         const LRESULT speedSelection =
             SendDlgItemMessageW(
@@ -2312,6 +2534,10 @@ public:
         WriteRegistryDword(L"NarrowFont", fontChoice_ == 4 ? 1u : 0u);
         WriteRegistryDword(L"AutoFitFont", autoFitFont_ ? 1u : 0u);
         WriteRegistryDword(L"CacheDisplayMode", static_cast<DWORD>(cacheDisplayMode_));
+        WriteRegistryDword(L"CacheScopeMode", static_cast<DWORD>(cacheScopeMode_));
+        WriteRegistryDword(
+            L"HideWidgetWhenPinned",
+            hideWidgetWhenPinned_ ? 1u : 0u);
         WriteRegistryDword(L"AutomaticThreadMode", automaticThreadMode_ ? 1u : 0u);
         WriteRegistryString(L"ManualThreadId", manualThreadId_);
         WriteRegistryString(L"SavedThreads", SerializeSavedThreads(savedThreads_));
@@ -2326,6 +2552,11 @@ public:
         if (widgetVisible_) {
             PositionWidget();
             InvalidateWidget();
+        }
+        if (pinHover_) {
+            ShowPinnedHoverPopup();
+        } else {
+            ApplyPinnedWidgetVisibility();
         }
         UpdateTooltipText();
         DestroyWindow(hwnd);
@@ -2561,9 +2792,33 @@ private:
                 ? app->HoverHitTest(hwnd, lParam)
                 : HTTRANSPARENT;
 
+        case WM_SETCURSOR:
+            if (app && app->HandleHoverSetCursor(hwnd)) {
+                return TRUE;
+            }
+            break;
+
+        case WM_LBUTTONDOWN:
+            if (app && app->HandleHoverLeftButtonDown(hwnd, lParam)) {
+                return 0;
+            }
+            break;
+
+        case WM_MOUSEMOVE:
+            if (app && app->HandleHoverMouseMove(hwnd)) {
+                return 0;
+            }
+            break;
+
         case WM_LBUTTONUP:
             if (app && app->HandleHoverLeftButtonUp(hwnd, lParam)) {
                 return 0;
+            }
+            break;
+
+        case WM_CAPTURECHANGED:
+            if (app) {
+                app->HandleHoverCaptureChanged();
             }
             break;
         }
@@ -2784,6 +3039,43 @@ private:
             face);
     }
 
+    double HoverFontScaleForSize(int width, int height) const {
+        if (!pinHover_) return 1.0;
+        const double widthScale =
+            static_cast<double>(width) /
+            static_cast<double>(kHoverDefaultWidth);
+        const double heightScale =
+            static_cast<double>(height) /
+            static_cast<double>(kHoverDefaultHeight);
+        return std::clamp(
+            std::min(widthScale, heightScale),
+            0.75,
+            1.75);
+    }
+
+    void RecreateHoverFontForSize(int width, int height) {
+        const double targetPointSize =
+            std::round(
+                fontSize_ *
+                HoverFontScaleForSize(width, height) *
+                10.0) / 10.0;
+        if (hoverFont_ &&
+            std::abs(targetPointSize - hoverFontPointSize_) < 0.05) {
+            return;
+        }
+
+        if (hoverFont_) {
+            DeleteObject(hoverFont_);
+            hoverFont_ = nullptr;
+        }
+        hoverFont_ = CreatePointFont(targetPointSize, false);
+        hoverFontPointSize_ = targetPointSize;
+    }
+
+    HFONT HoverFont() const {
+        return hoverFont_ ? hoverFont_ : font_;
+    }
+
     void ClearRowFitCaches() {
         for (auto& cache : rowFitCaches_) {
             if (cache.font) {
@@ -2812,6 +3104,10 @@ private:
         if (!widgetFont_) {
             widgetFont_ = CreatePointFont(fontSize_, false);
         }
+
+        RecreateHoverFontForSize(
+            pinHover_ ? hoverPinnedWidth_ : kHoverDefaultWidth,
+            pinHover_ ? hoverPinnedHeight_ : kHoverDefaultHeight);
     }
 
     int MeasureTextWidth(HDC dc, const std::wstring& text) const {
@@ -3148,6 +3444,14 @@ private:
                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
         }
 
+        if (pinHover_ &&
+            hideWidgetWhenPinned_ &&
+            hoverPopupVisible_ &&
+            widgetWindow_ &&
+            IsWindow(widgetWindow_)) {
+            ShowWindow(widgetWindow_, SW_HIDE);
+        }
+
         InvalidateWidget();
         return true;
     }
@@ -3449,70 +3753,84 @@ private:
             nullptr,
             instance_,
             this);
+        if (hoverWindow_) {
+            ApplyDarkWindowTheme(hoverWindow_);
+        }
     }
 
-    SIZE MeasureHoverContent(
-        HDC dc,
-        int maxContentWidth) const {
-        TEXTMETRICW tm{};
-        GetTextMetricsW(dc, &tm);
-        const int lineHeight = std::max(1, static_cast<int>(tm.tmHeight) + 1);
+    RECT HoverCloseRect(HWND hwnd) const {
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        const int size = 20;
+        const int right = std::max(
+            static_cast<int>(client.left) + size,
+            static_cast<int>(client.right) - 8);
+        const int top = static_cast<int>(client.top) + 4;
+        return RECT{
+            right - size,
+            top,
+            right,
+            std::min(
+                static_cast<int>(client.bottom),
+                top + size)};
+    }
 
-        int widest = 0;
-        int rows = 0;
-        bool wrapped = false;
+    int HoverResizeHitFromClient(HWND hwnd, POINT point) const {
+        if (!pinHover_) return HTNOWHERE;
 
-        for (const auto& line : hoverLines_) {
-            int x = 0;
-            int lineRows = 1;
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        const bool left =
+            point.x >= client.left &&
+            point.x < client.left + kHoverResizeMargin;
+        const bool right =
+            point.x <= client.right &&
+            point.x > client.right - kHoverResizeMargin;
+        const bool top =
+            point.y >= client.top &&
+            point.y < client.top + kHoverResizeMargin;
+        const bool bottom =
+            point.y <= client.bottom &&
+            point.y > client.bottom - kHoverResizeMargin;
 
-            for (const auto& segment : line) {
-                if (segment.text.empty()) continue;
-                SIZE size{};
-                GetTextExtentPoint32W(
-                    dc,
-                    segment.text.c_str(),
-                    static_cast<int>(segment.text.size()),
-                    &size);
-
-                if (x > 0 && x + size.cx > maxContentWidth) {
-                    widest = std::max(widest, x);
-                    x = 0;
-                    ++lineRows;
-                    wrapped = true;
-                }
-                x += size.cx;
-            }
-
-            widest = std::max(widest, x);
-            rows += lineRows;
-        }
-
-        return SIZE{
-            wrapped
-                ? maxContentWidth
-                : std::min(maxContentWidth, widest),
-            rows * lineHeight};
+        if (top && left) return HTTOPLEFT;
+        if (top && right) return HTTOPRIGHT;
+        if (bottom && left) return HTBOTTOMLEFT;
+        if (bottom && right) return HTBOTTOMRIGHT;
+        if (left) return HTLEFT;
+        if (right) return HTRIGHT;
+        if (top) return HTTOP;
+        if (bottom) return HTBOTTOM;
+        return HTNOWHERE;
     }
 
     void DrawHoverContent(
         HDC dc,
         const RECT& client) const {
         const int padding = 10;
-        const int closeReserve = pinHover_ ? 22 : 0;
         const int left = client.left + padding;
-        const int right = std::max(
-            left + 1,
-            static_cast<int>(client.right) - padding - closeReserve);
 
         TEXTMETRICW tm{};
         GetTextMetricsW(dc, &tm);
-        const int lineHeight = std::max(1, static_cast<int>(tm.tmHeight) + 1);
+        const int lineHeight =
+            std::max(1, static_cast<int>(tm.tmHeight) + 1);
 
         int y = client.top + padding;
-        for (const auto& line : hoverLines_) {
-            int x = left;
+        for (std::size_t lineIndex = 0;
+             lineIndex < hoverLines_.size();
+             ++lineIndex) {
+            const auto& line = hoverLines_[lineIndex];
+            int right = std::max(
+                left + 1,
+                static_cast<int>(client.right) - padding);
+            if (pinHover_ && lineIndex == 0) {
+                const RECT close = HoverCloseRect(hoverWindow_);
+                right = std::max(
+                    left + 1,
+                    static_cast<int>(close.left) - 4);
+            }
 
+            int x = left;
             for (const auto& segment : line) {
                 if (segment.text.empty()) continue;
 
@@ -3539,76 +3857,6 @@ private:
             }
 
             y += lineHeight;
-        }
-    }
-
-    void FitVisibleHoverPopup() {
-        if (!hoverPopupVisible_ ||
-            !hoverWindow_ ||
-            !IsWindow(hoverWindow_)) {
-            return;
-        }
-
-        HDC dc = GetDC(hoverWindow_);
-        if (!dc) return;
-        HFONT oldFont = font_
-            ? static_cast<HFONT>(SelectObject(dc, font_))
-            : nullptr;
-
-        const int closeReserve = pinHover_ ? 22 : 0;
-        const SIZE measure = MeasureHoverContent(
-            dc,
-            std::max(260, 520 - closeReserve));
-
-        if (oldFont) SelectObject(dc, oldFont);
-        ReleaseDC(hoverWindow_, dc);
-
-        const int padding = 10;
-        const int width = std::clamp(
-            static_cast<int>(measure.cx) + padding * 2 + closeReserve,
-            280,
-            560);
-        const int height = std::max(
-            80,
-            static_cast<int>(measure.cy) + padding * 2);
-
-        RECT current{};
-        if (!GetWindowRect(hoverWindow_, &current)) return;
-
-        MONITORINFO monitorInfo{};
-        monitorInfo.cbSize = sizeof(monitorInfo);
-        const HMONITOR monitor = MonitorFromWindow(
-            hoverWindow_,
-            MONITOR_DEFAULTTONEAREST);
-        GetMonitorInfoW(monitor, &monitorInfo);
-
-        const int x = std::clamp(
-            static_cast<int>(current.left),
-            static_cast<int>(monitorInfo.rcMonitor.left),
-            std::max(
-                static_cast<int>(monitorInfo.rcMonitor.left),
-                static_cast<int>(monitorInfo.rcMonitor.right) - width));
-        const int y = std::clamp(
-            static_cast<int>(current.top),
-            static_cast<int>(monitorInfo.rcMonitor.top),
-            std::max(
-                static_cast<int>(monitorInfo.rcMonitor.top),
-                static_cast<int>(monitorInfo.rcMonitor.bottom) - height));
-
-        const int currentWidth = current.right - current.left;
-        const int currentHeight = current.bottom - current.top;
-        if (x != current.left ||
-            y != current.top ||
-            width != currentWidth ||
-            height != currentHeight) {
-            SetWindowPos(
-                hoverWindow_,
-                HWND_TOPMOST,
-                x,
-                y,
-                width,
-                height,
-                SWP_NOACTIVATE | SWP_NOOWNERZORDER);
         }
     }
 
@@ -3646,8 +3894,9 @@ private:
         if (border) DeleteObject(border);
 
         SetBkMode(target, TRANSPARENT);
-        HFONT oldFont = font_
-            ? static_cast<HFONT>(SelectObject(target, font_))
+        HFONT hoverFont = HoverFont();
+        HFONT oldFont = hoverFont
+            ? static_cast<HFONT>(SelectObject(target, hoverFont))
             : nullptr;
 
         DrawHoverContent(target, client);
@@ -3684,54 +3933,51 @@ private:
         EndPaint(hwnd, &ps);
     }
 
-    void ShowHoverPopup(const POINT& cursor) {
+    bool ShowHoverPopup(const POINT& cursor) {
         EnsureHoverPopup();
-        if (!hoverWindow_ || !IsWindow(hoverWindow_)) return;
+        if (!hoverWindow_ || !IsWindow(hoverWindow_)) return false;
 
         UpdateTooltipText();
 
-        HDC dc = GetDC(hoverWindow_);
-        if (!dc) return;
-        HFONT oldFont = font_
-            ? static_cast<HFONT>(SelectObject(dc, font_))
-            : nullptr;
-        const int closeReserve = pinHover_ ? 22 : 0;
-        const SIZE measure = MeasureHoverContent(
-            dc,
-            std::max(260, 520 - closeReserve));
-        if (oldFont) SelectObject(dc, oldFont);
-        ReleaseDC(hoverWindow_, dc);
-
-        const int padding = 10;
-        const int width = std::clamp(
-            static_cast<int>(measure.cx) + padding * 2 + closeReserve,
-            280,
-            560);
-        const int height = std::max(
-            80,
-            static_cast<int>(measure.cy) + padding * 2);
+        const int width = pinHover_
+            ? hoverPinnedWidth_
+            : kHoverDefaultWidth;
+        const int height = pinHover_
+            ? hoverPinnedHeight_
+            : kHoverDefaultHeight;
+        RecreateHoverFontForSize(width, height);
 
         MONITORINFO monitorInfo{};
         monitorInfo.cbSize = sizeof(monitorInfo);
-        HMONITOR monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
-        GetMonitorInfoW(monitor, &monitorInfo);
+        HMONITOR monitor =
+            MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
+        if (!GetMonitorInfoW(monitor, &monitorInfo)) {
+            return false;
+        }
 
         RECT widgetRect{};
         RECT taskbarRect{};
-        GetWindowRect(widgetWindow_, &widgetRect);
-        GetWindowRect(taskbarWindow_, &taskbarRect);
+        if (!widgetWindow_ ||
+            !GetWindowRect(widgetWindow_, &widgetRect) ||
+            !taskbarWindow_ ||
+            !GetWindowRect(taskbarWindow_, &taskbarRect)) {
+            return false;
+        }
 
         int x = cursor.x + 12;
         int y = cursor.y + 12;
 
         const bool vertical =
-            (taskbarRect.bottom - taskbarRect.top) > (taskbarRect.right - taskbarRect.left);
+            (taskbarRect.bottom - taskbarRect.top) >
+            (taskbarRect.right - taskbarRect.left);
         if (vertical) {
             const int taskbarCenter =
-                taskbarRect.left + (taskbarRect.right - taskbarRect.left) / 2;
+                taskbarRect.left +
+                (taskbarRect.right - taskbarRect.left) / 2;
             const int monitorCenter =
                 monitorInfo.rcMonitor.left +
-                (monitorInfo.rcMonitor.right - monitorInfo.rcMonitor.left) / 2;
+                (monitorInfo.rcMonitor.right -
+                    monitorInfo.rcMonitor.left) / 2;
             if (taskbarCenter <= monitorCenter) {
                 x = widgetRect.right + 8;
             } else {
@@ -3740,10 +3986,12 @@ private:
             y = cursor.y + 8;
         } else {
             const int taskbarCenter =
-                taskbarRect.top + (taskbarRect.bottom - taskbarRect.top) / 2;
+                taskbarRect.top +
+                (taskbarRect.bottom - taskbarRect.top) / 2;
             const int monitorCenter =
                 monitorInfo.rcMonitor.top +
-                (monitorInfo.rcMonitor.bottom - monitorInfo.rcMonitor.top) / 2;
+                (monitorInfo.rcMonitor.bottom -
+                    monitorInfo.rcMonitor.top) / 2;
             x = cursor.x + 8;
             y = taskbarCenter >= monitorCenter
                 ? widgetRect.top - height - 8
@@ -3753,13 +4001,15 @@ private:
         x = std::clamp(
             x,
             static_cast<int>(monitorInfo.rcMonitor.left),
-            std::max(static_cast<int>(monitorInfo.rcMonitor.left),
-                     static_cast<int>(monitorInfo.rcMonitor.right) - width));
+            std::max(
+                static_cast<int>(monitorInfo.rcMonitor.left),
+                static_cast<int>(monitorInfo.rcMonitor.right) - width));
         y = std::clamp(
             y,
             static_cast<int>(monitorInfo.rcMonitor.top),
-            std::max(static_cast<int>(monitorInfo.rcMonitor.top),
-                     static_cast<int>(monitorInfo.rcMonitor.bottom) - height));
+            std::max(
+                static_cast<int>(monitorInfo.rcMonitor.top),
+                static_cast<int>(monitorInfo.rcMonitor.bottom) - height));
 
         SetWindowPos(
             hoverWindow_,
@@ -3771,6 +4021,7 @@ private:
             SWP_NOACTIVATE | SWP_SHOWWINDOW);
         hoverPopupVisible_ = true;
         InvalidateRect(hoverWindow_, nullptr, FALSE);
+        return true;
     }
 
     void HideHoverPopup() {
@@ -3778,20 +4029,51 @@ private:
             ShowWindow(hoverWindow_, SW_HIDE);
         }
         hoverPopupVisible_ = false;
+        hoverResizing_ = false;
+        hoverResizeHit_ = HTNOWHERE;
+        if (GetCapture() == hoverWindow_) {
+            ReleaseCapture();
+        }
     }
 
-    void ShowPinnedHoverPopup() {
-        if (!pinHover_ || !codexRunning_ || !widgetVisible_ ||
-            !widgetWindow_ || !IsWindowVisible(widgetWindow_)) {
+    void ApplyPinnedWidgetVisibility() {
+        if (!widgetVisible_ ||
+            !widgetWindow_ ||
+            !IsWindow(widgetWindow_)) {
             return;
         }
 
+        const bool shouldHide =
+            pinHover_ &&
+            hideWidgetWhenPinned_ &&
+            hoverPopupVisible_;
+        ShowWindow(
+            widgetWindow_,
+            shouldHide ? SW_HIDE : SW_SHOWNOACTIVATE);
+    }
+
+    bool ShowPinnedHoverPopup() {
+        if (!pinHover_ ||
+            !codexRunning_ ||
+            !widgetVisible_ ||
+            !widgetWindow_ ||
+            !IsWindow(widgetWindow_)) {
+            return false;
+        }
+
         RECT widgetRect{};
-        if (!GetWindowRect(widgetWindow_, &widgetRect)) return;
+        if (!GetWindowRect(widgetWindow_, &widgetRect)) return false;
         POINT anchor{
-            widgetRect.left + (widgetRect.right - widgetRect.left) / 2,
-            widgetRect.top + (widgetRect.bottom - widgetRect.top) / 2};
-        ShowHoverPopup(anchor);
+            widgetRect.left +
+                (widgetRect.right - widgetRect.left) / 2,
+            widgetRect.top +
+                (widgetRect.bottom - widgetRect.top) / 2};
+
+        const bool shown = ShowHoverPopup(anchor);
+        if (shown) {
+            ApplyPinnedWidgetVisibility();
+        }
+        return shown;
     }
 
     void SetPinHover(bool enabled) {
@@ -3799,25 +4081,21 @@ private:
         WriteRegistryDword(L"PinHover", pinHover_ ? 1u : 0u);
 
         if (pinHover_) {
+            RecreateHoverFontForSize(
+                hoverPinnedWidth_,
+                hoverPinnedHeight_);
             ShowPinnedHoverPopup();
         } else {
             HideHoverPopup();
+            RecreateHoverFontForSize(
+                kHoverDefaultWidth,
+                kHoverDefaultHeight);
+            ApplyPinnedWidgetVisibility();
         }
     }
 
     bool PinHoverEnabled() const {
         return pinHover_;
-    }
-
-    RECT HoverCloseRect(HWND hwnd) const {
-        RECT client{};
-        GetClientRect(hwnd, &client);
-        const int size = 22;
-        return RECT{
-            std::max(client.left, client.right - size - 2),
-            client.top + 2,
-            client.right - 2,
-            std::min(client.bottom, client.top + size + 2)};
     }
 
     LRESULT HoverHitTest(HWND hwnd, LPARAM lParam) const {
@@ -3827,12 +4105,177 @@ private:
             GET_X_LPARAM(lParam),
             GET_Y_LPARAM(lParam)};
         ScreenToClient(hwnd, &point);
+
         const RECT close = HoverCloseRect(hwnd);
-        return PtInRect(&close, point) ? HTCLIENT : HTTRANSPARENT;
+        if (PtInRect(&close, point)) {
+            return HTCLIENT;
+        }
+        return HoverResizeHitFromClient(hwnd, point) != HTNOWHERE
+            ? HTCLIENT
+            : HTTRANSPARENT;
+    }
+
+    bool HandleHoverSetCursor(HWND hwnd) const {
+        if (!pinHover_ || hoverResizing_) return false;
+
+        POINT point{};
+        if (!GetCursorPos(&point)) return false;
+        ScreenToClient(hwnd, &point);
+        const RECT close = HoverCloseRect(hwnd);
+        if (PtInRect(&close, point)) {
+            return false;
+        }
+
+        const int hit = HoverResizeHitFromClient(hwnd, point);
+        LPCWSTR cursorId = nullptr;
+        switch (hit) {
+        case HTLEFT:
+        case HTRIGHT:
+            cursorId = IDC_SIZEWE;
+            break;
+        case HTTOP:
+        case HTBOTTOM:
+            cursorId = IDC_SIZENS;
+            break;
+        case HTTOPLEFT:
+        case HTBOTTOMRIGHT:
+            cursorId = IDC_SIZENWSE;
+            break;
+        case HTTOPRIGHT:
+        case HTBOTTOMLEFT:
+            cursorId = IDC_SIZENESW;
+            break;
+        default:
+            return false;
+        }
+
+        SetCursor(LoadCursorW(nullptr, cursorId));
+        return true;
+    }
+
+    bool HandleHoverLeftButtonDown(HWND hwnd, LPARAM lParam) {
+        if (!pinHover_) return false;
+
+        POINT point{
+            GET_X_LPARAM(lParam),
+            GET_Y_LPARAM(lParam)};
+        const RECT close = HoverCloseRect(hwnd);
+        if (PtInRect(&close, point)) {
+            return true;
+        }
+
+        const int hit = HoverResizeHitFromClient(hwnd, point);
+        if (hit == HTNOWHERE) return false;
+
+        if (!GetCursorPos(&hoverResizeStartCursor_) ||
+            !GetWindowRect(hwnd, &hoverResizeStartRect_)) {
+            return false;
+        }
+
+        hoverResizing_ = true;
+        hoverResizeHit_ = hit;
+        SetCapture(hwnd);
+        return true;
+    }
+
+    bool HandleHoverMouseMove(HWND hwnd) {
+        if (!pinHover_ || !hoverResizing_) return false;
+
+        POINT cursor{};
+        if (!GetCursorPos(&cursor)) return true;
+        const int dx = cursor.x - hoverResizeStartCursor_.x;
+        const int dy = cursor.y - hoverResizeStartCursor_.y;
+
+        RECT rect = hoverResizeStartRect_;
+        switch (hoverResizeHit_) {
+        case HTLEFT:
+        case HTTOPLEFT:
+        case HTBOTTOMLEFT:
+            rect.left += dx;
+            break;
+        case HTRIGHT:
+        case HTTOPRIGHT:
+        case HTBOTTOMRIGHT:
+            rect.right += dx;
+            break;
+        }
+        switch (hoverResizeHit_) {
+        case HTTOP:
+        case HTTOPLEFT:
+        case HTTOPRIGHT:
+            rect.top += dy;
+            break;
+        case HTBOTTOM:
+        case HTBOTTOMLEFT:
+        case HTBOTTOMRIGHT:
+            rect.bottom += dy;
+            break;
+        }
+
+        const bool resizeLeft =
+            hoverResizeHit_ == HTLEFT ||
+            hoverResizeHit_ == HTTOPLEFT ||
+            hoverResizeHit_ == HTBOTTOMLEFT;
+        const bool resizeTop =
+            hoverResizeHit_ == HTTOP ||
+            hoverResizeHit_ == HTTOPLEFT ||
+            hoverResizeHit_ == HTTOPRIGHT;
+
+        int width = rect.right - rect.left;
+        int height = rect.bottom - rect.top;
+        width = std::clamp(
+            width,
+            kHoverMinWidth,
+            kHoverMaxWidth);
+        height = std::clamp(
+            height,
+            kHoverMinHeight,
+            kHoverMaxHeight);
+
+        if (resizeLeft) {
+            rect.left = rect.right - width;
+        } else {
+            rect.right = rect.left + width;
+        }
+        if (resizeTop) {
+            rect.top = rect.bottom - height;
+        } else {
+            rect.bottom = rect.top + height;
+        }
+
+        hoverPinnedWidth_ = width;
+        hoverPinnedHeight_ = height;
+        RecreateHoverFontForSize(width, height);
+
+        SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            rect.left,
+            rect.top,
+            width,
+            height,
+            SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return true;
     }
 
     bool HandleHoverLeftButtonUp(HWND hwnd, LPARAM lParam) {
         if (!pinHover_) return false;
+
+        if (hoverResizing_) {
+            hoverResizing_ = false;
+            hoverResizeHit_ = HTNOWHERE;
+            if (GetCapture() == hwnd) {
+                ReleaseCapture();
+            }
+            WriteRegistryDword(
+                L"HoverPinnedWidth",
+                static_cast<DWORD>(hoverPinnedWidth_));
+            WriteRegistryDword(
+                L"HoverPinnedHeight",
+                static_cast<DWORD>(hoverPinnedHeight_));
+            return true;
+        }
 
         POINT point{
             GET_X_LPARAM(lParam),
@@ -3842,6 +4285,11 @@ private:
 
         SetPinHover(false);
         return true;
+    }
+
+    void HandleHoverCaptureChanged() {
+        hoverResizing_ = false;
+        hoverResizeHit_ = HTNOWHERE;
     }
 
     void ResetHoverState(bool forceHide = false) {
@@ -4026,6 +4474,50 @@ private:
                     white}});
         } else {
             addLine({{L"缓存：暂无数据", white}});
+        }
+
+        {
+            std::vector<HoverSegment> line{
+                {threadMetrics_.activeTurn
+                    ? L"本轮缓存："
+                    : L"上轮缓存：",
+                 white}};
+            if (threadMetrics_.activeTurn) {
+                if (const auto estimate = CurrentTurnCacheEstimate()) {
+                    wchar_t cachePercent[32]{};
+                    swprintf_s(
+                        cachePercent,
+                        L"%.2f%%",
+                        estimate->percent);
+                    line.push_back({cachePercent, workingColor_});
+                    line.push_back({
+                        L" (" +
+                            FormatInteger(estimate->cachedDelta) +
+                            L" / " +
+                            FormatInteger(estimate->inputDelta) +
+                            L")",
+                        white});
+                } else {
+                    line.push_back({L"暂无", white});
+                }
+            } else if (turnCacheStoredValid_) {
+                wchar_t cachePercent[32]{};
+                swprintf_s(
+                    cachePercent,
+                    L"%.2f%%",
+                    turnCacheStoredPercent_);
+                line.push_back({cachePercent, white});
+                line.push_back({
+                    L" (" +
+                        FormatInteger(turnCacheStoredCachedDelta_) +
+                        L" / " +
+                        FormatInteger(turnCacheStoredInputDelta_) +
+                        L")",
+                    white});
+            } else {
+                line.push_back({L"暂无", white});
+            }
+            addLine(std::move(line));
         }
 
         if (threadMetrics_.hasTokenUsage) {
@@ -4266,7 +4758,6 @@ private:
         if (hoverPopupVisible_ &&
             hoverWindow_ &&
             IsWindow(hoverWindow_)) {
-            FitVisibleHoverPopup();
             InvalidateRect(hoverWindow_, nullptr, FALSE);
         }
     }
@@ -4315,7 +4806,7 @@ private:
         case kMenuAbout:
             MessageBoxW(
                 mainWindow_,
-                L"CodexTaskbar v0.3.14\n\n"
+                L"CodexTaskbar v0.3.15\n\n"
                 L"在 Windows 10 任务栏显示 Codex 配额、绑定会话上下文/缓存和本轮代码改动。\n"
                 L"配额来自官方 app-server；会话指标通过只读 Codex Desktop IPC follower 获取。",
                 L"关于 CodexTaskbar",
@@ -4462,6 +4953,8 @@ private:
     ULONGLONG anchorReadyDeadline_{0};
     HFONT font_{nullptr};
     HFONT widgetFont_{nullptr};
+    HFONT hoverFont_{nullptr};
+    double hoverFontPointSize_{0.0};
     HBRUSH darkBackgroundBrush_{nullptr};
     HBRUSH darkControlBrush_{nullptr};
     HBRUSH darkMenuBrush_{nullptr};
@@ -4479,6 +4972,13 @@ private:
     std::int64_t lastQuotaSuccessMs_{0};
     bool autoStart_{true};
     bool pinHover_{false};
+    bool hideWidgetWhenPinned_{false};
+    int hoverPinnedWidth_{kHoverDefaultWidth};
+    int hoverPinnedHeight_{kHoverDefaultHeight};
+    bool hoverResizing_{false};
+    int hoverResizeHit_{HTNOWHERE};
+    POINT hoverResizeStartCursor_{};
+    RECT hoverResizeStartRect_{};
     bool showFiveHourPercent_{true};
     bool showFiveHourTime_{true};
     bool showSevenDayPercent_{true};
@@ -4500,6 +5000,7 @@ private:
     int fontChoice_{0};
     bool autoFitFont_{false};
     int cacheDisplayMode_{0};
+    int cacheScopeMode_{0};
     bool showGenerationSpeed_{false};
     int generationSpeedMode_{0};
     bool compactHourUnderline_{false};
@@ -4538,6 +5039,16 @@ private:
     std::int64_t fiveHourRateStartTaskDurationMs_{0};
     std::int64_t fiveHourRateLastTaskDurationMs_{0};
     std::string fiveHourRateThreadId_;
+
+    bool turnCacheTracking_{false};
+    bool turnCacheStoredValid_{false};
+    double turnCacheStoredPercent_{0.0};
+    std::int64_t turnCacheStoredCachedDelta_{0};
+    std::int64_t turnCacheStoredInputDelta_{0};
+    std::int64_t turnCacheStartInputTokens_{0};
+    std::int64_t turnCacheStartCachedInputTokens_{0};
+    std::int64_t turnCacheLastTaskDurationMs_{0};
+    std::string turnCacheThreadId_;
 
     std::vector<HoverLine> hoverLines_;
     std::array<wchar_t, 1024> tooltipBuffer_{};
