@@ -2535,6 +2535,11 @@ public:
             PositionWidget();
             InvalidateWidget();
         }
+        if (pinHover_) {
+            ShowPinnedHoverPopup();
+        } else {
+            ApplyPinnedWidgetVisibility();
+        }
         UpdateTooltipText();
         DestroyWindow(hwnd);
     }
@@ -3419,6 +3424,14 @@ private:
                 width,
                 height,
                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        }
+
+        if (pinHover_ &&
+            hideWidgetWhenPinned_ &&
+            hoverPopupVisible_ &&
+            widgetWindow_ &&
+            IsWindow(widgetWindow_)) {
+            ShowWindow(widgetWindow_, SW_HIDE);
         }
 
         InvalidateWidget();
