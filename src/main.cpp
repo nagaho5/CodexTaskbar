@@ -1058,6 +1058,63 @@ public:
             CurrentTaskDurationMs());
     }
 
+    std::optional<TurnCacheEstimate>
+    TurnCacheEstimateForMetrics(const ThreadMetrics& metrics) const {
+        if (!turnCacheTracking_ || !metrics.hasCache) {
+            return std::nullopt;
+        }
+
+        const std::int64_t inputDelta =
+            metrics.inputTokens - turnCacheStartInputTokens_;
+        const std::int64_t cachedDelta =
+            metrics.cachedInputTokens - turnCacheStartCachedInputTokens_;
+        if (inputDelta <= 0 || cachedDelta < 0 || cachedDelta > inputDelta) {
+            return std::nullopt;
+        }
+
+        return TurnCacheEstimate{
+            std::clamp(
+                100.0 * static_cast<double>(cachedDelta) /
+                    static_cast<double>(inputDelta),
+                0.0,
+                100.0),
+            cachedDelta,
+            inputDelta};
+    }
+
+    std::optional<TurnCacheEstimate> CurrentTurnCacheEstimate() const {
+        if (!threadMetrics_.activeTurn) {
+            return std::nullopt;
+        }
+        return TurnCacheEstimateForMetrics(threadMetrics_);
+    }
+
+    void FreezeTurnCacheEstimate(const ThreadMetrics& metrics) {
+        if (const auto estimate = TurnCacheEstimateForMetrics(metrics)) {
+            turnCacheStoredPercent_ = estimate->percent;
+            turnCacheStoredCachedDelta_ = estimate->cachedDelta;
+            turnCacheStoredInputDelta_ = estimate->inputDelta;
+            turnCacheStoredValid_ = true;
+        } else {
+            turnCacheStoredValid_ = false;
+        }
+    }
+
+    void BeginTurnCacheTracking(
+        const ThreadMetrics& metrics,
+        std::int64_t taskDurationMs) {
+        if (!metrics.activeTurn || !metrics.hasCache) {
+            return;
+        }
+
+        turnCacheTracking_ = true;
+        turnCacheStartInputTokens_ = metrics.inputTokens;
+        turnCacheStartCachedInputTokens_ = metrics.cachedInputTokens;
+        turnCacheLastTaskDurationMs_ =
+            std::max<std::int64_t>(0, taskDurationMs);
+        turnCacheThreadId_ = metrics.threadId;
+    }
+
     std::optional<double> RecentGenerationAverage() const {
         if (generationSpeedRecent_.size() < 5) {
             return std::nullopt;
@@ -1167,6 +1224,59 @@ public:
                    incomingTaskDurationMs >= 0) {
             fiveHourRateLastTaskDurationMs_ =
                 incomingTaskDurationMs;
+        }
+
+        const bool cacheThreadChanged =
+            !turnCacheThreadId_.empty() &&
+            !metrics.threadId.empty() &&
+            metrics.threadId != turnCacheThreadId_;
+        const bool cacheDurationRestarted =
+            turnCacheTracking_ &&
+            taskNowActive &&
+            incomingTaskDurationMs >= 0 &&
+            turnCacheLastTaskDurationMs_ >= 0 &&
+            incomingTaskDurationMs + 5000 <
+                turnCacheLastTaskDurationMs_;
+        const bool startNewCacheTask =
+            cacheThreadChanged || cacheDurationRestarted;
+
+        // Like the 5h estimator, keep the cache baseline alive across brief
+        // activeTurn=false gaps. Freeze a snapshot for idle display, but only
+        // start over when the thread changes or task duration clearly restarts.
+        if (turnCacheTracking_ &&
+            taskWasActive &&
+            metrics.valid &&
+            !taskNowActive) {
+            FreezeTurnCacheEstimate(threadMetrics_);
+        }
+
+        if (turnCacheTracking_ && startNewCacheTask) {
+            FreezeTurnCacheEstimate(threadMetrics_);
+            turnCacheTracking_ = false;
+            turnCacheThreadId_.clear();
+        }
+
+        if (taskNowActive &&
+            metrics.hasCache &&
+            !turnCacheTracking_) {
+            BeginTurnCacheTracking(
+                metrics,
+                std::max<std::int64_t>(0, incomingTaskDurationMs));
+        } else if (taskNowActive &&
+                   turnCacheTracking_ &&
+                   incomingTaskDurationMs >= 0) {
+            // Cumulative counters should never move backwards inside one task.
+            // If Codex refreshes/replaces the cumulative usage snapshot, reset
+            // only this cache baseline rather than showing a negative delta.
+            if (metrics.hasCache &&
+                (metrics.inputTokens < turnCacheStartInputTokens_ ||
+                 metrics.cachedInputTokens <
+                     turnCacheStartCachedInputTokens_)) {
+                BeginTurnCacheTracking(metrics, incomingTaskDurationMs);
+            } else {
+                turnCacheLastTaskDurationMs_ =
+                    incomingTaskDurationMs;
+            }
         }
 
         if (identityChanged) {
@@ -1703,6 +1813,9 @@ public:
         fiveHourRateSampleCount_ = 0;
         fiveHourRateStoredValid_ = false;
         fiveHourRateThreadId_.clear();
+        turnCacheTracking_ = false;
+        turnCacheStoredValid_ = false;
+        turnCacheThreadId_.clear();
 
         WriteRegistryDword(L"AutomaticThreadMode", 0);
         WriteRegistryString(L"ManualThreadId", manualThreadId_);
@@ -4573,6 +4686,16 @@ private:
     std::int64_t fiveHourRateStartTaskDurationMs_{0};
     std::int64_t fiveHourRateLastTaskDurationMs_{0};
     std::string fiveHourRateThreadId_;
+
+    bool turnCacheTracking_{false};
+    bool turnCacheStoredValid_{false};
+    double turnCacheStoredPercent_{0.0};
+    std::int64_t turnCacheStoredCachedDelta_{0};
+    std::int64_t turnCacheStoredInputDelta_{0};
+    std::int64_t turnCacheStartInputTokens_{0};
+    std::int64_t turnCacheStartCachedInputTokens_{0};
+    std::int64_t turnCacheLastTaskDurationMs_{0};
+    std::string turnCacheThreadId_;
 
     std::vector<HoverLine> hoverLines_;
     std::array<wchar_t, 1024> tooltipBuffer_{};
