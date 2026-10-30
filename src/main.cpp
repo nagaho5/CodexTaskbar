@@ -1102,14 +1102,21 @@ public:
 
     void BeginTurnCacheTracking(
         const ThreadMetrics& metrics,
-        std::int64_t taskDurationMs) {
+        std::int64_t taskDurationMs,
+        const ThreadMetrics* baselineMetrics = nullptr) {
         if (!metrics.activeTurn || !metrics.hasCache) {
             return;
         }
 
+        const ThreadMetrics* baseline =
+            baselineMetrics && baselineMetrics->hasCache
+                ? baselineMetrics
+                : &metrics;
+
         turnCacheTracking_ = true;
-        turnCacheStartInputTokens_ = metrics.inputTokens;
-        turnCacheStartCachedInputTokens_ = metrics.cachedInputTokens;
+        turnCacheStartInputTokens_ = baseline->inputTokens;
+        turnCacheStartCachedInputTokens_ =
+            baseline->cachedInputTokens;
         turnCacheLastTaskDurationMs_ =
             std::max<std::int64_t>(0, taskDurationMs);
         turnCacheThreadId_ = metrics.threadId;
@@ -1259,9 +1266,20 @@ public:
         if (taskNowActive &&
             metrics.hasCache &&
             !turnCacheTracking_) {
+            const bool sameObservedThread =
+                threadMetrics_.threadId.empty() ||
+                metrics.threadId.empty() ||
+                threadMetrics_.threadId == metrics.threadId;
+            const ThreadMetrics* baselineMetrics =
+                !taskWasActive &&
+                threadMetrics_.hasCache &&
+                sameObservedThread
+                    ? &threadMetrics_
+                    : nullptr;
             BeginTurnCacheTracking(
                 metrics,
-                std::max<std::int64_t>(0, incomingTaskDurationMs));
+                std::max<std::int64_t>(0, incomingTaskDurationMs),
+                baselineMetrics);
         } else if (taskNowActive &&
                    turnCacheTracking_ &&
                    incomingTaskDurationMs >= 0) {
