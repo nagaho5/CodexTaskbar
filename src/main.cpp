@@ -4659,14 +4659,18 @@ private:
             // Retain v0.3.15 dimensions only as a downgrade/migration hint.
             RECT rect{};
             if (GetWindowRect(hwnd, &rect)) {
+                const int savedWidth = std::max(
+                    1,
+                    static_cast<int>(rect.right - rect.left));
+                const int savedHeight = std::max(
+                    1,
+                    static_cast<int>(rect.bottom - rect.top));
                 WriteRegistryDword(
                     L"HoverPinnedWidth",
-                    static_cast<DWORD>(
-                        std::max(1, rect.right - rect.left)));
+                    static_cast<DWORD>(savedWidth));
                 WriteRegistryDword(
                     L"HoverPinnedHeight",
-                    static_cast<DWORD>(
-                        std::max(1, rect.bottom - rect.top)));
+                    static_cast<DWORD>(savedHeight));
             }
             return true;
         }
