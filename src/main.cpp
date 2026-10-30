@@ -139,6 +139,11 @@ struct HoverSegment {
 
 using HoverLine = std::vector<HoverSegment>;
 
+struct HoverLayout {
+    int width{0};
+    int height{0};
+};
+
 struct FiveHourRateEstimate {
     double ratePerMinute{0.0};
     int consumedPercent{0};
@@ -784,14 +789,36 @@ public:
         pinHover_ = ReadRegistryDword(L"PinHover", 0) != 0;
         hideWidgetWhenPinned_ =
             ReadRegistryDword(L"HideWidgetWhenPinned", 0) != 0;
-        hoverPinnedWidth_ = std::clamp(
-            ReadRegistryDword(L"HoverPinnedWidth", kHoverDefaultWidth),
-            kHoverMinWidth,
-            kHoverMaxWidth);
-        hoverPinnedHeight_ = std::clamp(
-            ReadRegistryDword(L"HoverPinnedHeight", kHoverDefaultHeight),
-            kHoverMinHeight,
-            kHoverMaxHeight);
+        const int savedHoverScale =
+            ReadRegistryDword(L"HoverPinnedScalePermille", -1);
+        if (savedHoverScale >= 0) {
+            hoverPinnedScalePermille_ =
+                std::clamp(savedHoverScale, 750, 1750);
+        } else {
+            // v0.3.15 migration: preserve roughly the user's previous overall
+            // size, but v0.3.16 will re-establish the natural aspect ratio.
+            const int oldWidth = std::clamp(
+                ReadRegistryDword(
+                    L"HoverPinnedWidth",
+                    kHoverDefaultWidth),
+                kHoverMinWidth,
+                kHoverMaxWidth);
+            const int oldHeight = std::clamp(
+                ReadRegistryDword(
+                    L"HoverPinnedHeight",
+                    kHoverDefaultHeight),
+                kHoverMinHeight,
+                kHoverMaxHeight);
+            const double oldScale = std::min(
+                static_cast<double>(oldWidth) /
+                    static_cast<double>(kHoverDefaultWidth),
+                static_cast<double>(oldHeight) /
+                    static_cast<double>(kHoverDefaultHeight));
+            hoverPinnedScalePermille_ = std::clamp(
+                static_cast<int>(std::lround(oldScale * 1000.0)),
+                750,
+                1750);
+        }
         showFiveHourPercent_ = ReadRegistryDword(L"ShowFiveHourPercent", 1) != 0;
         showFiveHourTime_ = ReadRegistryDword(L"ShowFiveHourTime", 1) != 0;
         showSevenDayPercent_ = ReadRegistryDword(L"ShowSevenDayPercent", 1) != 0;
@@ -3040,13 +3067,18 @@ private:
     }
 
     double HoverFontScaleForSize(int width, int height) const {
-        if (!pinHover_) return 1.0;
+        if (!pinHover_ ||
+            hoverPinnedBaseWidth_ <= 0 ||
+            hoverPinnedBaseHeight_ <= 0) {
+            return 1.0;
+        }
+
         const double widthScale =
             static_cast<double>(width) /
-            static_cast<double>(kHoverDefaultWidth);
+            static_cast<double>(hoverPinnedBaseWidth_);
         const double heightScale =
             static_cast<double>(height) /
-            static_cast<double>(kHoverDefaultHeight);
+            static_cast<double>(hoverPinnedBaseHeight_);
         return std::clamp(
             std::min(widthScale, heightScale),
             0.75,
@@ -3106,8 +3138,12 @@ private:
         }
 
         RecreateHoverFontForSize(
-            pinHover_ ? hoverPinnedWidth_ : kHoverDefaultWidth,
-            pinHover_ ? hoverPinnedHeight_ : kHoverDefaultHeight);
+            pinHover_ && hoverPinnedBaseValid_
+                ? hoverPinnedBaseWidth_
+                : kHoverDefaultWidth,
+            pinHover_ && hoverPinnedBaseValid_
+                ? hoverPinnedBaseHeight_
+                : kHoverDefaultHeight);
     }
 
     int MeasureTextWidth(HDC dc, const std::wstring& text) const {
@@ -4973,8 +5009,10 @@ private:
     bool autoStart_{true};
     bool pinHover_{false};
     bool hideWidgetWhenPinned_{false};
-    int hoverPinnedWidth_{kHoverDefaultWidth};
-    int hoverPinnedHeight_{kHoverDefaultHeight};
+    int hoverPinnedScalePermille_{1000};
+    int hoverPinnedBaseWidth_{0};
+    int hoverPinnedBaseHeight_{0};
+    bool hoverPinnedBaseValid_{false};
     bool hoverResizing_{false};
     int hoverResizeHit_{HTNOWHERE};
     POINT hoverResizeStartCursor_{};
