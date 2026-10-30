@@ -3,6 +3,7 @@
 #include "RendererActivityMonitor.h"
 
 #include <windows.h>
+#include <windowsx.h>
 #include <commctrl.h>
 #include <commdlg.h>
 #include <dwmapi.h>
@@ -55,6 +56,7 @@ constexpr UINT kMenuAutoStart = 1002;
 constexpr UINT kMenuReconnect = 1003;
 constexpr UINT kMenuAbout = 1004;
 constexpr UINT kMenuExit = 1005;
+constexpr UINT kMenuPinHover = 1006;
 constexpr UINT kMenuDisplayPrimary = 1050;
 constexpr UINT kMenuDisplaySecondary = 1051;
 constexpr UINT kMenuThreadBase = 1100;
@@ -92,6 +94,7 @@ constexpr int kCheckCompactHourUnderline = 2028;
 constexpr COLORREF kDefaultWorkingColor = RGB(79, 195, 247);
 constexpr COLORREF kWarningYellow = RGB(255, 196, 64);
 constexpr COLORREF kWarningRed = RGB(242, 88, 88);
+constexpr COLORREF kStatusGreen = RGB(92, 201, 112);
 
 struct ColoredSegment {
     std::wstring text;
@@ -118,6 +121,13 @@ struct SavedThreadEntry {
 struct GenerationSpeedSample {
     double speed{0.0};
 };
+
+struct HoverSegment {
+    std::wstring text;
+    COLORREF color{RGB(242, 242, 242)};
+};
+
+using HoverLine = std::vector<HoverSegment>;
 
 struct FiveHourRateEstimate {
     double ratePerMinute{0.0};
@@ -370,6 +380,53 @@ std::wstring FormatResetTime(std::int64_t unixSeconds) {
     wchar_t text[16]{};
     swprintf_s(text, L"%02d:%02d", local.tm_hour, local.tm_min);
     return text;
+}
+
+std::wstring FormatSevenDayReset(std::int64_t unixSeconds) {
+    if (unixSeconds <= 0) {
+        return L"--";
+    }
+
+    const time_t value = static_cast<time_t>(unixSeconds);
+    tm local{};
+    if (localtime_s(&local, &value) != 0) {
+        return L"--";
+    }
+
+    wchar_t absolute[32]{};
+    swprintf_s(
+        absolute,
+        L"%d/%d %02d:%02d",
+        local.tm_mon + 1,
+        local.tm_mday,
+        local.tm_hour,
+        local.tm_min);
+
+    const std::int64_t now = static_cast<std::int64_t>(time(nullptr));
+    const std::int64_t remaining =
+        std::max<std::int64_t>(0, unixSeconds - now);
+
+    std::wstring relative;
+    const std::int64_t days = remaining / 86400;
+    const std::int64_t hours = (remaining % 86400) / 3600;
+    const std::int64_t minutes = (remaining % 3600) / 60;
+
+    if (days > 0) {
+        relative = std::to_wstring(days) + L"天";
+        if (hours > 0) {
+            relative += std::to_wstring(hours) + L"小时";
+        }
+        relative += L"后";
+    } else if (hours > 0) {
+        relative = std::to_wstring(hours) + L"小时后";
+    } else if (remaining > 0) {
+        relative = std::to_wstring(std::max<std::int64_t>(1, minutes)) +
+            L"分钟后";
+    } else {
+        relative = L"已到恢复时间";
+    }
+
+    return std::wstring(absolute) + L"（" + relative + L"）";
 }
 
 int ReadRegistryDword(const wchar_t* name, int fallback) {
@@ -705,6 +762,7 @@ public:
             80,
             240)) / 10.0;
         autoStart_ = ReadRegistryDword(L"AutoStart", 1) != 0;
+        pinHover_ = ReadRegistryDword(L"PinHover", 0) != 0;
         showFiveHourPercent_ = ReadRegistryDword(L"ShowFiveHourPercent", 1) != 0;
         showFiveHourTime_ = ReadRegistryDword(L"ShowFiveHourTime", 1) != 0;
         showSevenDayPercent_ = ReadRegistryDword(L"ShowSevenDayPercent", 1) != 0;
@@ -728,7 +786,7 @@ public:
         autoFitFont_ = ReadRegistryDword(L"AutoFitFont", 0) != 0;
         cacheDisplayMode_ = std::clamp(ReadRegistryDword(L"CacheDisplayMode", 0), 0, 3);
         showGenerationSpeed_ = ReadRegistryDword(L"ShowGenerationSpeed", 0) != 0;
-        generationSpeedMode_ = std::clamp(ReadRegistryDword(L"GenerationSpeedMode", 0), 0, 1);
+        generationSpeedMode_ = std::clamp(ReadRegistryDword(L"GenerationSpeedMode", 0), 0, 2);
         compactHourUnderline_ = ReadRegistryDword(L"CompactHourUnderline", 0) != 0;
         displayTarget_ = std::clamp(ReadRegistryDword(L"DisplayTarget", 0), 0, 1);
         automaticThreadMode_ = ReadRegistryDword(L"AutomaticThreadMode", 0) != 0;
@@ -983,6 +1041,14 @@ public:
         return sum / static_cast<double>(end - begin);
     }
 
+    std::optional<double> CurrentTurnGenerationAverage() const {
+        if (generationSpeedTurnSampleCount_ < 5) {
+            return std::nullopt;
+        }
+        return generationSpeedTurnSampleSum_ /
+            static_cast<double>(generationSpeedTurnSampleCount_);
+    }
+
     void ApplyThreadMetrics(const ThreadMetrics& metrics) {
         const int oldRows = VisibleRowCount();
         const std::int64_t nowMs = CurrentUnixMilliseconds();
@@ -1025,11 +1091,22 @@ public:
         }
 
         if (identityChanged) {
+            if (generationSpeedTurnSampleCount_ >= 5) {
+                generationSpeedStoredTurnAverage_ =
+                    generationSpeedTurnSampleSum_ /
+                    static_cast<double>(generationSpeedTurnSampleCount_);
+                generationSpeedStoredTurnAverageValid_ = true;
+            } else {
+                generationSpeedStoredTurnAverageValid_ = false;
+            }
+
             generationSpeedThreadId_ = metrics.threadId;
             generationSpeedTurnId_ = metrics.turnId;
             generationSpeedValid_ = false;
             generationSpeed_ = 0.0;
             generationSpeedRecent_.clear();
+            generationSpeedTurnSampleSum_ = 0.0;
+            generationSpeedTurnSampleCount_ = 0;
             generationSpeedLastOutputTokens_ =
                 metrics.hasTokenUsage ? metrics.outputTokens : 0;
             generationSpeedLastSampleMs_ = nowMs;
@@ -1037,6 +1114,8 @@ public:
             if (metrics.outputTokens < generationSpeedLastOutputTokens_) {
                 generationSpeedValid_ = false;
                 generationSpeedRecent_.clear();
+                generationSpeedTurnSampleSum_ = 0.0;
+                generationSpeedTurnSampleCount_ = 0;
                 generationSpeedLastOutputTokens_ = metrics.outputTokens;
                 generationSpeedLastSampleMs_ = nowMs;
             } else if (metrics.outputTokens > generationSpeedLastOutputTokens_) {
@@ -1070,10 +1149,26 @@ public:
                             generationSpeedRecent_.begin());
                     }
 
+                    // Current-turn average is intentionally the simplest
+                    // possible arithmetic mean of all accepted speed samples.
+                    generationSpeedTurnSampleSum_ += generationSpeed_;
+                    ++generationSpeedTurnSampleCount_;
+
                     // Advance only after accepting a real sample.
                     generationSpeedLastOutputTokens_ = metrics.outputTokens;
                     generationSpeedLastSampleMs_ = nowMs;
                 }
+            }
+        }
+
+        if (taskWasActive && !taskNowActive) {
+            if (generationSpeedTurnSampleCount_ >= 5) {
+                generationSpeedStoredTurnAverage_ =
+                    generationSpeedTurnSampleSum_ /
+                    static_cast<double>(generationSpeedTurnSampleCount_);
+                generationSpeedStoredTurnAverageValid_ = true;
+            } else {
+                generationSpeedStoredTurnAverageValid_ = false;
             }
         }
 
@@ -1520,6 +1615,9 @@ public:
         generationSpeedValid_ = false;
         generationSpeed_ = 0.0;
         generationSpeedRecent_.clear();
+        generationSpeedTurnSampleSum_ = 0.0;
+        generationSpeedTurnSampleCount_ = 0;
+        generationSpeedStoredTurnAverageValid_ = false;
         generationSpeedThreadId_.clear();
         generationSpeedTurnId_.clear();
         fiveHourRateTracking_ = false;
@@ -1645,6 +1743,11 @@ public:
             MF_OWNERDRAW | (autoStart_ ? MF_CHECKED : MF_UNCHECKED),
             kMenuAutoStart,
             reinterpret_cast<LPCWSTR>(L"开机自动启动"));
+        AppendMenuW(
+            menu,
+            MF_OWNERDRAW | (pinHover_ ? MF_CHECKED : MF_UNCHECKED),
+            kMenuPinHover,
+            reinterpret_cast<LPCWSTR>(L"固定显示悬浮窗"));
         AppendMenuW(
             menu,
             MF_OWNERDRAW,
@@ -1802,6 +1905,9 @@ public:
         SendMessageW(
             speedMode, CB_ADDSTRING, 0,
             reinterpret_cast<LPARAM>(L"最近平均"));
+        SendMessageW(
+            speedMode, CB_ADDSTRING, 0,
+            reinterpret_cast<LPARAM>(L"本轮平均"));
         SendMessageW(
             speedMode, CB_SETCURSEL,
             static_cast<WPARAM>(generationSpeedMode_), 0);
@@ -2111,7 +2217,7 @@ public:
                 0);
         generationSpeedMode_ = speedSelection == CB_ERR
             ? 0
-            : std::clamp(static_cast<int>(speedSelection), 0, 1);
+            : std::clamp(static_cast<int>(speedSelection), 0, 2);
 
         const bool previousAutomaticMode = automaticThreadMode_;
         automaticThreadMode_ = checked(kRadioAutoThread);
@@ -2407,7 +2513,15 @@ private:
             return MA_NOACTIVATE;
 
         case WM_NCHITTEST:
-            return HTTRANSPARENT;
+            return app
+                ? app->HoverHitTest(hwnd, lParam)
+                : HTTRANSPARENT;
+
+        case WM_LBUTTONUP:
+            if (app && app->HandleHoverLeftButtonUp(hwnd, lParam)) {
+                return 0;
+            }
+            break;
         }
 
         return DefWindowProcW(hwnd, message, wParam, lParam);
@@ -3009,6 +3123,7 @@ private:
             ShowWindow(widgetWindow_, SW_SHOWNOACTIVATE);
             widgetVisible_ = true;
             UpdateBlinkTimer();
+            if (pinHover_) ShowPinnedHoverPopup();
             return;
         }
 
@@ -3019,6 +3134,7 @@ private:
                 ShowWindow(widgetWindow_, SW_SHOWNOACTIVATE);
                 widgetVisible_ = true;
                 UpdateBlinkTimer();
+                if (pinHover_) ShowPinnedHoverPopup();
             }
         }
     }
@@ -3030,6 +3146,9 @@ private:
         if (widgetWindow_ && IsWindow(widgetWindow_)) {
             ShowWindow(widgetWindow_, SW_HIDE);
         }
+        if (pinHover_) {
+            HideHoverPopup();
+        }
         widgetVisible_ = false;
 
         anchorReadyActive_ = true;
@@ -3039,7 +3158,7 @@ private:
     }
 
     void HideWidget() {
-        ResetHoverState();
+        ResetHoverState(true);
         if (widgetWindow_ && IsWindow(widgetWindow_)) {
             ShowWindow(widgetWindow_, SW_HIDE);
         }
@@ -3122,6 +3241,10 @@ private:
         double value = generationSpeed_;
         if (generationSpeedMode_ == 1) {
             if (const auto average = RecentGenerationAverage()) {
+                value = *average;
+            }
+        } else if (generationSpeedMode_ == 2) {
+            if (const auto average = CurrentTurnGenerationAverage()) {
                 value = *average;
             }
         }
@@ -3284,6 +3407,167 @@ private:
             this);
     }
 
+    SIZE MeasureHoverContent(
+        HDC dc,
+        int maxContentWidth) const {
+        TEXTMETRICW tm{};
+        GetTextMetricsW(dc, &tm);
+        const int lineHeight = std::max(1, static_cast<int>(tm.tmHeight) + 1);
+
+        int widest = 0;
+        int rows = 0;
+        bool wrapped = false;
+
+        for (const auto& line : hoverLines_) {
+            int x = 0;
+            int lineRows = 1;
+
+            for (const auto& segment : line) {
+                if (segment.text.empty()) continue;
+                SIZE size{};
+                GetTextExtentPoint32W(
+                    dc,
+                    segment.text.c_str(),
+                    static_cast<int>(segment.text.size()),
+                    &size);
+
+                if (x > 0 && x + size.cx > maxContentWidth) {
+                    widest = std::max(widest, x);
+                    x = 0;
+                    ++lineRows;
+                    wrapped = true;
+                }
+                x += size.cx;
+            }
+
+            widest = std::max(widest, x);
+            rows += lineRows;
+        }
+
+        return SIZE{
+            wrapped
+                ? maxContentWidth
+                : std::min(maxContentWidth, widest),
+            rows * lineHeight};
+    }
+
+    void DrawHoverContent(
+        HDC dc,
+        const RECT& client) const {
+        const int padding = 10;
+        const int closeReserve = pinHover_ ? 22 : 0;
+        const int left = client.left + padding;
+        const int right = std::max(
+            left + 1,
+            static_cast<int>(client.right) - padding - closeReserve);
+
+        TEXTMETRICW tm{};
+        GetTextMetricsW(dc, &tm);
+        const int lineHeight = std::max(1, static_cast<int>(tm.tmHeight) + 1);
+
+        int y = client.top + padding;
+        for (const auto& line : hoverLines_) {
+            int x = left;
+
+            for (const auto& segment : line) {
+                if (segment.text.empty()) continue;
+
+                SIZE size{};
+                GetTextExtentPoint32W(
+                    dc,
+                    segment.text.c_str(),
+                    static_cast<int>(segment.text.size()),
+                    &size);
+
+                if (x > left && x + size.cx > right) {
+                    x = left;
+                    y += lineHeight;
+                }
+
+                SetTextColor(dc, segment.color);
+                TextOutW(
+                    dc,
+                    x,
+                    y,
+                    segment.text.c_str(),
+                    static_cast<int>(segment.text.size()));
+                x += size.cx;
+            }
+
+            y += lineHeight;
+        }
+    }
+
+    void FitVisibleHoverPopup() {
+        if (!hoverPopupVisible_ ||
+            !hoverWindow_ ||
+            !IsWindow(hoverWindow_)) {
+            return;
+        }
+
+        HDC dc = GetDC(hoverWindow_);
+        if (!dc) return;
+        HFONT oldFont = font_
+            ? static_cast<HFONT>(SelectObject(dc, font_))
+            : nullptr;
+
+        const int closeReserve = pinHover_ ? 22 : 0;
+        const SIZE measure = MeasureHoverContent(
+            dc,
+            std::max(260, 520 - closeReserve));
+
+        if (oldFont) SelectObject(dc, oldFont);
+        ReleaseDC(hoverWindow_, dc);
+
+        const int padding = 10;
+        const int width = std::clamp(
+            static_cast<int>(measure.cx) + padding * 2 + closeReserve,
+            280,
+            560);
+        const int height = std::max(
+            80,
+            static_cast<int>(measure.cy) + padding * 2);
+
+        RECT current{};
+        if (!GetWindowRect(hoverWindow_, &current)) return;
+
+        MONITORINFO monitorInfo{};
+        monitorInfo.cbSize = sizeof(monitorInfo);
+        const HMONITOR monitor = MonitorFromWindow(
+            hoverWindow_,
+            MONITOR_DEFAULTTONEAREST);
+        GetMonitorInfoW(monitor, &monitorInfo);
+
+        const int x = std::clamp(
+            static_cast<int>(current.left),
+            static_cast<int>(monitorInfo.rcMonitor.left),
+            std::max(
+                static_cast<int>(monitorInfo.rcMonitor.left),
+                static_cast<int>(monitorInfo.rcMonitor.right) - width));
+        const int y = std::clamp(
+            static_cast<int>(current.top),
+            static_cast<int>(monitorInfo.rcMonitor.top),
+            std::max(
+                static_cast<int>(monitorInfo.rcMonitor.top),
+                static_cast<int>(monitorInfo.rcMonitor.bottom) - height));
+
+        const int currentWidth = current.right - current.left;
+        const int currentHeight = current.bottom - current.top;
+        if (x != current.left ||
+            y != current.top ||
+            width != currentWidth ||
+            height != currentHeight) {
+            SetWindowPos(
+                hoverWindow_,
+                HWND_TOPMOST,
+                x,
+                y,
+                width,
+                height,
+                SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+        }
+    }
+
     void PaintHoverPopup(HWND hwnd) {
         PAINTSTRUCT ps{};
         HDC dc = BeginPaint(hwnd, &ps);
@@ -3318,20 +3602,22 @@ private:
         if (border) DeleteObject(border);
 
         SetBkMode(target, TRANSPARENT);
-        SetTextColor(target, RGB(242, 242, 242));
         HFONT oldFont = font_
             ? static_cast<HFONT>(SelectObject(target, font_))
             : nullptr;
 
-        RECT textRect = client;
-        const int padding = 10;
-        InflateRect(&textRect, -padding, -padding);
-        DrawTextW(
-            target,
-            tooltipBuffer_.data(),
-            -1,
-            &textRect,
-            DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX);
+        DrawHoverContent(target, client);
+
+        if (pinHover_) {
+            RECT close = HoverCloseRect(hwnd);
+            SetTextColor(target, RGB(220, 220, 220));
+            DrawTextW(
+                target,
+                L"×",
+                -1,
+                &close,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        }
 
         if (oldFont) SelectObject(target, oldFont);
 
@@ -3362,20 +3648,24 @@ private:
 
         HDC dc = GetDC(hoverWindow_);
         if (!dc) return;
-        HFONT oldFont = font_ ? static_cast<HFONT>(SelectObject(dc, font_)) : nullptr;
-        RECT measure{0, 0, 520, 0};
-        DrawTextW(
+        HFONT oldFont = font_
+            ? static_cast<HFONT>(SelectObject(dc, font_))
+            : nullptr;
+        const int closeReserve = pinHover_ ? 22 : 0;
+        const SIZE measure = MeasureHoverContent(
             dc,
-            tooltipBuffer_.data(),
-            -1,
-            &measure,
-            DT_CALCRECT | DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
+            std::max(260, 520 - closeReserve));
         if (oldFont) SelectObject(dc, oldFont);
         ReleaseDC(hoverWindow_, dc);
 
         const int padding = 10;
-        const int width = std::clamp(static_cast<int>(measure.right - measure.left) + padding * 2, 280, 560);
-        const int height = std::max(80, static_cast<int>(measure.bottom - measure.top) + padding * 2);
+        const int width = std::clamp(
+            static_cast<int>(measure.cx) + padding * 2 + closeReserve,
+            280,
+            560);
+        const int height = std::max(
+            80,
+            static_cast<int>(measure.cy) + padding * 2);
 
         MONITORINFO monitorInfo{};
         monitorInfo.cbSize = sizeof(monitorInfo);
@@ -3446,11 +3736,77 @@ private:
         hoverPopupVisible_ = false;
     }
 
-    void ResetHoverState() {
+    void ShowPinnedHoverPopup() {
+        if (!pinHover_ || !codexRunning_ || !widgetVisible_ ||
+            !widgetWindow_ || !IsWindowVisible(widgetWindow_)) {
+            return;
+        }
+
+        RECT widgetRect{};
+        if (!GetWindowRect(widgetWindow_, &widgetRect)) return;
+        POINT anchor{
+            widgetRect.left + (widgetRect.right - widgetRect.left) / 2,
+            widgetRect.top + (widgetRect.bottom - widgetRect.top) / 2};
+        ShowHoverPopup(anchor);
+    }
+
+    void SetPinHover(bool enabled) {
+        pinHover_ = enabled;
+        WriteRegistryDword(L"PinHover", pinHover_ ? 1u : 0u);
+
+        if (pinHover_) {
+            ShowPinnedHoverPopup();
+        } else {
+            HideHoverPopup();
+        }
+    }
+
+    bool PinHoverEnabled() const {
+        return pinHover_;
+    }
+
+    RECT HoverCloseRect(HWND hwnd) const {
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        const int size = 22;
+        return RECT{
+            std::max(client.left, client.right - size - 2),
+            client.top + 2,
+            client.right - 2,
+            std::min(client.bottom, client.top + size + 2)};
+    }
+
+    LRESULT HoverHitTest(HWND hwnd, LPARAM lParam) const {
+        if (!pinHover_) return HTTRANSPARENT;
+
+        POINT point{
+            GET_X_LPARAM(lParam),
+            GET_Y_LPARAM(lParam)};
+        ScreenToClient(hwnd, &point);
+        const RECT close = HoverCloseRect(hwnd);
+        return PtInRect(&close, point) ? HTCLIENT : HTTRANSPARENT;
+    }
+
+    bool HandleHoverLeftButtonUp(HWND hwnd, LPARAM lParam) {
+        if (!pinHover_) return false;
+
+        POINT point{
+            GET_X_LPARAM(lParam),
+            GET_Y_LPARAM(lParam)};
+        const RECT close = HoverCloseRect(hwnd);
+        if (!PtInRect(&close, point)) return false;
+
+        SetPinHover(false);
+        return true;
+    }
+
+    void ResetHoverState(bool forceHide = false) {
         hoverInside_ = false;
         hoverStartTick_ = 0;
         KillTimer(mainWindow_, kHoverTimer);
-        HideHoverPopup();
+        if (forceHide || !pinHover_) {
+            HideHoverPopup();
+        }
     }
 
     void HandleWidgetMouseMove(HWND hwnd) {
@@ -3470,7 +3826,7 @@ private:
     }
 
     void HandleWidgetMouseLeave() {
-        ResetHoverState();
+        ResetHoverState(false);
     }
 
     void ShowHoverAfterDelay() {
@@ -3508,211 +3864,365 @@ private:
     }
 
     void UpdateTooltipText() {
-        std::wstring text;
+        const COLORREF white = RGB(242, 242, 242);
+        hoverLines_.clear();
+
+        auto addLine = [&](std::vector<HoverSegment> line) {
+            hoverLines_.push_back(std::move(line));
+        };
 
         if (quotaValid_ && quota_.fiveHour.valid) {
-            text += L"5小时：剩余 " + std::to_wstring(quota_.fiveHour.remainingPercent) +
-                    L"% · 恢复 " + FormatResetTime(quota_.fiveHour.resetsAtUnix);
+            addLine({
+                {L"5小时：剩余 ", white},
+                {std::to_wstring(quota_.fiveHour.remainingPercent),
+                    QuotaPercentColor(
+                        quota_.fiveHour.remainingPercent,
+                        true,
+                        true)},
+                {L"% · 恢复 " + FormatResetTime(
+                    quota_.fiveHour.resetsAtUnix), white}});
         } else {
-            text += L"5小时：暂无数据";
+            addLine({
+                {L"5小时：", white},
+                {L"暂无数据", kWarningRed}});
         }
 
         if (threadMetrics_.activeTurn) {
-            text += L"\r\n5h消耗速度（估算）：";
+            std::vector<HoverSegment> line{
+                {L"5h消耗速度（估算）：", white}};
             if (const auto estimate = CurrentFiveHourConsumptionRate()) {
                 wchar_t rateText[64]{};
                 swprintf_s(
                     rateText,
                     L"%.3f%%/分钟",
                     estimate->ratePerMinute);
-                text += rateText;
-                text += L"（" +
-                    std::to_wstring(estimate->consumedPercent) +
-                    L"%/" +
-                    FormatRateDurationCompact(estimate->elapsedMs) +
-                    L"）";
+                line.push_back({
+                    rateText,
+                    workingColor_});
+                line.push_back({
+                    L"（" +
+                        std::to_wstring(estimate->consumedPercent) +
+                        L"%/" +
+                        FormatRateDurationCompact(estimate->elapsedMs) +
+                        L"）",
+                    white});
             } else {
-                text += L"暂无";
+                line.push_back({L"暂无", white});
             }
+            addLine(std::move(line));
         } else {
-            text += L"\r\n上次5h消耗速度（估算）：";
+            std::vector<HoverSegment> line{
+                {L"上次5h消耗速度（估算）：", white}};
             if (fiveHourRateStoredValid_) {
                 wchar_t rateText[64]{};
                 swprintf_s(
                     rateText,
                     L"%.3f%%/分钟",
                     fiveHourRateStoredValue_);
-                text += rateText;
-                text += L"（" +
-                    std::to_wstring(fiveHourRateStoredConsumedPercent_) +
-                    L"%/" +
-                    FormatRateDurationCompact(
-                        fiveHourRateStoredElapsedMs_) +
-                    L"）";
+                line.push_back({rateText, white});
+                line.push_back({
+                    L"（" +
+                        std::to_wstring(
+                            fiveHourRateStoredConsumedPercent_) +
+                        L"%/" +
+                        FormatRateDurationCompact(
+                            fiveHourRateStoredElapsedMs_) +
+                        L"）",
+                    white});
             } else {
-                text += L"暂无";
+                line.push_back({L"暂无", white});
             }
+            addLine(std::move(line));
         }
 
-        text += L"\r\n";
         if (quotaValid_ && quota_.sevenDay.valid) {
-            text += L"7天：剩余 " +
-                std::to_wstring(quota_.sevenDay.remainingPercent) +
-                L"% · 恢复 " +
-                FormatResetTime(quota_.sevenDay.resetsAtUnix);
+            addLine({
+                {L"7天：剩余 ", white},
+                {std::to_wstring(quota_.sevenDay.remainingPercent),
+                    QuotaPercentColor(
+                        quota_.sevenDay.remainingPercent,
+                        true,
+                        false)},
+                {L"% · 恢复 " +
+                    FormatSevenDayReset(
+                        quota_.sevenDay.resetsAtUnix),
+                    white}});
         } else {
-            text += L"7天：暂无数据";
+            addLine({
+                {L"7天：", white},
+                {L"暂无数据", kWarningRed}});
         }
 
-        text += L"\r\n";
         if (threadMetrics_.hasContext) {
-            text += L"上下文：" + std::to_wstring(threadMetrics_.contextPercent) + L"% 已用 (" +
-                    FormatInteger(threadMetrics_.contextUsedTokens) + L" / " +
-                    FormatInteger(threadMetrics_.contextWindowTokens) + L")";
+            addLine({
+                {L"上下文：", white},
+                {std::to_wstring(threadMetrics_.contextPercent),
+                    ContextPercentColor(true)},
+                {L"% 已用 (" +
+                    FormatInteger(threadMetrics_.contextUsedTokens) +
+                    L" / " +
+                    FormatInteger(threadMetrics_.contextWindowTokens) +
+                    L")",
+                    white}});
         } else {
-            text += L"上下文：暂无数据";
+            addLine({
+                {L"上下文：", white},
+                {L"暂无数据", kWarningRed}});
         }
 
-        text += L"\r\n";
         if (threadMetrics_.hasCache) {
             wchar_t cachePercent[32]{};
             swprintf_s(cachePercent, L"%.5f", ExactCachePercent());
-            text += L"缓存：" + std::wstring(cachePercent) + L"% (" +
-                    FormatInteger(threadMetrics_.cachedInputTokens) + L" / " +
-                    FormatInteger(threadMetrics_.inputTokens) + L")";
+            addLine({
+                {L"缓存：" + std::wstring(cachePercent) + L"% (" +
+                    FormatInteger(threadMetrics_.cachedInputTokens) +
+                    L" / " +
+                    FormatInteger(threadMetrics_.inputTokens) +
+                    L")",
+                    white}});
         } else {
-            text += L"缓存：暂无数据";
+            addLine({{L"缓存：暂无数据", white}});
         }
 
-        text += L"\r\n";
         if (threadMetrics_.hasTokenUsage) {
-            text += L"总 Token：" + FormatInteger(threadMetrics_.totalTokens) +
-                    L" · 输出 " + FormatInteger(threadMetrics_.outputTokens);
+            addLine({
+                {L"总 Token：" + FormatInteger(threadMetrics_.totalTokens) +
+                    L" · 输出 " +
+                    FormatInteger(threadMetrics_.outputTokens),
+                    white}});
         } else {
-            text += L"总 Token：暂无数据";
+            addLine({{L"总 Token：暂无数据", white}});
         }
 
-        text += L"\r\n生成速度：";
-        if (generationSpeedValid_) {
-            wchar_t speed[32]{};
-            swprintf_s(speed, L"%.1f token/s", generationSpeed_);
-            text += speed;
-        } else {
-            text += L"暂无";
+        {
+            std::vector<HoverSegment> line{{L"生成速度：", white}};
+            if (generationSpeedValid_) {
+                wchar_t speed[32]{};
+                swprintf_s(speed, L"%.1f token/s", generationSpeed_);
+                line.push_back({speed, white});
+            } else {
+                line.push_back({L"暂无", white});
+            }
+            addLine(std::move(line));
         }
 
-        text += L"\r\n最近平均：";
-        if (const auto averageValue = RecentGenerationAverage()) {
-            wchar_t average[32]{};
-            swprintf_s(
-                average,
-                L"%.1f token/s",
-                *averageValue);
-            text += average;
-        } else {
-            text += L"样本不足";
-        }
-
-        text += L"\r\n最近速度：";
-        if (!generationSpeedRecent_.empty()) {
-            for (std::size_t i = 0; i < generationSpeedRecent_.size(); ++i) {
-                if (i > 0) text += L" / ";
-                wchar_t sample[24]{};
+        {
+            std::vector<HoverSegment> line{{L"最近平均：", white}};
+            if (const auto averageValue = RecentGenerationAverage()) {
+                wchar_t average[32]{};
                 swprintf_s(
-                    sample,
-                    L"%.1f",
-                    generationSpeedRecent_[i].speed);
-                text += sample;
+                    average,
+                    L"%.1f token/s",
+                    *averageValue);
+                line.push_back({average, white});
+            } else {
+                line.push_back({L"样本不足", white});
             }
-        } else {
-            text += L"暂无";
+            addLine(std::move(line));
         }
 
-        text += L"\r\n";
-        if (quotaValid_) {
-            text += L"配额连接：正常 · " + FormatElapsedAge(lastQuotaSuccessMs_) + L"更新";
-        } else {
-            text += L"配额连接：异常";
-            if (lastQuotaSuccessMs_ > 0) {
-                text += L" · 上次成功 " + FormatElapsedAge(lastQuotaSuccessMs_);
-            }
-        }
-        text += L"\r\n会话连接：";
-        text += threadMetrics_.connected ? L"已连接" : L"未连接";
-
-        text += L"\r\n任务状态：";
-        if (!threadMetrics_.valid) {
-            text += L"暂无";
-        } else if (threadMetrics_.waitingForUserInput) {
-            text += L"等待输入";
-        } else if (threadMetrics_.activeTurn) {
-            text += L"运行中";
-        } else {
-            text += L"空闲";
-        }
-
-        text += L"\r\n";
-        const std::int64_t taskDurationMs = CurrentTaskDurationMs();
-        if (taskDurationMs >= 0) {
-            text += L"任务耗时：" + FormatDurationVerbose(taskDurationMs);
+        {
+            std::vector<HoverSegment> line{
+                {threadMetrics_.activeTurn
+                    ? L"本轮平均："
+                    : L"上轮平均：",
+                 white}};
             if (threadMetrics_.activeTurn) {
-                text += L"（进行中）";
+                if (const auto averageValue =
+                        CurrentTurnGenerationAverage()) {
+                    wchar_t average[32]{};
+                    swprintf_s(
+                        average,
+                        L"%.1f token/s",
+                        *averageValue);
+                    line.push_back({average, white});
+                } else {
+                    line.push_back({L"样本不足", white});
+                }
+            } else if (generationSpeedStoredTurnAverageValid_) {
+                wchar_t average[32]{};
+                swprintf_s(
+                    average,
+                    L"%.1f token/s",
+                    generationSpeedStoredTurnAverage_);
+                line.push_back({average, white});
+            } else {
+                line.push_back({L"样本不足", white});
             }
-        } else {
-            text += L"任务耗时：暂无";
+            addLine(std::move(line));
         }
 
-        text += L"\r\n";
+        {
+            std::vector<HoverSegment> line{{L"最近速度：", white}};
+            if (!generationSpeedRecent_.empty()) {
+                for (std::size_t i = 0;
+                     i < generationSpeedRecent_.size();
+                     ++i) {
+                    wchar_t sample[24]{};
+                    swprintf_s(
+                        sample,
+                        i == 0 ? L"%.1f" : L" / %.1f",
+                        generationSpeedRecent_[i].speed);
+                    line.push_back({sample, white});
+                }
+            } else {
+                line.push_back({L"暂无", white});
+            }
+            addLine(std::move(line));
+        }
+
+        if (quotaValid_) {
+            addLine({
+                {L"配额连接：", white},
+                {L"正常", kStatusGreen},
+                {L" · " +
+                    FormatElapsedAge(lastQuotaSuccessMs_) +
+                    L"更新",
+                    white}});
+        } else {
+            std::vector<HoverSegment> line{
+                {L"配额连接：", white},
+                {L"异常", kWarningRed}};
+            if (lastQuotaSuccessMs_ > 0) {
+                line.push_back({
+                    L" · 上次成功 " +
+                        FormatElapsedAge(lastQuotaSuccessMs_),
+                    white});
+            }
+            addLine(std::move(line));
+        }
+
+        addLine({
+            {L"会话连接：", white},
+            {threadMetrics_.connected ? L"已连接" : L"未连接",
+                threadMetrics_.connected
+                    ? kStatusGreen
+                    : kWarningRed}});
+
+        {
+            std::vector<HoverSegment> line{{L"任务状态：", white}};
+            if (!threadMetrics_.valid) {
+                line.push_back({L"暂无", kWarningRed});
+            } else if (threadMetrics_.waitingForUserInput) {
+                line.push_back({L"等待输入", kWarningYellow});
+            } else if (threadMetrics_.activeTurn) {
+                line.push_back({L"运行中", workingColor_});
+            } else {
+                line.push_back({L"空闲", white});
+            }
+            addLine(std::move(line));
+        }
+
+        {
+            const std::int64_t taskDurationMs = CurrentTaskDurationMs();
+            if (taskDurationMs >= 0) {
+                std::vector<HoverSegment> line{
+                    {L"任务耗时：" +
+                        FormatDurationVerbose(taskDurationMs),
+                     white}};
+                if (threadMetrics_.activeTurn) {
+                    line.push_back({
+                        L"（进行中）",
+                        workingColor_});
+                }
+                addLine(std::move(line));
+            } else {
+                addLine({{L"任务耗时：暂无", white}});
+            }
+        }
+
         if (threadMetrics_.hasDiff) {
-            text += threadMetrics_.diffExact ? L"代码改动：" : L"代码改动（实时估算）：";
-            text += std::to_wstring(threadMetrics_.changedFiles) +
-                    L" 个文件 · +" + FormatInteger(threadMetrics_.addedLines) +
-                    L" · -" + FormatInteger(threadMetrics_.removedLines);
+            std::vector<HoverSegment> line{
+                {threadMetrics_.diffExact
+                    ? L"代码改动："
+                    : L"代码改动（实时估算）：",
+                 white},
+                {std::to_wstring(threadMetrics_.changedFiles) +
+                    L" 个文件 · ",
+                 white},
+                {L"+" + FormatInteger(threadMetrics_.addedLines),
+                    kStatusGreen},
+                {L" · ", white},
+                {L"-" + FormatInteger(threadMetrics_.removedLines),
+                    kWarningRed}};
+            addLine(std::move(line));
         } else {
-            text += L"代码改动：本轮暂无";
+            addLine({{L"代码改动：本轮暂无", white}});
         }
 
-        text += L"\r\n会话：";
-        if (!threadMetrics_.threadId.empty()) {
-            text += Utf8ToWide(threadMetrics_.threadId);
-        } else if (!manualThreadId_.empty()) {
-            text += manualThreadId_;
-        } else {
-            text += L"未绑定";
+        {
+            std::wstring session;
+            if (!threadMetrics_.threadId.empty()) {
+                session = Utf8ToWide(threadMetrics_.threadId);
+            } else if (!manualThreadId_.empty()) {
+                session = manualThreadId_;
+            } else {
+                session = L"未绑定";
+            }
+            session += automaticThreadMode_
+                ? L"（自动/实验）"
+                : L"（手动）";
+            addLine({
+                {L"会话：", white},
+                {session, white}});
         }
-        text += automaticThreadMode_ ? L"（自动/实验）" : L"（手动）";
 
         if (automaticThreadMode_) {
-            const RendererActivityState& renderer = rendererActivityMonitor_.State();
-            text += L"\r\nRenderer：";
+            const RendererActivityState& renderer =
+                rendererActivityMonitor_.State();
+
+            std::wstring rendererText;
             if (!renderer.logAvailable) {
-                text += L"日志未找到";
+                rendererText = L"日志未找到";
             } else if (!renderer.eventSeen) {
-                text += L"等待 activity 事件";
+                rendererText = L"等待 activity 事件";
             } else if (renderer.activeThreadId.empty()) {
-                text += L"暂无 active Thread";
+                rendererText = L"暂无 active Thread";
             } else {
-                text += CompactThreadId(renderer.activeThreadId);
+                rendererText =
+                    CompactThreadId(renderer.activeThreadId);
                 if (renderer.pendingInactive) {
-                    text += L"（inactive待确认）";
+                    rendererText += L"（inactive待确认）";
                 }
             }
+            addLine({
+                {L"Renderer：", white},
+                {rendererText, white}});
 
-            text += L"\r\nIPC显示：" + CompactThreadId(threadMetrics_.threadId);
+            std::wstring ipc =
+                CompactThreadId(threadMetrics_.threadId);
             if (renderer.eventSeen &&
                 !renderer.activeThreadId.empty() &&
                 !threadMetrics_.threadId.empty()) {
-                text += renderer.activeThreadId == threadMetrics_.threadId
+                ipc += renderer.activeThreadId ==
+                        threadMetrics_.threadId
                     ? L" · 一致"
                     : L" · 不一致";
             } else {
-                text += L" · 暂无法判断";
+                ipc += L" · 暂无法判断";
             }
+            addLine({
+                {L"IPC显示：", white},
+                {ipc, white}});
         }
 
-        wcsncpy_s(tooltipBuffer_.data(), tooltipBuffer_.size(), text.c_str(), _TRUNCATE);
+        std::wstring plainText;
+        for (std::size_t i = 0; i < hoverLines_.size(); ++i) {
+            if (i > 0) plainText += L"\r\n";
+            for (const auto& segment : hoverLines_[i]) {
+                plainText += segment.text;
+            }
+        }
+        wcsncpy_s(
+            tooltipBuffer_.data(),
+            tooltipBuffer_.size(),
+            plainText.c_str(),
+            _TRUNCATE);
 
-        if (hoverPopupVisible_ && hoverWindow_ && IsWindow(hoverWindow_)) {
+        if (hoverPopupVisible_ &&
+            hoverWindow_ &&
+            IsWindow(hoverWindow_)) {
+            FitVisibleHoverPopup();
             InvalidateRect(hoverWindow_, nullptr, FALSE);
         }
     }
@@ -3750,6 +4260,10 @@ private:
             SetAutoStartRegistry(autoStart_);
             break;
 
+        case kMenuPinHover:
+            SetPinHover(!pinHover_);
+            break;
+
         case kMenuReconnect:
             RequestReconnect();
             break;
@@ -3757,7 +4271,7 @@ private:
         case kMenuAbout:
             MessageBoxW(
                 mainWindow_,
-                L"CodexTaskbar v0.3.12\n\n"
+                L"CodexTaskbar v0.3.13\n\n"
                 L"在 Windows 10 任务栏显示 Codex 配额、绑定会话上下文/缓存和本轮代码改动。\n"
                 L"配额来自官方 app-server；会话指标通过只读 Codex Desktop IPC follower 获取。",
                 L"关于 CodexTaskbar",
@@ -3920,6 +4434,7 @@ private:
     bool quotaValid_{false};
     std::int64_t lastQuotaSuccessMs_{0};
     bool autoStart_{true};
+    bool pinHover_{false};
     bool showFiveHourPercent_{true};
     bool showFiveHourTime_{true};
     bool showSevenDayPercent_{true};
@@ -3958,6 +4473,10 @@ private:
     bool generationSpeedValid_{false};
     double generationSpeed_{0.0};
     std::vector<GenerationSpeedSample> generationSpeedRecent_;
+    double generationSpeedTurnSampleSum_{0.0};
+    std::uint64_t generationSpeedTurnSampleCount_{0};
+    bool generationSpeedStoredTurnAverageValid_{false};
+    double generationSpeedStoredTurnAverage_{0.0};
     std::int64_t generationSpeedLastOutputTokens_{0};
     std::int64_t generationSpeedLastSampleMs_{0};
     std::string generationSpeedThreadId_;
@@ -3975,6 +4494,7 @@ private:
     std::int64_t fiveHourRateStartTaskDurationMs_{0};
     std::string fiveHourRateThreadId_;
 
+    std::vector<HoverLine> hoverLines_;
     std::array<wchar_t, 1024> tooltipBuffer_{};
     std::unique_ptr<DesktopThreadMonitor> threadMonitor_;
     RendererActivityMonitor rendererActivityMonitor_;
