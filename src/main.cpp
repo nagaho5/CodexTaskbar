@@ -2131,6 +2131,11 @@ public:
             speedMode, CB_SETCURSEL,
             static_cast<WPARAM>(generationSpeedMode_), 0);
 
+        checkbox(
+            kCheckHideWidgetWhenPinned,
+            L"固定悬浮窗时隐藏任务栏信息区",
+            24, 322, hideWidgetWhenPinned_, 320);
+
         // Right column: presentation and alert behavior.
         CreateWindowW(L"STATIC", L"显示样式与提醒", WS_CHILD | WS_VISIBLE,
             400, 62, 200, 24, hwnd, nullptr, instance_, nullptr);
@@ -2159,18 +2164,29 @@ public:
         checkbox(kCheckAutoFitFont, L"溢出时逐行微缩 (最多 2pt)",
             400, 262, autoFitFont_, 280);
 
-        CreateWindowW(L"STATIC", L"Cache显示：", WS_CHILD | WS_VISIBLE,
-            400, 294, 92, 24, hwnd, nullptr, instance_, nullptr);
+        CreateWindowW(L"STATIC", L"Cache格式：", WS_CHILD | WS_VISIBLE,
+            400, 294, 88, 24, hwnd, nullptr, instance_, nullptr);
         HWND cacheMode = CreateWindowExW(
             WS_EX_CLIENTEDGE, L"COMBOBOX", nullptr,
             WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
-            494, 289, 170, 150, hwnd,
+            488, 289, 110, 150, hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kComboCacheDisplayMode)), instance_, nullptr);
         SendMessageW(cacheMode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"整数"));
         SendMessageW(cacheMode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"1位小数"));
         SendMessageW(cacheMode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"2位小数"));
         SendMessageW(cacheMode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"90+紧凑"));
         SendMessageW(cacheMode, CB_SETCURSEL, static_cast<WPARAM>(cacheDisplayMode_), 0);
+
+        CreateWindowW(L"STATIC", L"范围：", WS_CHILD | WS_VISIBLE,
+            610, 294, 48, 24, hwnd, nullptr, instance_, nullptr);
+        HWND cacheScope = CreateWindowExW(
+            WS_EX_CLIENTEDGE, L"COMBOBOX", nullptr,
+            WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+            658, 289, 80, 90, hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kComboCacheScope)), instance_, nullptr);
+        SendMessageW(cacheScope, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"本对话"));
+        SendMessageW(cacheScope, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"本轮"));
+        SendMessageW(cacheScope, CB_SETCURSEL, static_cast<WPARAM>(cacheScopeMode_), 0);
 
         checkbox(
             kCheckCompactHourUnderline,
@@ -2414,6 +2430,8 @@ public:
         blinkOnUserInput_ = checked(kCheckBlinkOnUserInput);
         hidePercentSigns_ = checked(kCheckHidePercentSigns);
         autoFitFont_ = checked(kCheckAutoFitFont);
+        hideWidgetWhenPinned_ =
+            checked(kCheckHideWidgetWhenPinned);
 
         const LRESULT fontSelection =
             SendDlgItemMessageW(hwnd, kComboFontChoice, CB_GETCURSEL, 0, 0);
@@ -2426,6 +2444,17 @@ public:
         cacheDisplayMode_ = cacheSelection == CB_ERR
             ? 0
             : std::clamp(static_cast<int>(cacheSelection), 0, 3);
+
+        const LRESULT cacheScopeSelection =
+            SendDlgItemMessageW(
+                hwnd,
+                kComboCacheScope,
+                CB_GETCURSEL,
+                0,
+                0);
+        cacheScopeMode_ = cacheScopeSelection == CB_ERR
+            ? 0
+            : std::clamp(static_cast<int>(cacheScopeSelection), 0, 1);
 
         const LRESULT speedSelection =
             SendDlgItemMessageW(
@@ -2487,6 +2516,10 @@ public:
         WriteRegistryDword(L"NarrowFont", fontChoice_ == 4 ? 1u : 0u);
         WriteRegistryDword(L"AutoFitFont", autoFitFont_ ? 1u : 0u);
         WriteRegistryDword(L"CacheDisplayMode", static_cast<DWORD>(cacheDisplayMode_));
+        WriteRegistryDword(L"CacheScopeMode", static_cast<DWORD>(cacheScopeMode_));
+        WriteRegistryDword(
+            L"HideWidgetWhenPinned",
+            hideWidgetWhenPinned_ ? 1u : 0u);
         WriteRegistryDword(L"AutomaticThreadMode", automaticThreadMode_ ? 1u : 0u);
         WriteRegistryString(L"ManualThreadId", manualThreadId_);
         WriteRegistryString(L"SavedThreads", SerializeSavedThreads(savedThreads_));
