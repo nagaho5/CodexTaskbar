@@ -3,6 +3,7 @@
 #include "RendererActivityMonitor.h"
 
 #include <windows.h>
+#include <windowsx.h>
 #include <commctrl.h>
 #include <commdlg.h>
 #include <dwmapi.h>
@@ -3398,6 +3399,93 @@ private:
             this);
     }
 
+    SIZE MeasureHoverContent(
+        HDC dc,
+        int maxContentWidth) const {
+        TEXTMETRICW tm{};
+        GetTextMetricsW(dc, &tm);
+        const int lineHeight = std::max(1, static_cast<int>(tm.tmHeight) + 1);
+
+        int widest = 0;
+        int rows = 0;
+
+        for (const auto& line : hoverLines_) {
+            int x = 0;
+            int lineRows = 1;
+
+            for (const auto& segment : line) {
+                if (segment.text.empty()) continue;
+                SIZE size{};
+                GetTextExtentPoint32W(
+                    dc,
+                    segment.text.c_str(),
+                    static_cast<int>(segment.text.size()),
+                    &size);
+
+                if (x > 0 && x + size.cx > maxContentWidth) {
+                    widest = std::max(widest, x);
+                    x = 0;
+                    ++lineRows;
+                }
+                x += size.cx;
+            }
+
+            widest = std::max(widest, x);
+            rows += lineRows;
+        }
+
+        return SIZE{
+            std::min(maxContentWidth, widest),
+            rows * lineHeight};
+    }
+
+    void DrawHoverContent(
+        HDC dc,
+        const RECT& client) const {
+        const int padding = 10;
+        const int closeReserve = pinHover_ ? 22 : 0;
+        const int left = client.left + padding;
+        const int right = std::max(
+            left + 1,
+            client.right - padding - closeReserve);
+
+        TEXTMETRICW tm{};
+        GetTextMetricsW(dc, &tm);
+        const int lineHeight = std::max(1, static_cast<int>(tm.tmHeight) + 1);
+
+        int y = client.top + padding;
+        for (const auto& line : hoverLines_) {
+            int x = left;
+
+            for (const auto& segment : line) {
+                if (segment.text.empty()) continue;
+
+                SIZE size{};
+                GetTextExtentPoint32W(
+                    dc,
+                    segment.text.c_str(),
+                    static_cast<int>(segment.text.size()),
+                    &size);
+
+                if (x > left && x + size.cx > right) {
+                    x = left;
+                    y += lineHeight;
+                }
+
+                SetTextColor(dc, segment.color);
+                TextOutW(
+                    dc,
+                    x,
+                    y,
+                    segment.text.c_str(),
+                    static_cast<int>(segment.text.size()));
+                x += size.cx;
+            }
+
+            y += lineHeight;
+        }
+    }
+
     void PaintHoverPopup(HWND hwnd) {
         PAINTSTRUCT ps{};
         HDC dc = BeginPaint(hwnd, &ps);
@@ -3432,20 +3520,22 @@ private:
         if (border) DeleteObject(border);
 
         SetBkMode(target, TRANSPARENT);
-        SetTextColor(target, RGB(242, 242, 242));
         HFONT oldFont = font_
             ? static_cast<HFONT>(SelectObject(target, font_))
             : nullptr;
 
-        RECT textRect = client;
-        const int padding = 10;
-        InflateRect(&textRect, -padding, -padding);
-        DrawTextW(
-            target,
-            tooltipBuffer_.data(),
-            -1,
-            &textRect,
-            DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX);
+        DrawHoverContent(target, client);
+
+        if (pinHover_) {
+            RECT close = HoverCloseRect(hwnd);
+            SetTextColor(target, RGB(220, 220, 220));
+            DrawTextW(
+                target,
+                L"×",
+                -1,
+                &close,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        }
 
         if (oldFont) SelectObject(target, oldFont);
 
@@ -3476,20 +3566,24 @@ private:
 
         HDC dc = GetDC(hoverWindow_);
         if (!dc) return;
-        HFONT oldFont = font_ ? static_cast<HFONT>(SelectObject(dc, font_)) : nullptr;
-        RECT measure{0, 0, 520, 0};
-        DrawTextW(
+        HFONT oldFont = font_
+            ? static_cast<HFONT>(SelectObject(dc, font_))
+            : nullptr;
+        const int closeReserve = pinHover_ ? 22 : 0;
+        const SIZE measure = MeasureHoverContent(
             dc,
-            tooltipBuffer_.data(),
-            -1,
-            &measure,
-            DT_CALCRECT | DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
+            std::max(260, 520 - closeReserve));
         if (oldFont) SelectObject(dc, oldFont);
         ReleaseDC(hoverWindow_, dc);
 
         const int padding = 10;
-        const int width = std::clamp(static_cast<int>(measure.right - measure.left) + padding * 2, 280, 560);
-        const int height = std::max(80, static_cast<int>(measure.bottom - measure.top) + padding * 2);
+        const int width = std::clamp(
+            static_cast<int>(measure.cx) + padding * 2 + closeReserve,
+            280,
+            560);
+        const int height = std::max(
+            80,
+            static_cast<int>(measure.cy) + padding * 2);
 
         MONITORINFO monitorInfo{};
         monitorInfo.cbSize = sizeof(monitorInfo);
