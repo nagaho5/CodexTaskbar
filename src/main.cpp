@@ -1471,12 +1471,13 @@ public:
         return result;
     }
 
-    std::wstring CacheTaskbarText() const {
-        if (!threadMetrics_.hasCache) {
+    std::wstring FormatCacheTaskbarValue(
+        double exact,
+        bool valid) const {
+        if (!valid) {
             return hidePercentSigns_ ? L"--" : L"--%";
         }
 
-        const double exact = ExactCachePercent();
         if (cacheDisplayMode_ == 1) {
             return FixedCachePercent(exact, 1);
         }
@@ -1497,11 +1498,37 @@ public:
             if (hundredths >= 10000) {
                 return L"100";
             }
-            // Below 90%, fall back to an unambiguous two-decimal display.
             return FixedCachePercent(exact, 2);
         }
+
         return TaskbarPercentText(
-            threadMetrics_.cachePercent,
+            static_cast<int>(std::lround(exact)),
+            true);
+    }
+
+    std::optional<double> DisplayTurnCachePercent() const {
+        if (threadMetrics_.activeTurn) {
+            if (const auto estimate = CurrentTurnCacheEstimate()) {
+                return estimate->percent;
+            }
+            return std::nullopt;
+        }
+        if (turnCacheStoredValid_) {
+            return turnCacheStoredPercent_;
+        }
+        return std::nullopt;
+    }
+
+    std::wstring CacheTaskbarText() const {
+        if (cacheScopeMode_ == 1) {
+            const auto turnPercent = DisplayTurnCachePercent();
+            return FormatCacheTaskbarValue(
+                turnPercent.value_or(0.0),
+                turnPercent.has_value());
+        }
+
+        return FormatCacheTaskbarValue(
+            ExactCachePercent(),
             threadMetrics_.hasCache);
     }
 
@@ -4176,6 +4203,50 @@ private:
             addLine({{L"缓存：暂无数据", white}});
         }
 
+        {
+            std::vector<HoverSegment> line{
+                {threadMetrics_.activeTurn
+                    ? L"本轮缓存："
+                    : L"上轮缓存：",
+                 white}};
+            if (threadMetrics_.activeTurn) {
+                if (const auto estimate = CurrentTurnCacheEstimate()) {
+                    wchar_t cachePercent[32]{};
+                    swprintf_s(
+                        cachePercent,
+                        L"%.2f%%",
+                        estimate->percent);
+                    line.push_back({cachePercent, workingColor_});
+                    line.push_back({
+                        L" (" +
+                            FormatInteger(estimate->cachedDelta) +
+                            L" / " +
+                            FormatInteger(estimate->inputDelta) +
+                            L")",
+                        white});
+                } else {
+                    line.push_back({L"暂无", white});
+                }
+            } else if (turnCacheStoredValid_) {
+                wchar_t cachePercent[32]{};
+                swprintf_s(
+                    cachePercent,
+                    L"%.2f%%",
+                    turnCacheStoredPercent_);
+                line.push_back({cachePercent, white});
+                line.push_back({
+                    L" (" +
+                        FormatInteger(turnCacheStoredCachedDelta_) +
+                        L" / " +
+                        FormatInteger(turnCacheStoredInputDelta_) +
+                        L")",
+                    white});
+            } else {
+                line.push_back({L"暂无", white});
+            }
+            addLine(std::move(line));
+        }
+
         if (threadMetrics_.hasTokenUsage) {
             addLine({
                 {L"总 Token：" + FormatInteger(threadMetrics_.totalTokens) +
@@ -4648,6 +4719,7 @@ private:
     int fontChoice_{0};
     bool autoFitFont_{false};
     int cacheDisplayMode_{0};
+    int cacheScopeMode_{0};
     bool showGenerationSpeed_{false};
     int generationSpeedMode_{0};
     bool compactHourUnderline_{false};
