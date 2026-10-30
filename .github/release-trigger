@@ -1,3 +1,3 @@
-tag=v0.3.10
-source_commit=eca4750ba6807e93907458a50cf7e3d48d5ffa32
-reason=restore reliable generation-speed sampling while keeping robust recent averaging
+tag=v0.3.11
+source_commit=da87dccd28a20dfe25fdcc19f177342cb5057262
+reason=simplify 5h consumption-rate tracking to task max-min over task duration
