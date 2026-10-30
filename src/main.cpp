@@ -784,7 +784,7 @@ public:
         autoFitFont_ = ReadRegistryDword(L"AutoFitFont", 0) != 0;
         cacheDisplayMode_ = std::clamp(ReadRegistryDword(L"CacheDisplayMode", 0), 0, 3);
         showGenerationSpeed_ = ReadRegistryDword(L"ShowGenerationSpeed", 0) != 0;
-        generationSpeedMode_ = std::clamp(ReadRegistryDword(L"GenerationSpeedMode", 0), 0, 1);
+        generationSpeedMode_ = std::clamp(ReadRegistryDword(L"GenerationSpeedMode", 0), 0, 2);
         compactHourUnderline_ = ReadRegistryDword(L"CompactHourUnderline", 0) != 0;
         displayTarget_ = std::clamp(ReadRegistryDword(L"DisplayTarget", 0), 0, 1);
         automaticThreadMode_ = ReadRegistryDword(L"AutomaticThreadMode", 0) != 0;
@@ -1039,6 +1039,14 @@ public:
         return sum / static_cast<double>(end - begin);
     }
 
+    std::optional<double> CurrentTurnGenerationAverage() const {
+        if (generationSpeedTurnSampleCount_ < 5) {
+            return std::nullopt;
+        }
+        return generationSpeedTurnSampleSum_ /
+            static_cast<double>(generationSpeedTurnSampleCount_);
+    }
+
     void ApplyThreadMetrics(const ThreadMetrics& metrics) {
         const int oldRows = VisibleRowCount();
         const std::int64_t nowMs = CurrentUnixMilliseconds();
@@ -1081,11 +1089,20 @@ public:
         }
 
         if (identityChanged) {
+            if (generationSpeedTurnSampleCount_ >= 5) {
+                generationSpeedStoredTurnAverage_ =
+                    generationSpeedTurnSampleSum_ /
+                    static_cast<double>(generationSpeedTurnSampleCount_);
+                generationSpeedStoredTurnAverageValid_ = true;
+            }
+
             generationSpeedThreadId_ = metrics.threadId;
             generationSpeedTurnId_ = metrics.turnId;
             generationSpeedValid_ = false;
             generationSpeed_ = 0.0;
             generationSpeedRecent_.clear();
+            generationSpeedTurnSampleSum_ = 0.0;
+            generationSpeedTurnSampleCount_ = 0;
             generationSpeedLastOutputTokens_ =
                 metrics.hasTokenUsage ? metrics.outputTokens : 0;
             generationSpeedLastSampleMs_ = nowMs;
@@ -1126,11 +1143,24 @@ public:
                             generationSpeedRecent_.begin());
                     }
 
+                    // Current-turn average is intentionally the simplest
+                    // possible arithmetic mean of all accepted speed samples.
+                    generationSpeedTurnSampleSum_ += generationSpeed_;
+                    ++generationSpeedTurnSampleCount_;
+
                     // Advance only after accepting a real sample.
                     generationSpeedLastOutputTokens_ = metrics.outputTokens;
                     generationSpeedLastSampleMs_ = nowMs;
                 }
             }
+        }
+
+        if (taskWasActive && !taskNowActive &&
+            generationSpeedTurnSampleCount_ >= 5) {
+            generationSpeedStoredTurnAverage_ =
+                generationSpeedTurnSampleSum_ /
+                static_cast<double>(generationSpeedTurnSampleCount_);
+            generationSpeedStoredTurnAverageValid_ = true;
         }
 
         threadMetrics_ = metrics;
@@ -1576,6 +1606,9 @@ public:
         generationSpeedValid_ = false;
         generationSpeed_ = 0.0;
         generationSpeedRecent_.clear();
+        generationSpeedTurnSampleSum_ = 0.0;
+        generationSpeedTurnSampleCount_ = 0;
+        generationSpeedStoredTurnAverageValid_ = false;
         generationSpeedThreadId_.clear();
         generationSpeedTurnId_.clear();
         fiveHourRateTracking_ = false;
@@ -1858,6 +1891,9 @@ public:
         SendMessageW(
             speedMode, CB_ADDSTRING, 0,
             reinterpret_cast<LPARAM>(L"最近平均"));
+        SendMessageW(
+            speedMode, CB_ADDSTRING, 0,
+            reinterpret_cast<LPARAM>(L"本轮平均"));
         SendMessageW(
             speedMode, CB_SETCURSEL,
             static_cast<WPARAM>(generationSpeedMode_), 0);
@@ -2167,7 +2203,7 @@ public:
                 0);
         generationSpeedMode_ = speedSelection == CB_ERR
             ? 0
-            : std::clamp(static_cast<int>(speedSelection), 0, 1);
+            : std::clamp(static_cast<int>(speedSelection), 0, 2);
 
         const bool previousAutomaticMode = automaticThreadMode_;
         automaticThreadMode_ = checked(kRadioAutoThread);
@@ -3180,6 +3216,10 @@ private:
             if (const auto average = RecentGenerationAverage()) {
                 value = *average;
             }
+        } else if (generationSpeedMode_ == 2) {
+            if (const auto average = CurrentTurnGenerationAverage()) {
+                value = *average;
+            }
         }
 
         wchar_t text[32]{};
@@ -4014,6 +4054,10 @@ private:
     bool generationSpeedValid_{false};
     double generationSpeed_{0.0};
     std::vector<GenerationSpeedSample> generationSpeedRecent_;
+    double generationSpeedTurnSampleSum_{0.0};
+    std::uint64_t generationSpeedTurnSampleCount_{0};
+    bool generationSpeedStoredTurnAverageValid_{false};
+    double generationSpeedStoredTurnAverage_{0.0};
     std::int64_t generationSpeedLastOutputTokens_{0};
     std::int64_t generationSpeedLastSampleMs_{0};
     std::string generationSpeedThreadId_;
