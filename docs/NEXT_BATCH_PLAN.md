@@ -237,3 +237,38 @@ Required optimization:
 - No extra quota polling is required; reuse the existing quota snapshots.
 
 This is an optimization item only; do not implement it until separately scheduled.
+
+
+## 8. Hover popup: show 5h-rate calculation details
+
+Goal:
+
+- Keep the existing compact live/previous 5h consumption-rate row, but append the two inputs that make the estimate easy to verify at a glance:
+  - consumed 5h quota percentage during the measured task interval;
+  - task duration / measured duration used by the formula.
+
+Preferred compact presentation:
+
+- Example:
+  - `5h消耗速度（估算）：1.000%/分钟（10% / 10分钟）`
+- Keep the main rate first, followed by concise details in parentheses.
+- Use the actual values used by the calculation, not separately rounded or reconstructed values.
+- For the normal full-task v0.3.11 calculation, the duration detail is the task duration used by the formula.
+- For the planned mid-task-start optimization, the parenthetical duration must be the observed interval used by that temporary formula (current task duration minus attach-time task duration), not the full historical task duration.
+- When showing the frozen previous-task rate, retain the corresponding frozen consumed percentage and duration so the calculation details remain meaningful after task completion.
+- Keep the wording compact; do not add another hover row just for the calculation details unless width/legibility testing proves necessary.
+
+## 9. Hover popup: show 7-day quota reset time
+
+Goal:
+
+- Make the 7-day quota row mirror the useful information density of the 5-hour quota row.
+- Current style:
+  - `7天：剩余 74%`
+- Target style:
+  - `7天：剩余 74% · 恢复 <time>`
+- Reuse the same reset-time formatting helper/style already used for the 5-hour row.
+- If the 7-day quota is valid but its reset timestamp is unavailable/invalid, keep the percentage and omit or gracefully mark the reset-time portion rather than hiding the whole row.
+- This is hover-only display work; it must not add extra quota polling or requests.
+
+These are display optimization items only; do not implement them until separately scheduled.
