@@ -4103,6 +4103,10 @@ private:
         POINT point{};
         if (!GetCursorPos(&point)) return false;
         ScreenToClient(hwnd, &point);
+        const RECT close = HoverCloseRect(hwnd);
+        if (PtInRect(&close, point)) {
+            return false;
+        }
 
         const int hit = HoverResizeHitFromClient(hwnd, point);
         LPCWSTR cursorId = nullptr;
