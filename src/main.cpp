@@ -90,6 +90,16 @@ constexpr int kComboFontChoice = 2025;
 constexpr int kEditSavedThreads = 2026;
 constexpr int kComboGenerationSpeedMode = 2027;
 constexpr int kCheckCompactHourUnderline = 2028;
+constexpr int kCheckHideWidgetWhenPinned = 2029;
+constexpr int kComboCacheScope = 2030;
+
+constexpr int kHoverDefaultWidth = 560;
+constexpr int kHoverDefaultHeight = 520;
+constexpr int kHoverMinWidth = 320;
+constexpr int kHoverMinHeight = 240;
+constexpr int kHoverMaxWidth = 1200;
+constexpr int kHoverMaxHeight = 1000;
+constexpr int kHoverResizeMargin = 7;
 
 constexpr COLORREF kDefaultWorkingColor = RGB(79, 195, 247);
 constexpr COLORREF kWarningYellow = RGB(255, 196, 64);
@@ -133,6 +143,12 @@ struct FiveHourRateEstimate {
     double ratePerMinute{0.0};
     int consumedPercent{0};
     std::int64_t elapsedMs{0};
+};
+
+struct TurnCacheEstimate {
+    double percent{0.0};
+    std::int64_t cachedDelta{0};
+    std::int64_t inputDelta{0};
 };
 
 struct TaskbarCandidate {
@@ -739,6 +755,9 @@ public:
         if (widgetFont_ && widgetFont_ != font_) {
             DeleteObject(widgetFont_);
         }
+        if (hoverFont_) {
+            DeleteObject(hoverFont_);
+        }
         if (darkBackgroundBrush_) {
             DeleteObject(darkBackgroundBrush_);
         }
@@ -763,6 +782,16 @@ public:
             240)) / 10.0;
         autoStart_ = ReadRegistryDword(L"AutoStart", 1) != 0;
         pinHover_ = ReadRegistryDword(L"PinHover", 0) != 0;
+        hideWidgetWhenPinned_ =
+            ReadRegistryDword(L"HideWidgetWhenPinned", 0) != 0;
+        hoverPinnedWidth_ = std::clamp(
+            ReadRegistryDword(L"HoverPinnedWidth", kHoverDefaultWidth),
+            kHoverMinWidth,
+            kHoverMaxWidth);
+        hoverPinnedHeight_ = std::clamp(
+            ReadRegistryDword(L"HoverPinnedHeight", kHoverDefaultHeight),
+            kHoverMinHeight,
+            kHoverMaxHeight);
         showFiveHourPercent_ = ReadRegistryDword(L"ShowFiveHourPercent", 1) != 0;
         showFiveHourTime_ = ReadRegistryDword(L"ShowFiveHourTime", 1) != 0;
         showSevenDayPercent_ = ReadRegistryDword(L"ShowSevenDayPercent", 1) != 0;
@@ -784,7 +813,10 @@ public:
             ? std::clamp(savedFontChoice, 0, 4)
             : (ReadRegistryDword(L"NarrowFont", 0) != 0 ? 4 : 0);
         autoFitFont_ = ReadRegistryDword(L"AutoFitFont", 0) != 0;
-        cacheDisplayMode_ = std::clamp(ReadRegistryDword(L"CacheDisplayMode", 0), 0, 3);
+        cacheDisplayMode_ = std::clamp(
+            ReadRegistryDword(L"CacheDisplayMode", 0), 0, 3);
+        cacheScopeMode_ = std::clamp(
+            ReadRegistryDword(L"CacheScopeMode", 0), 0, 1);
         showGenerationSpeed_ = ReadRegistryDword(L"ShowGenerationSpeed", 0) != 0;
         generationSpeedMode_ = std::clamp(ReadRegistryDword(L"GenerationSpeedMode", 0), 0, 2);
         compactHourUnderline_ = ReadRegistryDword(L"CompactHourUnderline", 0) != 0;
@@ -890,6 +922,9 @@ public:
                     fiveHourRateSampleCount_ = 0;
                     fiveHourRateStoredValid_ = false;
                     fiveHourRateThreadId_.clear();
+                    turnCacheTracking_ = false;
+                    turnCacheStoredValid_ = false;
+                    turnCacheThreadId_.clear();
                     rendererActivityMonitor_.Reset();
                     UpdateBlinkTimer();
                     InvalidateWidget();
