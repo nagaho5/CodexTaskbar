@@ -2575,6 +2575,11 @@ public:
             threadMonitor_->UpdateConfig(WideToUtf8(manualThreadId_), automaticThreadMode_);
         }
 
+        if (pinHover_) {
+            // Font/settings changes can alter the minimum complete layout.
+            // Recompute the natural pinned ratio before showing it again.
+            hoverPinnedBaseValid_ = false;
+        }
         RecreateFont();
         UpdateBlinkTimer();
         if (widgetVisible_) {
