@@ -341,6 +341,7 @@ Implemented fix:
   - Corner drag keeps the opposite corner fixed.
 - Pinned scale is persisted as a single permille value (75%-175%). v0.3.15 stored width/height are used only as a one-time migration hint.
 - Font or display-setting changes invalidate the pinned natural base so the next show recalculates a complete ratio.
+- Hover `会话` row now shows the saved conversation name only; long Thread IDs are no longer rendered. If the active ID has no saved name, it shows `未命名会话` instead.
 - No new timers, quota reads, Desktop IPC reads or background polling were added.
 
 Status: implemented in v0.3.16; real-device validation is required for the natural-size choice, full-content visibility, and proportional edge/corner drag feel.
