@@ -294,3 +294,29 @@ Implemented together:
 - No new quota polling, IPC polling, renderer-log reads, or permanent timers were added.
 
 Status: implemented in v0.3.13; real-device validation still required for pin/close hit-testing, popup resizing, color appearance, 7-day formatting, and current-turn average behavior.
+
+
+## 11. Resizable pinned hover, optional taskbar hiding, and current-task cache (implemented in v0.3.15)
+
+Implemented design:
+
+- Ordinary non-pinned hover uses a fixed default size (560×520) and no longer resizes itself when live text changes.
+- Pinned hover starts from the same default size on first use, then remembers the user's most recently resized width/height in the registry.
+- Pinned hover can be resized from all four edges/corners. Its internal hover font scales with the smaller of the width/height scale factors, clamped to 75%-175% of the configured hover font size. Horizontal-only growth therefore primarily reduces wrapping; proportional growth increases text size.
+- Pinned width/height are saved only when the resize drag ends; no periodic disk writes were added.
+- The close × is overlaid in the upper-right and no longer reserves an empty column for every line. Only the first content line leaves a small local gap for the close control.
+- New setting: `固定悬浮窗时隐藏任务栏信息区` (default off).
+  - The popup must be successfully shown before the taskbar widget is hidden.
+  - Closing/unpinning restores the taskbar widget immediately.
+  - Pinning remains available from the tray/context menu; no new polling is added.
+- Existing cumulative cache remains the conversation-wide `cachedInputTokens / inputTokens`.
+- New current-task cache uses only the already-received Desktop IPC cumulative counters:
+  - `cachedDelta = currentCached - taskBaselineCached`
+  - `inputDelta = currentInput - taskBaselineInput`
+  - `currentTaskCache = cachedDelta / inputDelta`
+- The cache baseline is kept across brief inactive IPC gaps, follows the same thread/task-duration restart semantics as the 5h estimator, and naturally becomes observation-aligned when CodexTaskbar attaches mid-task.
+- Hover always shows cumulative `缓存` plus `本轮缓存` while active, and freezes it as `上轮缓存` when idle.
+- Taskbar Cache now has an independent scope selector `本对话 / 本轮`; the existing integer/1-decimal/2-decimal/90+ compact formatting is reused.
+- No extra Desktop IPC requests, quota reads, renderer-log reads, timers, or task-time disk reads were added.
+
+Status: implemented in v0.3.15; real-device validation is required for hover edge hit-testing, remembered size/font scaling, taskbar auto-hide/restore, and current-task cache deltas.
