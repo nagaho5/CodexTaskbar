@@ -5081,20 +5081,35 @@ private:
         }
 
         {
-            std::wstring session;
+            std::wstring activeId;
             if (!threadMetrics_.threadId.empty()) {
-                session = Utf8ToWide(threadMetrics_.threadId);
-            } else if (!manualThreadId_.empty()) {
-                session = manualThreadId_;
+                activeId = Utf8ToWide(threadMetrics_.threadId);
             } else {
-                session = L"未绑定";
+                activeId = manualThreadId_;
             }
-            session += automaticThreadMode_
+
+            std::wstring sessionName;
+            if (!activeId.empty()) {
+                for (const auto& entry : savedThreads_) {
+                    if (entry.id == activeId) {
+                        sessionName = entry.name;
+                        break;
+                    }
+                }
+            }
+
+            if (sessionName.empty()) {
+                sessionName = activeId.empty()
+                    ? L"未绑定"
+                    : L"未命名会话";
+            }
+
+            sessionName += automaticThreadMode_
                 ? L"（自动/实验）"
                 : L"（手动）";
             addLine({
                 {L"会话：", white},
-                {session, white}});
+                {sessionName, white}});
         }
 
         if (automaticThreadMode_) {
