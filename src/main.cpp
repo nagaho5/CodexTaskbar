@@ -117,7 +117,6 @@ struct SavedThreadEntry {
 
 struct GenerationSpeedSample {
     double speed{0.0};
-    std::int64_t intervalMs{0};
 };
 
 struct TaskbarCandidate {
@@ -917,26 +916,6 @@ public:
         return std::nullopt;
     }
 
-    std::int64_t GenerationGapThresholdMs() const {
-        if (generationSpeedRecent_.size() < 3) {
-            return 5000;
-        }
-
-        std::vector<std::int64_t> intervals;
-        intervals.reserve(generationSpeedRecent_.size());
-        for (const auto& sample : generationSpeedRecent_) {
-            if (sample.intervalMs > 0) {
-                intervals.push_back(sample.intervalMs);
-            }
-        }
-        if (intervals.size() < 3) return 5000;
-
-        std::sort(intervals.begin(), intervals.end());
-        const std::int64_t median =
-            intervals[intervals.size() / 2];
-        return std::max<std::int64_t>(3000, median * 4);
-    }
-
     std::optional<double> RecentGenerationAverage() const {
         if (generationSpeedRecent_.size() < 5) {
             return std::nullopt;
@@ -1014,19 +993,19 @@ public:
                     metrics.outputTokens - generationSpeedLastOutputTokens_;
                 const std::int64_t deltaMs =
                     nowMs - generationSpeedLastSampleMs_;
-                const std::int64_t longGapThreshold =
-                    GenerationGapThresholdMs();
 
                 // Very short IPC updates are common. Keep the previous
                 // baseline so several short updates accumulate into one
-                // measurable interval instead of being rejected forever.
+                // measurable interval instead of producing a burst spike.
+                //
+                // Do not discard longer intervals solely because of elapsed
+                // time. Codex Desktop can publish cumulative output-token
+                // updates several seconds apart during normal generation, so
+                // a long-gap cutoff can starve sampling completely. The
+                // rolling trimmed mean already reduces the impact of an
+                // occasional unusually slow post-tool sample.
                 if (deltaMs < 250) {
                     // Intentionally do not advance token/time baseline.
-                } else if (deltaMs > longGapThreshold) {
-                    // Tool/network/approval pause: start a new generation
-                    // burst without counting the long idle gap.
-                    generationSpeedLastOutputTokens_ = metrics.outputTokens;
-                    generationSpeedLastSampleMs_ = nowMs;
                 } else if (deltaTokens > 0) {
                     generationSpeed_ =
                         static_cast<double>(deltaTokens) * 1000.0 /
@@ -1034,8 +1013,7 @@ public:
                     generationSpeedValid_ = true;
 
                     generationSpeedRecent_.push_back({
-                        generationSpeed_,
-                        deltaMs});
+                        generationSpeed_});
                     if (generationSpeedRecent_.size() > 8) {
                         generationSpeedRecent_.erase(
                             generationSpeedRecent_.begin());
@@ -3693,7 +3671,7 @@ private:
         case kMenuAbout:
             MessageBoxW(
                 mainWindow_,
-                L"CodexTaskbar v0.3.9\n\n"
+                L"CodexTaskbar v0.3.10\n\n"
                 L"在 Windows 10 任务栏显示 Codex 配额、绑定会话上下文/缓存和本轮代码改动。\n"
                 L"配额来自官方 app-server；会话指标通过只读 Codex Desktop IPC follower 获取。",
                 L"关于 CodexTaskbar",
