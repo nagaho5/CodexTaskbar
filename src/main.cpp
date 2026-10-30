@@ -4002,7 +4002,9 @@ private:
             : nullptr;
 
         int widestSegment = 0;
+        int pinnedDynamicWidthFloor = 0;
         for (const auto& line : hoverLines_) {
+            int fullLineWidth = 0;
             for (const auto& segment : line) {
                 if (segment.text.empty()) continue;
                 SIZE size{};
@@ -4015,14 +4017,34 @@ private:
                     std::max(
                         widestSegment,
                         static_cast<int>(size.cx));
+                fullLineWidth += static_cast<int>(size.cx);
+            }
+
+            if (reserveClose && !line.empty()) {
+                const std::wstring& label = line.front().text;
+                if (label.rfind(L"5小时：", 0) == 0 ||
+                    label.rfind(L"5h消耗速度", 0) == 0 ||
+                    label.rfind(L"上次5h消耗速度", 0) == 0) {
+                    pinnedDynamicWidthFloor =
+                        std::max(
+                            pinnedDynamicWidthFloor,
+                            fullLineWidth + 64);
+                }
             }
         }
 
         const int closeGap = reserveClose ? 24 : 0;
-        const int minWidth = std::clamp(
+        int minWidth = std::clamp(
             widestSegment + 20 + closeGap,
             kHoverMinWidth,
             maxWidth);
+        if (reserveClose && pinnedDynamicWidthFloor > 0) {
+            minWidth = std::max(
+                minWidth,
+                std::min(
+                    maxWidth,
+                    pinnedDynamicWidthFloor + 20));
+        }
 
         HoverLayout best{
             maxWidth,
