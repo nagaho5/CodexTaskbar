@@ -951,6 +951,8 @@ public:
         fiveHourRateResetAtUnix_ = 0;
         fiveHourRateStartTaskDurationMs_ =
             std::max<std::int64_t>(0, taskDurationMs);
+        fiveHourRateLastTaskDurationMs_ =
+            std::max<std::int64_t>(0, taskDurationMs);
         fiveHourRateThreadId_ = metrics.threadId;
 
         // Seed from the currently displayed quota value. For a normal task
@@ -987,15 +989,13 @@ public:
     }
 
     std::optional<FiveHourRateEstimate>
-    CurrentFiveHourConsumptionRate() const {
+    FiveHourConsumptionRateAtDuration(
+        std::int64_t currentDurationMs) const {
         if (!fiveHourRateTracking_ ||
-            !threadMetrics_.activeTurn ||
-            fiveHourRateSampleCount_ < 2) {
+            fiveHourRateSampleCount_ < 2 ||
+            currentDurationMs < 0) {
             return std::nullopt;
         }
-
-        const std::int64_t currentDurationMs = CurrentTaskDurationMs();
-        if (currentDurationMs < 0) return std::nullopt;
 
         const std::int64_t elapsedMs =
             currentDurationMs - fiveHourRateStartTaskDurationMs_;
@@ -1012,6 +1012,15 @@ public:
                 std::max(0.001, elapsedMinutes),
             consumed,
             elapsedMs};
+    }
+
+    std::optional<FiveHourRateEstimate>
+    CurrentFiveHourConsumptionRate() const {
+        if (!threadMetrics_.activeTurn) {
+            return std::nullopt;
+        }
+        return FiveHourConsumptionRateAtDuration(
+            CurrentTaskDurationMs());
     }
 
     std::optional<double> RecentGenerationAverage() const {
@@ -1059,19 +1068,25 @@ public:
 
         const bool taskWasActive = threadMetrics_.activeTurn;
         const bool taskNowActive = metrics.activeTurn;
+        const std::int64_t incomingTaskDurationMs =
+            taskNowActive
+                ? TaskDurationMsForMetrics(metrics, nowMs)
+                : -1;
         const bool rateThreadChanged =
             !fiveHourRateThreadId_.empty() &&
             !metrics.threadId.empty() &&
             metrics.threadId != fiveHourRateThreadId_;
 
-        // Finalize the task that just ended (or the previously selected active
-        // thread) before replacing threadMetrics_. Turn-ID changes inside the
-        // same active thread are intentionally ignored so a user follow-up does
-        // not reset the 5h consumption history.
+        // A brief activeTurn=false can occur during one logical task. Freeze
+        // the latest result for idle display, but keep max/min/baseline state
+        // alive so a quick resume continues the same 5h estimate.
         if (fiveHourRateTracking_ &&
             taskWasActive &&
-            ((metrics.valid && !taskNowActive) || rateThreadChanged)) {
-            if (const auto estimate = CurrentFiveHourConsumptionRate()) {
+            metrics.valid &&
+            !taskNowActive) {
+            if (const auto estimate =
+                    FiveHourConsumptionRateAtDuration(
+                        CurrentTaskDurationMs())) {
                 fiveHourRateStoredValue_ = estimate->ratePerMinute;
                 fiveHourRateStoredConsumedPercent_ =
                     estimate->consumedPercent;
@@ -1080,14 +1095,43 @@ public:
             } else {
                 fiveHourRateStoredValid_ = false;
             }
+        }
+
+        // Treat it as a genuinely new task only when the bound thread changed
+        // or the reported task duration clearly restarted from a much smaller
+        // value. Small timing jitter must not reset the 5h history.
+        const bool taskDurationRestarted =
+            fiveHourRateTracking_ &&
+            taskNowActive &&
+            incomingTaskDurationMs >= 0 &&
+            fiveHourRateLastTaskDurationMs_ >= 0 &&
+            incomingTaskDurationMs + 5000 <
+                fiveHourRateLastTaskDurationMs_;
+        const bool startNewRateTask =
+            rateThreadChanged || taskDurationRestarted;
+
+        if (fiveHourRateTracking_ && startNewRateTask) {
+            if (const auto estimate =
+                    FiveHourConsumptionRateAtDuration(
+                        fiveHourRateLastTaskDurationMs_)) {
+                fiveHourRateStoredValue_ = estimate->ratePerMinute;
+                fiveHourRateStoredConsumedPercent_ =
+                    estimate->consumedPercent;
+                fiveHourRateStoredElapsedMs_ = estimate->elapsedMs;
+                fiveHourRateStoredValid_ = true;
+            }
             fiveHourRateTracking_ = false;
             fiveHourRateSampleCount_ = 0;
             fiveHourRateThreadId_.clear();
         }
 
-        if (taskNowActive &&
-            (!fiveHourRateTracking_ || rateThreadChanged)) {
+        if (taskNowActive && !fiveHourRateTracking_) {
             BeginFiveHourRateTracking(metrics);
+        } else if (taskNowActive &&
+                   fiveHourRateTracking_ &&
+                   incomingTaskDurationMs >= 0) {
+            fiveHourRateLastTaskDurationMs_ =
+                incomingTaskDurationMs;
         }
 
         if (identityChanged) {
@@ -4271,7 +4315,7 @@ private:
         case kMenuAbout:
             MessageBoxW(
                 mainWindow_,
-                L"CodexTaskbar v0.3.13\n\n"
+                L"CodexTaskbar v0.3.14\n\n"
                 L"在 Windows 10 任务栏显示 Codex 配额、绑定会话上下文/缓存和本轮代码改动。\n"
                 L"配额来自官方 app-server；会话指标通过只读 Codex Desktop IPC follower 获取。",
                 L"关于 CodexTaskbar",
@@ -4492,6 +4536,7 @@ private:
     int fiveHourRateMinRemaining_{0};
     std::int64_t fiveHourRateResetAtUnix_{0};
     std::int64_t fiveHourRateStartTaskDurationMs_{0};
+    std::int64_t fiveHourRateLastTaskDurationMs_{0};
     std::string fiveHourRateThreadId_;
 
     std::vector<HoverLine> hoverLines_;
