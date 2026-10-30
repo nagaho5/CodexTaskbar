@@ -1,3 +1,3 @@
-tag=v0.3.13
-source_commit=6133236e98d96a8316a3e9d5ec230e99a3fbf7b3
-reason=add pinned colored hover dashboard and simple current-turn speed average
+tag=v0.3.14
+source_commit=8a490e322120f9ed9039d23ec14bd1c197b38615
+reason=preserve 5h estimate across transient task-state gaps
