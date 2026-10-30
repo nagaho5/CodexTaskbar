@@ -4439,72 +4439,189 @@ private:
     }
 
     bool HandleHoverMouseMove(HWND hwnd) {
-        if (!pinHover_ || !hoverResizing_) return false;
+        if (!pinHover_ ||
+            !hoverResizing_ ||
+            !hoverPinnedBaseValid_) {
+            return false;
+        }
 
         POINT cursor{};
         if (!GetCursorPos(&cursor)) return true;
         const int dx = cursor.x - hoverResizeStartCursor_.x;
         const int dy = cursor.y - hoverResizeStartCursor_.y;
 
-        RECT rect = hoverResizeStartRect_;
-        switch (hoverResizeHit_) {
-        case HTLEFT:
-        case HTTOPLEFT:
-        case HTBOTTOMLEFT:
-            rect.left += dx;
-            break;
-        case HTRIGHT:
-        case HTTOPRIGHT:
-        case HTBOTTOMRIGHT:
-            rect.right += dx;
-            break;
-        }
-        switch (hoverResizeHit_) {
-        case HTTOP:
-        case HTTOPLEFT:
-        case HTTOPRIGHT:
-            rect.top += dy;
-            break;
-        case HTBOTTOM:
-        case HTBOTTOMLEFT:
-        case HTBOTTOMRIGHT:
-            rect.bottom += dy;
-            break;
+        const int startWidth =
+            hoverResizeStartRect_.right -
+            hoverResizeStartRect_.left;
+        const int startHeight =
+            hoverResizeStartRect_.bottom -
+            hoverResizeStartRect_.top;
+        if (startWidth <= 0 || startHeight <= 0) {
+            return true;
         }
 
         const bool resizeLeft =
             hoverResizeHit_ == HTLEFT ||
             hoverResizeHit_ == HTTOPLEFT ||
             hoverResizeHit_ == HTBOTTOMLEFT;
+        const bool resizeRight =
+            hoverResizeHit_ == HTRIGHT ||
+            hoverResizeHit_ == HTTOPRIGHT ||
+            hoverResizeHit_ == HTBOTTOMRIGHT;
         const bool resizeTop =
             hoverResizeHit_ == HTTOP ||
             hoverResizeHit_ == HTTOPLEFT ||
             hoverResizeHit_ == HTTOPRIGHT;
+        const bool resizeBottom =
+            hoverResizeHit_ == HTBOTTOM ||
+            hoverResizeHit_ == HTBOTTOMLEFT ||
+            hoverResizeHit_ == HTBOTTOMRIGHT;
 
-        int width = rect.right - rect.left;
-        int height = rect.bottom - rect.top;
-        width = std::clamp(
-            width,
-            kHoverMinWidth,
-            kHoverMaxWidth);
-        height = std::clamp(
-            height,
-            kHoverMinHeight,
-            kHoverMaxHeight);
-
+        double horizontalFactor = 1.0;
         if (resizeLeft) {
-            rect.left = rect.right - width;
+            horizontalFactor =
+                static_cast<double>(startWidth - dx) /
+                static_cast<double>(startWidth);
+        } else if (resizeRight) {
+            horizontalFactor =
+                static_cast<double>(startWidth + dx) /
+                static_cast<double>(startWidth);
+        }
+
+        double verticalFactor = 1.0;
+        if (resizeTop) {
+            verticalFactor =
+                static_cast<double>(startHeight - dy) /
+                static_cast<double>(startHeight);
+        } else if (resizeBottom) {
+            verticalFactor =
+                static_cast<double>(startHeight + dy) /
+                static_cast<double>(startHeight);
+        }
+
+        double dragFactor = 1.0;
+        const bool horizontalActive =
+            resizeLeft || resizeRight;
+        const bool verticalActive =
+            resizeTop || resizeBottom;
+        if (horizontalActive && verticalActive) {
+            dragFactor =
+                std::abs(horizontalFactor - 1.0) >=
+                        std::abs(verticalFactor - 1.0)
+                    ? horizontalFactor
+                    : verticalFactor;
+        } else if (horizontalActive) {
+            dragFactor = horizontalFactor;
+        } else if (verticalActive) {
+            dragFactor = verticalFactor;
+        }
+
+        const double startScale =
+            static_cast<double>(startWidth) /
+            static_cast<double>(hoverPinnedBaseWidth_);
+        double minimumScale = std::max({
+            0.75,
+            static_cast<double>(kHoverMinWidth) /
+                static_cast<double>(hoverPinnedBaseWidth_),
+            static_cast<double>(kHoverMinHeight) /
+                static_cast<double>(hoverPinnedBaseHeight_)});
+        double maximumScale = std::min({
+            1.75,
+            static_cast<double>(kHoverMaxWidth) /
+                static_cast<double>(hoverPinnedBaseWidth_),
+            static_cast<double>(kHoverMaxHeight) /
+                static_cast<double>(hoverPinnedBaseHeight_)});
+
+        MONITORINFO monitorInfo{};
+        monitorInfo.cbSize = sizeof(monitorInfo);
+        const HMONITOR monitor = MonitorFromWindow(
+            hwnd,
+            MONITOR_DEFAULTTONEAREST);
+        if (GetMonitorInfoW(monitor, &monitorInfo)) {
+            const int workWidth = std::max(
+                1,
+                static_cast<int>(
+                    monitorInfo.rcWork.right -
+                    monitorInfo.rcWork.left) - 8);
+            const int workHeight = std::max(
+                1,
+                static_cast<int>(
+                    monitorInfo.rcWork.bottom -
+                    monitorInfo.rcWork.top) - 8);
+            maximumScale = std::min({
+                maximumScale,
+                static_cast<double>(workWidth) /
+                    static_cast<double>(hoverPinnedBaseWidth_),
+                static_cast<double>(workHeight) /
+                    static_cast<double>(hoverPinnedBaseHeight_)});
+        }
+
+        if (maximumScale < minimumScale) {
+            minimumScale = maximumScale;
+        }
+
+        const double scale = std::clamp(
+            startScale * dragFactor,
+            minimumScale,
+            maximumScale);
+        const int width = std::max(
+            1,
+            static_cast<int>(std::lround(
+                hoverPinnedBaseWidth_ * scale)));
+        const int height = std::max(
+            1,
+            static_cast<int>(std::lround(
+                hoverPinnedBaseHeight_ * scale)));
+
+        RECT rect = hoverResizeStartRect_;
+        const int centerX =
+            (hoverResizeStartRect_.left +
+             hoverResizeStartRect_.right) / 2;
+        const int centerY =
+            (hoverResizeStartRect_.top +
+             hoverResizeStartRect_.bottom) / 2;
+
+        if (horizontalActive && verticalActive) {
+            if (resizeLeft) {
+                rect.left = hoverResizeStartRect_.right - width;
+                rect.right = hoverResizeStartRect_.right;
+            } else {
+                rect.left = hoverResizeStartRect_.left;
+                rect.right = hoverResizeStartRect_.left + width;
+            }
+            if (resizeTop) {
+                rect.top = hoverResizeStartRect_.bottom - height;
+                rect.bottom = hoverResizeStartRect_.bottom;
+            } else {
+                rect.top = hoverResizeStartRect_.top;
+                rect.bottom = hoverResizeStartRect_.top + height;
+            }
+        } else if (horizontalActive) {
+            if (resizeLeft) {
+                rect.left = hoverResizeStartRect_.right - width;
+                rect.right = hoverResizeStartRect_.right;
+            } else {
+                rect.left = hoverResizeStartRect_.left;
+                rect.right = hoverResizeStartRect_.left + width;
+            }
+            rect.top = centerY - height / 2;
+            rect.bottom = rect.top + height;
         } else {
+            if (resizeTop) {
+                rect.top = hoverResizeStartRect_.bottom - height;
+                rect.bottom = hoverResizeStartRect_.bottom;
+            } else {
+                rect.top = hoverResizeStartRect_.top;
+                rect.bottom = hoverResizeStartRect_.top + height;
+            }
+            rect.left = centerX - width / 2;
             rect.right = rect.left + width;
         }
-        if (resizeTop) {
-            rect.top = rect.bottom - height;
-        } else {
-            rect.bottom = rect.top + height;
-        }
 
-        hoverPinnedWidth_ = width;
-        hoverPinnedHeight_ = height;
+        hoverPinnedScalePermille_ = std::clamp(
+            static_cast<int>(std::lround(scale * 1000.0)),
+            1,
+            5000);
         RecreateHoverFontForSize(width, height);
 
         SetWindowPos(
@@ -4528,12 +4645,24 @@ private:
             if (GetCapture() == hwnd) {
                 ReleaseCapture();
             }
+
             WriteRegistryDword(
-                L"HoverPinnedWidth",
-                static_cast<DWORD>(hoverPinnedWidth_));
-            WriteRegistryDword(
-                L"HoverPinnedHeight",
-                static_cast<DWORD>(hoverPinnedHeight_));
+                L"HoverPinnedScalePermille",
+                static_cast<DWORD>(
+                    hoverPinnedScalePermille_));
+
+            // Retain v0.3.15 dimensions only as a downgrade/migration hint.
+            RECT rect{};
+            if (GetWindowRect(hwnd, &rect)) {
+                WriteRegistryDword(
+                    L"HoverPinnedWidth",
+                    static_cast<DWORD>(
+                        std::max(1, rect.right - rect.left)));
+                WriteRegistryDword(
+                    L"HoverPinnedHeight",
+                    static_cast<DWORD>(
+                        std::max(1, rect.bottom - rect.top)));
+            }
             return true;
         }
 
