@@ -3782,211 +3782,364 @@ private:
     }
 
     void UpdateTooltipText() {
-        std::wstring text;
+        const COLORREF white = RGB(242, 242, 242);
+        hoverLines_.clear();
+
+        auto addLine = [&](std::vector<HoverSegment> line) {
+            hoverLines_.push_back(std::move(line));
+        };
 
         if (quotaValid_ && quota_.fiveHour.valid) {
-            text += L"5小时：剩余 " + std::to_wstring(quota_.fiveHour.remainingPercent) +
-                    L"% · 恢复 " + FormatResetTime(quota_.fiveHour.resetsAtUnix);
+            addLine({
+                {L"5小时：剩余 ", white},
+                {std::to_wstring(quota_.fiveHour.remainingPercent),
+                    QuotaPercentColor(
+                        quota_.fiveHour.remainingPercent,
+                        true,
+                        true)},
+                {L"% · 恢复 " + FormatResetTime(
+                    quota_.fiveHour.resetsAtUnix), white}});
         } else {
-            text += L"5小时：暂无数据";
+            addLine({
+                {L"5小时：", white},
+                {L"暂无数据", kWarningRed}});
         }
 
         if (threadMetrics_.activeTurn) {
-            text += L"\r\n5h消耗速度（估算）：";
+            std::vector<HoverSegment> line{
+                {L"5h消耗速度（估算）：", white}};
             if (const auto estimate = CurrentFiveHourConsumptionRate()) {
                 wchar_t rateText[64]{};
                 swprintf_s(
                     rateText,
                     L"%.3f%%/分钟",
                     estimate->ratePerMinute);
-                text += rateText;
-                text += L"（" +
-                    std::to_wstring(estimate->consumedPercent) +
-                    L"%/" +
-                    FormatRateDurationCompact(estimate->elapsedMs) +
-                    L"）";
+                line.push_back({
+                    rateText,
+                    workingColor_});
+                line.push_back({
+                    L"（" +
+                        std::to_wstring(estimate->consumedPercent) +
+                        L"%/" +
+                        FormatRateDurationCompact(estimate->elapsedMs) +
+                        L"）",
+                    white});
             } else {
-                text += L"暂无";
+                line.push_back({L"暂无", white});
             }
+            addLine(std::move(line));
         } else {
-            text += L"\r\n上次5h消耗速度（估算）：";
+            std::vector<HoverSegment> line{
+                {L"上次5h消耗速度（估算）：", white}};
             if (fiveHourRateStoredValid_) {
                 wchar_t rateText[64]{};
                 swprintf_s(
                     rateText,
                     L"%.3f%%/分钟",
                     fiveHourRateStoredValue_);
-                text += rateText;
-                text += L"（" +
-                    std::to_wstring(fiveHourRateStoredConsumedPercent_) +
-                    L"%/" +
-                    FormatRateDurationCompact(
-                        fiveHourRateStoredElapsedMs_) +
-                    L"）";
+                line.push_back({rateText, white});
+                line.push_back({
+                    L"（" +
+                        std::to_wstring(
+                            fiveHourRateStoredConsumedPercent_) +
+                        L"%/" +
+                        FormatRateDurationCompact(
+                            fiveHourRateStoredElapsedMs_) +
+                        L"）",
+                    white});
             } else {
-                text += L"暂无";
+                line.push_back({L"暂无", white});
             }
+            addLine(std::move(line));
         }
 
-        text += L"\r\n";
         if (quotaValid_ && quota_.sevenDay.valid) {
-            text += L"7天：剩余 " +
-                std::to_wstring(quota_.sevenDay.remainingPercent) +
-                L"% · 恢复 " +
-                FormatResetTime(quota_.sevenDay.resetsAtUnix);
+            addLine({
+                {L"7天：剩余 ", white},
+                {std::to_wstring(quota_.sevenDay.remainingPercent),
+                    QuotaPercentColor(
+                        quota_.sevenDay.remainingPercent,
+                        true,
+                        false)},
+                {L"% · 恢复 " +
+                    FormatSevenDayReset(
+                        quota_.sevenDay.resetsAtUnix),
+                    white}});
         } else {
-            text += L"7天：暂无数据";
+            addLine({
+                {L"7天：", white},
+                {L"暂无数据", kWarningRed}});
         }
 
-        text += L"\r\n";
         if (threadMetrics_.hasContext) {
-            text += L"上下文：" + std::to_wstring(threadMetrics_.contextPercent) + L"% 已用 (" +
-                    FormatInteger(threadMetrics_.contextUsedTokens) + L" / " +
-                    FormatInteger(threadMetrics_.contextWindowTokens) + L")";
+            addLine({
+                {L"上下文：", white},
+                {std::to_wstring(threadMetrics_.contextPercent),
+                    ContextPercentColor(true)},
+                {L"% 已用 (" +
+                    FormatInteger(threadMetrics_.contextUsedTokens) +
+                    L" / " +
+                    FormatInteger(threadMetrics_.contextWindowTokens) +
+                    L")",
+                    white}});
         } else {
-            text += L"上下文：暂无数据";
+            addLine({
+                {L"上下文：", white},
+                {L"暂无数据", kWarningRed}});
         }
 
-        text += L"\r\n";
         if (threadMetrics_.hasCache) {
             wchar_t cachePercent[32]{};
             swprintf_s(cachePercent, L"%.5f", ExactCachePercent());
-            text += L"缓存：" + std::wstring(cachePercent) + L"% (" +
-                    FormatInteger(threadMetrics_.cachedInputTokens) + L" / " +
-                    FormatInteger(threadMetrics_.inputTokens) + L")";
+            addLine({
+                {L"缓存：" + std::wstring(cachePercent) + L"% (" +
+                    FormatInteger(threadMetrics_.cachedInputTokens) +
+                    L" / " +
+                    FormatInteger(threadMetrics_.inputTokens) +
+                    L")",
+                    white}});
         } else {
-            text += L"缓存：暂无数据";
+            addLine({{{L"缓存：暂无数据", white}}});
         }
 
-        text += L"\r\n";
         if (threadMetrics_.hasTokenUsage) {
-            text += L"总 Token：" + FormatInteger(threadMetrics_.totalTokens) +
-                    L" · 输出 " + FormatInteger(threadMetrics_.outputTokens);
+            addLine({
+                {L"总 Token：" + FormatInteger(threadMetrics_.totalTokens) +
+                    L" · 输出 " +
+                    FormatInteger(threadMetrics_.outputTokens),
+                    white}});
         } else {
-            text += L"总 Token：暂无数据";
+            addLine({{{L"总 Token：暂无数据", white}}});
         }
 
-        text += L"\r\n生成速度：";
-        if (generationSpeedValid_) {
-            wchar_t speed[32]{};
-            swprintf_s(speed, L"%.1f token/s", generationSpeed_);
-            text += speed;
-        } else {
-            text += L"暂无";
+        {
+            std::vector<HoverSegment> line{{L"生成速度：", white}};
+            if (generationSpeedValid_) {
+                wchar_t speed[32]{};
+                swprintf_s(speed, L"%.1f token/s", generationSpeed_);
+                line.push_back({speed, white});
+            } else {
+                line.push_back({L"暂无", white});
+            }
+            addLine(std::move(line));
         }
 
-        text += L"\r\n最近平均：";
-        if (const auto averageValue = RecentGenerationAverage()) {
-            wchar_t average[32]{};
-            swprintf_s(
-                average,
-                L"%.1f token/s",
-                *averageValue);
-            text += average;
-        } else {
-            text += L"样本不足";
-        }
-
-        text += L"\r\n最近速度：";
-        if (!generationSpeedRecent_.empty()) {
-            for (std::size_t i = 0; i < generationSpeedRecent_.size(); ++i) {
-                if (i > 0) text += L" / ";
-                wchar_t sample[24]{};
+        {
+            std::vector<HoverSegment> line{{L"最近平均：", white}};
+            if (const auto averageValue = RecentGenerationAverage()) {
+                wchar_t average[32]{};
                 swprintf_s(
-                    sample,
-                    L"%.1f",
-                    generationSpeedRecent_[i].speed);
-                text += sample;
+                    average,
+                    L"%.1f token/s",
+                    *averageValue);
+                line.push_back({average, white});
+            } else {
+                line.push_back({L"样本不足", white});
             }
-        } else {
-            text += L"暂无";
+            addLine(std::move(line));
         }
 
-        text += L"\r\n";
-        if (quotaValid_) {
-            text += L"配额连接：正常 · " + FormatElapsedAge(lastQuotaSuccessMs_) + L"更新";
-        } else {
-            text += L"配额连接：异常";
-            if (lastQuotaSuccessMs_ > 0) {
-                text += L" · 上次成功 " + FormatElapsedAge(lastQuotaSuccessMs_);
-            }
-        }
-        text += L"\r\n会话连接：";
-        text += threadMetrics_.connected ? L"已连接" : L"未连接";
-
-        text += L"\r\n任务状态：";
-        if (!threadMetrics_.valid) {
-            text += L"暂无";
-        } else if (threadMetrics_.waitingForUserInput) {
-            text += L"等待输入";
-        } else if (threadMetrics_.activeTurn) {
-            text += L"运行中";
-        } else {
-            text += L"空闲";
-        }
-
-        text += L"\r\n";
-        const std::int64_t taskDurationMs = CurrentTaskDurationMs();
-        if (taskDurationMs >= 0) {
-            text += L"任务耗时：" + FormatDurationVerbose(taskDurationMs);
+        {
+            std::vector<HoverSegment> line{
+                {threadMetrics_.activeTurn
+                    ? L"本轮平均："
+                    : L"上轮平均：",
+                 white}};
             if (threadMetrics_.activeTurn) {
-                text += L"（进行中）";
+                if (const auto averageValue =
+                        CurrentTurnGenerationAverage()) {
+                    wchar_t average[32]{};
+                    swprintf_s(
+                        average,
+                        L"%.1f token/s",
+                        *averageValue);
+                    line.push_back({average, white});
+                } else {
+                    line.push_back({L"样本不足", white});
+                }
+            } else if (generationSpeedStoredTurnAverageValid_) {
+                wchar_t average[32]{};
+                swprintf_s(
+                    average,
+                    L"%.1f token/s",
+                    generationSpeedStoredTurnAverage_);
+                line.push_back({average, white});
+            } else {
+                line.push_back({L"样本不足", white});
             }
-        } else {
-            text += L"任务耗时：暂无";
+            addLine(std::move(line));
         }
 
-        text += L"\r\n";
+        {
+            std::vector<HoverSegment> line{{L"最近速度：", white}};
+            if (!generationSpeedRecent_.empty()) {
+                for (std::size_t i = 0;
+                     i < generationSpeedRecent_.size();
+                     ++i) {
+                    wchar_t sample[24]{};
+                    swprintf_s(
+                        sample,
+                        i == 0 ? L"%.1f" : L" / %.1f",
+                        generationSpeedRecent_[i].speed);
+                    line.push_back({sample, white});
+                }
+            } else {
+                line.push_back({L"暂无", white});
+            }
+            addLine(std::move(line));
+        }
+
+        if (quotaValid_) {
+            addLine({
+                {L"配额连接：", white},
+                {L"正常", kStatusGreen},
+                {L" · " +
+                    FormatElapsedAge(lastQuotaSuccessMs_) +
+                    L"更新",
+                    white}});
+        } else {
+            std::vector<HoverSegment> line{
+                {L"配额连接：", white},
+                {L"异常", kWarningRed}};
+            if (lastQuotaSuccessMs_ > 0) {
+                line.push_back({
+                    L" · 上次成功 " +
+                        FormatElapsedAge(lastQuotaSuccessMs_),
+                    white});
+            }
+            addLine(std::move(line));
+        }
+
+        addLine({
+            {L"会话连接：", white},
+            {threadMetrics_.connected ? L"已连接" : L"未连接",
+                threadMetrics_.connected
+                    ? kStatusGreen
+                    : kWarningRed}});
+
+        {
+            std::vector<HoverSegment> line{{L"任务状态：", white}};
+            if (!threadMetrics_.valid) {
+                line.push_back({L"暂无", kWarningRed});
+            } else if (threadMetrics_.waitingForUserInput) {
+                line.push_back({L"等待输入", kWarningYellow});
+            } else if (threadMetrics_.activeTurn) {
+                line.push_back({L"运行中", workingColor_});
+            } else {
+                line.push_back({L"空闲", white});
+            }
+            addLine(std::move(line));
+        }
+
+        {
+            const std::int64_t taskDurationMs = CurrentTaskDurationMs();
+            if (taskDurationMs >= 0) {
+                std::vector<HoverSegment> line{
+                    {L"任务耗时：" +
+                        FormatDurationVerbose(taskDurationMs),
+                     white}};
+                if (threadMetrics_.activeTurn) {
+                    line.push_back({
+                        L"（进行中）",
+                        workingColor_});
+                }
+                addLine(std::move(line));
+            } else {
+                addLine({{{L"任务耗时：暂无", white}}});
+            }
+        }
+
         if (threadMetrics_.hasDiff) {
-            text += threadMetrics_.diffExact ? L"代码改动：" : L"代码改动（实时估算）：";
-            text += std::to_wstring(threadMetrics_.changedFiles) +
-                    L" 个文件 · +" + FormatInteger(threadMetrics_.addedLines) +
-                    L" · -" + FormatInteger(threadMetrics_.removedLines);
+            std::vector<HoverSegment> line{
+                {threadMetrics_.diffExact
+                    ? L"代码改动："
+                    : L"代码改动（实时估算）：",
+                 white},
+                {std::to_wstring(threadMetrics_.changedFiles) +
+                    L" 个文件 · ",
+                 white},
+                {L"+" + FormatInteger(threadMetrics_.addedLines),
+                    kStatusGreen},
+                {L" · ", white},
+                {L"-" + FormatInteger(threadMetrics_.removedLines),
+                    kWarningRed}};
+            addLine(std::move(line));
         } else {
-            text += L"代码改动：本轮暂无";
+            addLine({{{L"代码改动：本轮暂无", white}}});
         }
 
-        text += L"\r\n会话：";
-        if (!threadMetrics_.threadId.empty()) {
-            text += Utf8ToWide(threadMetrics_.threadId);
-        } else if (!manualThreadId_.empty()) {
-            text += manualThreadId_;
-        } else {
-            text += L"未绑定";
+        {
+            std::wstring session;
+            if (!threadMetrics_.threadId.empty()) {
+                session = Utf8ToWide(threadMetrics_.threadId);
+            } else if (!manualThreadId_.empty()) {
+                session = manualThreadId_;
+            } else {
+                session = L"未绑定";
+            }
+            session += automaticThreadMode_
+                ? L"（自动/实验）"
+                : L"（手动）";
+            addLine({
+                {L"会话：", white},
+                {session, white}});
         }
-        text += automaticThreadMode_ ? L"（自动/实验）" : L"（手动）";
 
         if (automaticThreadMode_) {
-            const RendererActivityState& renderer = rendererActivityMonitor_.State();
-            text += L"\r\nRenderer：";
+            const RendererActivityState& renderer =
+                rendererActivityMonitor_.State();
+
+            std::wstring rendererText;
             if (!renderer.logAvailable) {
-                text += L"日志未找到";
+                rendererText = L"日志未找到";
             } else if (!renderer.eventSeen) {
-                text += L"等待 activity 事件";
+                rendererText = L"等待 activity 事件";
             } else if (renderer.activeThreadId.empty()) {
-                text += L"暂无 active Thread";
+                rendererText = L"暂无 active Thread";
             } else {
-                text += CompactThreadId(renderer.activeThreadId);
+                rendererText =
+                    CompactThreadId(renderer.activeThreadId);
                 if (renderer.pendingInactive) {
-                    text += L"（inactive待确认）";
+                    rendererText += L"（inactive待确认）";
                 }
             }
+            addLine({
+                {L"Renderer：", white},
+                {rendererText, white}});
 
-            text += L"\r\nIPC显示：" + CompactThreadId(threadMetrics_.threadId);
+            std::wstring ipc =
+                CompactThreadId(threadMetrics_.threadId);
             if (renderer.eventSeen &&
                 !renderer.activeThreadId.empty() &&
                 !threadMetrics_.threadId.empty()) {
-                text += renderer.activeThreadId == threadMetrics_.threadId
+                ipc += renderer.activeThreadId ==
+                        threadMetrics_.threadId
                     ? L" · 一致"
                     : L" · 不一致";
             } else {
-                text += L" · 暂无法判断";
+                ipc += L" · 暂无法判断";
             }
+            addLine({
+                {L"IPC显示：", white},
+                {ipc, white}});
         }
 
-        wcsncpy_s(tooltipBuffer_.data(), tooltipBuffer_.size(), text.c_str(), _TRUNCATE);
+        std::wstring plainText;
+        for (std::size_t i = 0; i < hoverLines_.size(); ++i) {
+            if (i > 0) plainText += L"\r\n";
+            for (const auto& segment : hoverLines_[i]) {
+                plainText += segment.text;
+            }
+        }
+        wcsncpy_s(
+            tooltipBuffer_.data(),
+            tooltipBuffer_.size(),
+            plainText.c_str(),
+            _TRUNCATE);
 
-        if (hoverPopupVisible_ && hoverWindow_ && IsWindow(hoverWindow_)) {
+        if (hoverPopupVisible_ &&
+            hoverWindow_ &&
+            IsWindow(hoverWindow_)) {
             InvalidateRect(hoverWindow_, nullptr, FALSE);
         }
     }
@@ -4258,6 +4411,7 @@ private:
     std::int64_t fiveHourRateStartTaskDurationMs_{0};
     std::string fiveHourRateThreadId_;
 
+    std::vector<HoverLine> hoverLines_;
     std::array<wchar_t, 1024> tooltipBuffer_{};
     std::unique_ptr<DesktopThreadMonitor> threadMonitor_;
     RendererActivityMonitor rendererActivityMonitor_;
