@@ -3134,6 +3134,7 @@ private:
                 ShowWindow(widgetWindow_, SW_SHOWNOACTIVATE);
                 widgetVisible_ = true;
                 UpdateBlinkTimer();
+                if (pinHover_) ShowPinnedHoverPopup();
             }
         }
     }
@@ -3157,7 +3158,7 @@ private:
     }
 
     void HideWidget() {
-        ResetHoverState();
+        ResetHoverState(true);
         if (widgetWindow_ && IsWindow(widgetWindow_)) {
             ShowWindow(widgetWindow_, SW_HIDE);
         }
