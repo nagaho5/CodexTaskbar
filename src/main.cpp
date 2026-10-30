@@ -22,6 +22,7 @@
 #include <cwchar>
 #include <cwctype>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -138,6 +139,11 @@ struct HoverSegment {
 };
 
 using HoverLine = std::vector<HoverSegment>;
+
+struct HoverLayout {
+    int width{0};
+    int height{0};
+};
 
 struct FiveHourRateEstimate {
     double ratePerMinute{0.0};
@@ -784,14 +790,36 @@ public:
         pinHover_ = ReadRegistryDword(L"PinHover", 0) != 0;
         hideWidgetWhenPinned_ =
             ReadRegistryDword(L"HideWidgetWhenPinned", 0) != 0;
-        hoverPinnedWidth_ = std::clamp(
-            ReadRegistryDword(L"HoverPinnedWidth", kHoverDefaultWidth),
-            kHoverMinWidth,
-            kHoverMaxWidth);
-        hoverPinnedHeight_ = std::clamp(
-            ReadRegistryDword(L"HoverPinnedHeight", kHoverDefaultHeight),
-            kHoverMinHeight,
-            kHoverMaxHeight);
+        const int savedHoverScale =
+            ReadRegistryDword(L"HoverPinnedScalePermille", -1);
+        if (savedHoverScale >= 0) {
+            hoverPinnedScalePermille_ =
+                std::clamp(savedHoverScale, 750, 1750);
+        } else {
+            // v0.3.15 migration: preserve roughly the user's previous overall
+            // size, but v0.3.16 will re-establish the natural aspect ratio.
+            const int oldWidth = std::clamp(
+                ReadRegistryDword(
+                    L"HoverPinnedWidth",
+                    kHoverDefaultWidth),
+                kHoverMinWidth,
+                kHoverMaxWidth);
+            const int oldHeight = std::clamp(
+                ReadRegistryDword(
+                    L"HoverPinnedHeight",
+                    kHoverDefaultHeight),
+                kHoverMinHeight,
+                kHoverMaxHeight);
+            const double oldScale = std::min(
+                static_cast<double>(oldWidth) /
+                    static_cast<double>(kHoverDefaultWidth),
+                static_cast<double>(oldHeight) /
+                    static_cast<double>(kHoverDefaultHeight));
+            hoverPinnedScalePermille_ = std::clamp(
+                static_cast<int>(std::lround(oldScale * 1000.0)),
+                750,
+                1750);
+        }
         showFiveHourPercent_ = ReadRegistryDword(L"ShowFiveHourPercent", 1) != 0;
         showFiveHourTime_ = ReadRegistryDword(L"ShowFiveHourTime", 1) != 0;
         showSevenDayPercent_ = ReadRegistryDword(L"ShowSevenDayPercent", 1) != 0;
@@ -2547,6 +2575,11 @@ public:
             threadMonitor_->UpdateConfig(WideToUtf8(manualThreadId_), automaticThreadMode_);
         }
 
+        if (pinHover_) {
+            // Font/settings changes can alter the minimum complete layout.
+            // Recompute the natural pinned ratio before showing it again.
+            hoverPinnedBaseValid_ = false;
+        }
         RecreateFont();
         UpdateBlinkTimer();
         if (widgetVisible_) {
@@ -3040,13 +3073,18 @@ private:
     }
 
     double HoverFontScaleForSize(int width, int height) const {
-        if (!pinHover_) return 1.0;
+        if (!pinHover_ ||
+            hoverPinnedBaseWidth_ <= 0 ||
+            hoverPinnedBaseHeight_ <= 0) {
+            return 1.0;
+        }
+
         const double widthScale =
             static_cast<double>(width) /
-            static_cast<double>(kHoverDefaultWidth);
+            static_cast<double>(hoverPinnedBaseWidth_);
         const double heightScale =
             static_cast<double>(height) /
-            static_cast<double>(kHoverDefaultHeight);
+            static_cast<double>(hoverPinnedBaseHeight_);
         return std::clamp(
             std::min(widthScale, heightScale),
             0.75,
@@ -3106,8 +3144,12 @@ private:
         }
 
         RecreateHoverFontForSize(
-            pinHover_ ? hoverPinnedWidth_ : kHoverDefaultWidth,
-            pinHover_ ? hoverPinnedHeight_ : kHoverDefaultHeight);
+            pinHover_ && hoverPinnedBaseValid_
+                ? hoverPinnedBaseWidth_
+                : kHoverDefaultWidth,
+            pinHover_ && hoverPinnedBaseValid_
+                ? hoverPinnedBaseHeight_
+                : kHoverDefaultHeight);
     }
 
     int MeasureTextWidth(HDC dc, const std::wstring& text) const {
@@ -3804,6 +3846,174 @@ private:
         return HTNOWHERE;
     }
 
+    HoverLayout MeasureHoverLayoutAtWidth(
+        HDC dc,
+        int windowWidth,
+        bool reserveClose) const {
+        const int padding = 10;
+        const int closeGap = reserveClose ? 24 : 0;
+        const int normalLimit =
+            std::max(1, windowWidth - padding * 2);
+
+        TEXTMETRICW tm{};
+        GetTextMetricsW(dc, &tm);
+        const int lineHeight =
+            std::max(1, static_cast<int>(tm.tmHeight) + 1);
+
+        int rows = 0;
+        for (std::size_t lineIndex = 0;
+             lineIndex < hoverLines_.size();
+             ++lineIndex) {
+            const int lineLimit = std::max(
+                1,
+                normalLimit -
+                    ((reserveClose && lineIndex == 0)
+                        ? closeGap
+                        : 0));
+            int x = 0;
+            int lineRows = 1;
+
+            for (const auto& segment : hoverLines_[lineIndex]) {
+                if (segment.text.empty()) continue;
+
+                SIZE size{};
+                GetTextExtentPoint32W(
+                    dc,
+                    segment.text.c_str(),
+                    static_cast<int>(segment.text.size()),
+                    &size);
+
+                // A segment is never split internally. Width search therefore
+                // rejects candidates that cannot contain the widest segment.
+                if (size.cx > lineLimit) {
+                    return HoverLayout{windowWidth, INT_MAX};
+                }
+
+                if (x > 0 && x + size.cx > lineLimit) {
+                    x = 0;
+                    ++lineRows;
+                }
+                x += size.cx;
+            }
+
+            rows += lineRows;
+        }
+
+        return HoverLayout{
+            windowWidth,
+            rows * lineHeight + padding * 2};
+    }
+
+    HoverLayout CalculateNaturalHoverLayout(
+        HMONITOR monitor,
+        bool reserveClose) {
+        MONITORINFO info{};
+        info.cbSize = sizeof(info);
+        if (!monitor || !GetMonitorInfoW(monitor, &info)) {
+            return HoverLayout{
+                kHoverDefaultWidth,
+                kHoverDefaultHeight};
+        }
+
+        const int workWidth = std::max(
+            kHoverMinWidth,
+            static_cast<int>(
+                info.rcWork.right - info.rcWork.left) - 16);
+        const int workHeight = std::max(
+            kHoverMinHeight,
+            static_cast<int>(
+                info.rcWork.bottom - info.rcWork.top) - 16);
+        const int maxWidth = std::min(
+            kHoverMaxWidth,
+            workWidth);
+        const int maxHeight = std::min(
+            kHoverMaxHeight,
+            workHeight);
+
+        HDC dc = GetDC(hoverWindow_);
+        if (!dc) {
+            return HoverLayout{
+                std::min(kHoverDefaultWidth, maxWidth),
+                std::min(kHoverDefaultHeight, maxHeight)};
+        }
+
+        HFONT baseFont = font_;
+        HFONT oldFont = baseFont
+            ? static_cast<HFONT>(SelectObject(dc, baseFont))
+            : nullptr;
+
+        int widestSegment = 0;
+        for (const auto& line : hoverLines_) {
+            for (const auto& segment : line) {
+                if (segment.text.empty()) continue;
+                SIZE size{};
+                GetTextExtentPoint32W(
+                    dc,
+                    segment.text.c_str(),
+                    static_cast<int>(segment.text.size()),
+                    &size);
+                widestSegment =
+                    std::max(
+                        widestSegment,
+                        static_cast<int>(size.cx));
+            }
+        }
+
+        const int closeGap = reserveClose ? 24 : 0;
+        const int minWidth = std::clamp(
+            widestSegment + 20 + closeGap,
+            kHoverMinWidth,
+            maxWidth);
+
+        HoverLayout best{
+            maxWidth,
+            maxHeight};
+        long long bestArea =
+            std::numeric_limits<long long>::max();
+        bool found = false;
+
+        // Search a small finite range only when the popup is shown/pinned.
+        // This is UI layout work, not a background polling path.
+        for (int width = minWidth;
+             width <= maxWidth;
+             width += 4) {
+            const HoverLayout layout =
+                MeasureHoverLayoutAtWidth(
+                    dc,
+                    width,
+                    reserveClose);
+            if (layout.height <= 0 ||
+                layout.height > maxHeight) {
+                continue;
+            }
+
+            const long long area =
+                static_cast<long long>(layout.width) *
+                static_cast<long long>(layout.height);
+            if (!found || area < bestArea ||
+                (area == bestArea &&
+                 layout.width < best.width)) {
+                found = true;
+                best = layout;
+                bestArea = area;
+            }
+        }
+
+        if (oldFont) SelectObject(dc, oldFont);
+        ReleaseDC(hoverWindow_, dc);
+
+        if (!found) {
+            // Extremely small work areas fall back to the largest allowed
+            // rectangle. Normal desktop layouts should always take the fitted
+            // path above.
+            return HoverLayout{
+                maxWidth,
+                maxHeight};
+        }
+
+        return best;
+    }
+
     void DrawHoverContent(
         HDC dc,
         const RECT& client) const {
@@ -3939,21 +4149,77 @@ private:
 
         UpdateTooltipText();
 
-        const int width = pinHover_
-            ? hoverPinnedWidth_
-            : kHoverDefaultWidth;
-        const int height = pinHover_
-            ? hoverPinnedHeight_
-            : kHoverDefaultHeight;
-        RecreateHoverFontForSize(width, height);
-
-        MONITORINFO monitorInfo{};
-        monitorInfo.cbSize = sizeof(monitorInfo);
         HMONITOR monitor =
             MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO monitorInfo{};
+        monitorInfo.cbSize = sizeof(monitorInfo);
         if (!GetMonitorInfoW(monitor, &monitorInfo)) {
             return false;
         }
+
+        const HoverLayout natural =
+            CalculateNaturalHoverLayout(
+                monitor,
+                pinHover_);
+
+        int width = natural.width;
+        int height = natural.height;
+
+        if (pinHover_) {
+            if (!hoverPinnedBaseValid_) {
+                hoverPinnedBaseWidth_ = natural.width;
+                hoverPinnedBaseHeight_ = natural.height;
+                hoverPinnedBaseValid_ =
+                    hoverPinnedBaseWidth_ > 0 &&
+                    hoverPinnedBaseHeight_ > 0;
+            }
+
+            if (hoverPinnedBaseValid_) {
+                const int workWidth = std::max(
+                    1,
+                    static_cast<int>(
+                        monitorInfo.rcWork.right -
+                        monitorInfo.rcWork.left) - 8);
+                const int workHeight = std::max(
+                    1,
+                    static_cast<int>(
+                        monitorInfo.rcWork.bottom -
+                        monitorInfo.rcWork.top) - 8);
+
+                const double screenMaxScale = std::min(
+                    static_cast<double>(workWidth) /
+                        static_cast<double>(
+                            hoverPinnedBaseWidth_),
+                    static_cast<double>(workHeight) /
+                        static_cast<double>(
+                            hoverPinnedBaseHeight_));
+                const double maxScale =
+                    std::max(
+                        0.75,
+                        std::min(1.75, screenMaxScale));
+                const double requestedScale =
+                    static_cast<double>(
+                        hoverPinnedScalePermille_) /
+                    1000.0;
+                const double scale = std::clamp(
+                    requestedScale,
+                    0.75,
+                    maxScale);
+
+                width = std::clamp(
+                    static_cast<int>(std::lround(
+                        hoverPinnedBaseWidth_ * scale)),
+                    kHoverMinWidth,
+                    kHoverMaxWidth);
+                height = std::clamp(
+                    static_cast<int>(std::lround(
+                        hoverPinnedBaseHeight_ * scale)),
+                    kHoverMinHeight,
+                    kHoverMaxHeight);
+            }
+        }
+
+        RecreateHoverFontForSize(width, height);
 
         RECT widgetRect{};
         RECT taskbarRect{};
@@ -4000,16 +4266,18 @@ private:
 
         x = std::clamp(
             x,
-            static_cast<int>(monitorInfo.rcMonitor.left),
+            static_cast<int>(monitorInfo.rcWork.left),
             std::max(
-                static_cast<int>(monitorInfo.rcMonitor.left),
-                static_cast<int>(monitorInfo.rcMonitor.right) - width));
+                static_cast<int>(monitorInfo.rcWork.left),
+                static_cast<int>(monitorInfo.rcWork.right) -
+                    width));
         y = std::clamp(
             y,
-            static_cast<int>(monitorInfo.rcMonitor.top),
+            static_cast<int>(monitorInfo.rcWork.top),
             std::max(
-                static_cast<int>(monitorInfo.rcMonitor.top),
-                static_cast<int>(monitorInfo.rcMonitor.bottom) - height));
+                static_cast<int>(monitorInfo.rcWork.top),
+                static_cast<int>(monitorInfo.rcWork.bottom) -
+                    height));
 
         SetWindowPos(
             hoverWindow_,
@@ -4081,12 +4349,11 @@ private:
         WriteRegistryDword(L"PinHover", pinHover_ ? 1u : 0u);
 
         if (pinHover_) {
-            RecreateHoverFontForSize(
-                hoverPinnedWidth_,
-                hoverPinnedHeight_);
+            hoverPinnedBaseValid_ = false;
             ShowPinnedHoverPopup();
         } else {
             HideHoverPopup();
+            hoverPinnedBaseValid_ = false;
             RecreateHoverFontForSize(
                 kHoverDefaultWidth,
                 kHoverDefaultHeight);
@@ -4179,72 +4446,189 @@ private:
     }
 
     bool HandleHoverMouseMove(HWND hwnd) {
-        if (!pinHover_ || !hoverResizing_) return false;
+        if (!pinHover_ ||
+            !hoverResizing_ ||
+            !hoverPinnedBaseValid_) {
+            return false;
+        }
 
         POINT cursor{};
         if (!GetCursorPos(&cursor)) return true;
         const int dx = cursor.x - hoverResizeStartCursor_.x;
         const int dy = cursor.y - hoverResizeStartCursor_.y;
 
-        RECT rect = hoverResizeStartRect_;
-        switch (hoverResizeHit_) {
-        case HTLEFT:
-        case HTTOPLEFT:
-        case HTBOTTOMLEFT:
-            rect.left += dx;
-            break;
-        case HTRIGHT:
-        case HTTOPRIGHT:
-        case HTBOTTOMRIGHT:
-            rect.right += dx;
-            break;
-        }
-        switch (hoverResizeHit_) {
-        case HTTOP:
-        case HTTOPLEFT:
-        case HTTOPRIGHT:
-            rect.top += dy;
-            break;
-        case HTBOTTOM:
-        case HTBOTTOMLEFT:
-        case HTBOTTOMRIGHT:
-            rect.bottom += dy;
-            break;
+        const int startWidth =
+            hoverResizeStartRect_.right -
+            hoverResizeStartRect_.left;
+        const int startHeight =
+            hoverResizeStartRect_.bottom -
+            hoverResizeStartRect_.top;
+        if (startWidth <= 0 || startHeight <= 0) {
+            return true;
         }
 
         const bool resizeLeft =
             hoverResizeHit_ == HTLEFT ||
             hoverResizeHit_ == HTTOPLEFT ||
             hoverResizeHit_ == HTBOTTOMLEFT;
+        const bool resizeRight =
+            hoverResizeHit_ == HTRIGHT ||
+            hoverResizeHit_ == HTTOPRIGHT ||
+            hoverResizeHit_ == HTBOTTOMRIGHT;
         const bool resizeTop =
             hoverResizeHit_ == HTTOP ||
             hoverResizeHit_ == HTTOPLEFT ||
             hoverResizeHit_ == HTTOPRIGHT;
+        const bool resizeBottom =
+            hoverResizeHit_ == HTBOTTOM ||
+            hoverResizeHit_ == HTBOTTOMLEFT ||
+            hoverResizeHit_ == HTBOTTOMRIGHT;
 
-        int width = rect.right - rect.left;
-        int height = rect.bottom - rect.top;
-        width = std::clamp(
-            width,
-            kHoverMinWidth,
-            kHoverMaxWidth);
-        height = std::clamp(
-            height,
-            kHoverMinHeight,
-            kHoverMaxHeight);
-
+        double horizontalFactor = 1.0;
         if (resizeLeft) {
-            rect.left = rect.right - width;
+            horizontalFactor =
+                static_cast<double>(startWidth - dx) /
+                static_cast<double>(startWidth);
+        } else if (resizeRight) {
+            horizontalFactor =
+                static_cast<double>(startWidth + dx) /
+                static_cast<double>(startWidth);
+        }
+
+        double verticalFactor = 1.0;
+        if (resizeTop) {
+            verticalFactor =
+                static_cast<double>(startHeight - dy) /
+                static_cast<double>(startHeight);
+        } else if (resizeBottom) {
+            verticalFactor =
+                static_cast<double>(startHeight + dy) /
+                static_cast<double>(startHeight);
+        }
+
+        double dragFactor = 1.0;
+        const bool horizontalActive =
+            resizeLeft || resizeRight;
+        const bool verticalActive =
+            resizeTop || resizeBottom;
+        if (horizontalActive && verticalActive) {
+            dragFactor =
+                std::abs(horizontalFactor - 1.0) >=
+                        std::abs(verticalFactor - 1.0)
+                    ? horizontalFactor
+                    : verticalFactor;
+        } else if (horizontalActive) {
+            dragFactor = horizontalFactor;
+        } else if (verticalActive) {
+            dragFactor = verticalFactor;
+        }
+
+        const double startScale =
+            static_cast<double>(startWidth) /
+            static_cast<double>(hoverPinnedBaseWidth_);
+        double minimumScale = std::max({
+            0.75,
+            static_cast<double>(kHoverMinWidth) /
+                static_cast<double>(hoverPinnedBaseWidth_),
+            static_cast<double>(kHoverMinHeight) /
+                static_cast<double>(hoverPinnedBaseHeight_)});
+        double maximumScale = std::min({
+            1.75,
+            static_cast<double>(kHoverMaxWidth) /
+                static_cast<double>(hoverPinnedBaseWidth_),
+            static_cast<double>(kHoverMaxHeight) /
+                static_cast<double>(hoverPinnedBaseHeight_)});
+
+        MONITORINFO monitorInfo{};
+        monitorInfo.cbSize = sizeof(monitorInfo);
+        const HMONITOR monitor = MonitorFromWindow(
+            hwnd,
+            MONITOR_DEFAULTTONEAREST);
+        if (GetMonitorInfoW(monitor, &monitorInfo)) {
+            const int workWidth = std::max(
+                1,
+                static_cast<int>(
+                    monitorInfo.rcWork.right -
+                    monitorInfo.rcWork.left) - 8);
+            const int workHeight = std::max(
+                1,
+                static_cast<int>(
+                    monitorInfo.rcWork.bottom -
+                    monitorInfo.rcWork.top) - 8);
+            maximumScale = std::min({
+                maximumScale,
+                static_cast<double>(workWidth) /
+                    static_cast<double>(hoverPinnedBaseWidth_),
+                static_cast<double>(workHeight) /
+                    static_cast<double>(hoverPinnedBaseHeight_)});
+        }
+
+        if (maximumScale < minimumScale) {
+            minimumScale = maximumScale;
+        }
+
+        const double scale = std::clamp(
+            startScale * dragFactor,
+            minimumScale,
+            maximumScale);
+        const int width = std::max(
+            1,
+            static_cast<int>(std::lround(
+                hoverPinnedBaseWidth_ * scale)));
+        const int height = std::max(
+            1,
+            static_cast<int>(std::lround(
+                hoverPinnedBaseHeight_ * scale)));
+
+        RECT rect = hoverResizeStartRect_;
+        const int centerX =
+            (hoverResizeStartRect_.left +
+             hoverResizeStartRect_.right) / 2;
+        const int centerY =
+            (hoverResizeStartRect_.top +
+             hoverResizeStartRect_.bottom) / 2;
+
+        if (horizontalActive && verticalActive) {
+            if (resizeLeft) {
+                rect.left = hoverResizeStartRect_.right - width;
+                rect.right = hoverResizeStartRect_.right;
+            } else {
+                rect.left = hoverResizeStartRect_.left;
+                rect.right = hoverResizeStartRect_.left + width;
+            }
+            if (resizeTop) {
+                rect.top = hoverResizeStartRect_.bottom - height;
+                rect.bottom = hoverResizeStartRect_.bottom;
+            } else {
+                rect.top = hoverResizeStartRect_.top;
+                rect.bottom = hoverResizeStartRect_.top + height;
+            }
+        } else if (horizontalActive) {
+            if (resizeLeft) {
+                rect.left = hoverResizeStartRect_.right - width;
+                rect.right = hoverResizeStartRect_.right;
+            } else {
+                rect.left = hoverResizeStartRect_.left;
+                rect.right = hoverResizeStartRect_.left + width;
+            }
+            rect.top = centerY - height / 2;
+            rect.bottom = rect.top + height;
         } else {
+            if (resizeTop) {
+                rect.top = hoverResizeStartRect_.bottom - height;
+                rect.bottom = hoverResizeStartRect_.bottom;
+            } else {
+                rect.top = hoverResizeStartRect_.top;
+                rect.bottom = hoverResizeStartRect_.top + height;
+            }
+            rect.left = centerX - width / 2;
             rect.right = rect.left + width;
         }
-        if (resizeTop) {
-            rect.top = rect.bottom - height;
-        } else {
-            rect.bottom = rect.top + height;
-        }
 
-        hoverPinnedWidth_ = width;
-        hoverPinnedHeight_ = height;
+        hoverPinnedScalePermille_ = std::clamp(
+            static_cast<int>(std::lround(scale * 1000.0)),
+            1,
+            5000);
         RecreateHoverFontForSize(width, height);
 
         SetWindowPos(
@@ -4268,12 +4652,28 @@ private:
             if (GetCapture() == hwnd) {
                 ReleaseCapture();
             }
+
             WriteRegistryDword(
-                L"HoverPinnedWidth",
-                static_cast<DWORD>(hoverPinnedWidth_));
-            WriteRegistryDword(
-                L"HoverPinnedHeight",
-                static_cast<DWORD>(hoverPinnedHeight_));
+                L"HoverPinnedScalePermille",
+                static_cast<DWORD>(
+                    hoverPinnedScalePermille_));
+
+            // Retain v0.3.15 dimensions only as a downgrade/migration hint.
+            RECT rect{};
+            if (GetWindowRect(hwnd, &rect)) {
+                const int savedWidth = std::max(
+                    1,
+                    static_cast<int>(rect.right - rect.left));
+                const int savedHeight = std::max(
+                    1,
+                    static_cast<int>(rect.bottom - rect.top));
+                WriteRegistryDword(
+                    L"HoverPinnedWidth",
+                    static_cast<DWORD>(savedWidth));
+                WriteRegistryDword(
+                    L"HoverPinnedHeight",
+                    static_cast<DWORD>(savedHeight));
+            }
             return true;
         }
 
@@ -4687,20 +5087,35 @@ private:
         }
 
         {
-            std::wstring session;
+            std::wstring activeId;
             if (!threadMetrics_.threadId.empty()) {
-                session = Utf8ToWide(threadMetrics_.threadId);
-            } else if (!manualThreadId_.empty()) {
-                session = manualThreadId_;
+                activeId = Utf8ToWide(threadMetrics_.threadId);
             } else {
-                session = L"未绑定";
+                activeId = manualThreadId_;
             }
-            session += automaticThreadMode_
+
+            std::wstring sessionName;
+            if (!activeId.empty()) {
+                for (const auto& entry : savedThreads_) {
+                    if (entry.id == activeId) {
+                        sessionName = entry.name;
+                        break;
+                    }
+                }
+            }
+
+            if (sessionName.empty()) {
+                sessionName = activeId.empty()
+                    ? L"未绑定"
+                    : L"未命名会话";
+            }
+
+            sessionName += automaticThreadMode_
                 ? L"（自动/实验）"
                 : L"（手动）";
             addLine({
                 {L"会话：", white},
-                {session, white}});
+                {sessionName, white}});
         }
 
         if (automaticThreadMode_) {
@@ -4806,7 +5221,7 @@ private:
         case kMenuAbout:
             MessageBoxW(
                 mainWindow_,
-                L"CodexTaskbar v0.3.15\n\n"
+                L"CodexTaskbar v0.3.16\n\n"
                 L"在 Windows 10 任务栏显示 Codex 配额、绑定会话上下文/缓存和本轮代码改动。\n"
                 L"配额来自官方 app-server；会话指标通过只读 Codex Desktop IPC follower 获取。",
                 L"关于 CodexTaskbar",
@@ -4973,8 +5388,10 @@ private:
     bool autoStart_{true};
     bool pinHover_{false};
     bool hideWidgetWhenPinned_{false};
-    int hoverPinnedWidth_{kHoverDefaultWidth};
-    int hoverPinnedHeight_{kHoverDefaultHeight};
+    int hoverPinnedScalePermille_{1000};
+    int hoverPinnedBaseWidth_{0};
+    int hoverPinnedBaseHeight_{0};
+    bool hoverPinnedBaseValid_{false};
     bool hoverResizing_{false};
     int hoverResizeHit_{HTNOWHERE};
     POINT hoverResizeStartCursor_{};
