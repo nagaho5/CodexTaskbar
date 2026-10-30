@@ -3415,6 +3415,7 @@ private:
 
         int widest = 0;
         int rows = 0;
+        bool wrapped = false;
 
         for (const auto& line : hoverLines_) {
             int x = 0;
@@ -3433,6 +3434,7 @@ private:
                     widest = std::max(widest, x);
                     x = 0;
                     ++lineRows;
+                    wrapped = true;
                 }
                 x += size.cx;
             }
@@ -3442,7 +3444,9 @@ private:
         }
 
         return SIZE{
-            std::min(maxContentWidth, widest),
+            wrapped
+                ? maxContentWidth
+                : std::min(maxContentWidth, widest),
             rows * lineHeight};
     }
 
@@ -3491,6 +3495,69 @@ private:
 
             y += lineHeight;
         }
+    }
+
+    void FitVisibleHoverPopup() {
+        if (!hoverPopupVisible_ ||
+            !hoverWindow_ ||
+            !IsWindow(hoverWindow_)) {
+            return;
+        }
+
+        HDC dc = GetDC(hoverWindow_);
+        if (!dc) return;
+        HFONT oldFont = font_
+            ? static_cast<HFONT>(SelectObject(dc, font_))
+            : nullptr;
+
+        const int closeReserve = pinHover_ ? 22 : 0;
+        const SIZE measure = MeasureHoverContent(
+            dc,
+            std::max(260, 520 - closeReserve));
+
+        if (oldFont) SelectObject(dc, oldFont);
+        ReleaseDC(hoverWindow_, dc);
+
+        const int padding = 10;
+        const int width = std::clamp(
+            static_cast<int>(measure.cx) + padding * 2 + closeReserve,
+            280,
+            560);
+        const int height = std::max(
+            80,
+            static_cast<int>(measure.cy) + padding * 2);
+
+        RECT current{};
+        if (!GetWindowRect(hoverWindow_, &current)) return;
+
+        MONITORINFO monitorInfo{};
+        monitorInfo.cbSize = sizeof(monitorInfo);
+        const HMONITOR monitor = MonitorFromWindow(
+            hoverWindow_,
+            MONITOR_DEFAULTTONEAREST);
+        GetMonitorInfoW(monitor, &monitorInfo);
+
+        const int x = std::clamp(
+            current.left,
+            static_cast<int>(monitorInfo.rcMonitor.left),
+            std::max(
+                static_cast<int>(monitorInfo.rcMonitor.left),
+                static_cast<int>(monitorInfo.rcMonitor.right) - width));
+        const int y = std::clamp(
+            current.top,
+            static_cast<int>(monitorInfo.rcMonitor.top),
+            std::max(
+                static_cast<int>(monitorInfo.rcMonitor.top),
+                static_cast<int>(monitorInfo.rcMonitor.bottom) - height));
+
+        SetWindowPos(
+            hoverWindow_,
+            HWND_TOPMOST,
+            x,
+            y,
+            width,
+            height,
+            SWP_NOACTIVATE | SWP_NOOWNERZORDER);
     }
 
     void PaintHoverPopup(HWND hwnd) {
@@ -4147,6 +4214,7 @@ private:
         if (hoverPopupVisible_ &&
             hoverWindow_ &&
             IsWindow(hoverWindow_)) {
+            FitVisibleHoverPopup();
             InvalidateRect(hoverWindow_, nullptr, FALSE);
         }
     }
