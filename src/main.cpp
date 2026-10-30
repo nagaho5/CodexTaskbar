@@ -55,6 +55,7 @@ constexpr UINT kMenuAutoStart = 1002;
 constexpr UINT kMenuReconnect = 1003;
 constexpr UINT kMenuAbout = 1004;
 constexpr UINT kMenuExit = 1005;
+constexpr UINT kMenuPinHover = 1006;
 constexpr UINT kMenuDisplayPrimary = 1050;
 constexpr UINT kMenuDisplaySecondary = 1051;
 constexpr UINT kMenuThreadBase = 1100;
@@ -92,6 +93,7 @@ constexpr int kCheckCompactHourUnderline = 2028;
 constexpr COLORREF kDefaultWorkingColor = RGB(79, 195, 247);
 constexpr COLORREF kWarningYellow = RGB(255, 196, 64);
 constexpr COLORREF kWarningRed = RGB(242, 88, 88);
+constexpr COLORREF kStatusGreen = RGB(92, 201, 112);
 
 struct ColoredSegment {
     std::wstring text;
@@ -118,6 +120,13 @@ struct SavedThreadEntry {
 struct GenerationSpeedSample {
     double speed{0.0};
 };
+
+struct HoverSegment {
+    std::wstring text;
+    COLORREF color{RGB(242, 242, 242)};
+};
+
+using HoverLine = std::vector<HoverSegment>;
 
 struct FiveHourRateEstimate {
     double ratePerMinute{0.0};
@@ -370,6 +379,53 @@ std::wstring FormatResetTime(std::int64_t unixSeconds) {
     wchar_t text[16]{};
     swprintf_s(text, L"%02d:%02d", local.tm_hour, local.tm_min);
     return text;
+}
+
+std::wstring FormatSevenDayReset(std::int64_t unixSeconds) {
+    if (unixSeconds <= 0) {
+        return L"--";
+    }
+
+    const time_t value = static_cast<time_t>(unixSeconds);
+    tm local{};
+    if (localtime_s(&local, &value) != 0) {
+        return L"--";
+    }
+
+    wchar_t absolute[32]{};
+    swprintf_s(
+        absolute,
+        L"%d/%d %02d:%02d",
+        local.tm_mon + 1,
+        local.tm_mday,
+        local.tm_hour,
+        local.tm_min);
+
+    const std::int64_t now = static_cast<std::int64_t>(time(nullptr));
+    const std::int64_t remaining =
+        std::max<std::int64_t>(0, unixSeconds - now);
+
+    std::wstring relative;
+    const std::int64_t days = remaining / 86400;
+    const std::int64_t hours = (remaining % 86400) / 3600;
+    const std::int64_t minutes = (remaining % 3600) / 60;
+
+    if (days > 0) {
+        relative = std::to_wstring(days) + L"天";
+        if (hours > 0) {
+            relative += std::to_wstring(hours) + L"小时";
+        }
+        relative += L"后";
+    } else if (hours > 0) {
+        relative = std::to_wstring(hours) + L"小时后";
+    } else if (remaining > 0) {
+        relative = std::to_wstring(std::max<std::int64_t>(1, minutes)) +
+            L"分钟后";
+    } else {
+        relative = L"已到恢复时间";
+    }
+
+    return std::wstring(absolute) + L"（" + relative + L"）";
 }
 
 int ReadRegistryDword(const wchar_t* name, int fallback) {
