@@ -3459,7 +3459,7 @@ private:
         const int left = client.left + padding;
         const int right = std::max(
             left + 1,
-            client.right - padding - closeReserve);
+            static_cast<int>(client.right) - padding - closeReserve);
 
         TEXTMETRICW tm{};
         GetTextMetricsW(dc, &tm);
@@ -3539,13 +3539,13 @@ private:
         GetMonitorInfoW(monitor, &monitorInfo);
 
         const int x = std::clamp(
-            current.left,
+            static_cast<int>(current.left),
             static_cast<int>(monitorInfo.rcMonitor.left),
             std::max(
                 static_cast<int>(monitorInfo.rcMonitor.left),
                 static_cast<int>(monitorInfo.rcMonitor.right) - width));
         const int y = std::clamp(
-            current.top,
+            static_cast<int>(current.top),
             static_cast<int>(monitorInfo.rcMonitor.top),
             std::max(
                 static_cast<int>(monitorInfo.rcMonitor.top),
