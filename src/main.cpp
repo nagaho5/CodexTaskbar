@@ -946,7 +946,7 @@ public:
         // not reset the 5h consumption history.
         if (fiveHourRateTracking_ &&
             taskWasActive &&
-            (!taskNowActive || rateThreadChanged)) {
+            ((metrics.valid && !taskNowActive) || rateThreadChanged)) {
             if (const auto rate = CurrentFiveHourConsumptionRate()) {
                 fiveHourRateStoredValue_ = *rate;
                 fiveHourRateStoredValid_ = true;
@@ -959,7 +959,7 @@ public:
         }
 
         if (taskNowActive &&
-            (!fiveHourRateTracking_ || rateThreadChanged || !taskWasActive)) {
+            (!fiveHourRateTracking_ || rateThreadChanged)) {
             BeginFiveHourRateTracking(metrics);
         }
 
