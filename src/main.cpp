@@ -761,6 +761,7 @@ public:
             80,
             240)) / 10.0;
         autoStart_ = ReadRegistryDword(L"AutoStart", 1) != 0;
+        pinHover_ = ReadRegistryDword(L"PinHover", 0) != 0;
         showFiveHourPercent_ = ReadRegistryDword(L"ShowFiveHourPercent", 1) != 0;
         showFiveHourTime_ = ReadRegistryDword(L"ShowFiveHourTime", 1) != 0;
         showSevenDayPercent_ = ReadRegistryDword(L"ShowSevenDayPercent", 1) != 0;
@@ -1736,6 +1737,11 @@ public:
             reinterpret_cast<LPCWSTR>(L"开机自动启动"));
         AppendMenuW(
             menu,
+            MF_OWNERDRAW | (pinHover_ ? MF_CHECKED : MF_UNCHECKED),
+            kMenuPinHover,
+            reinterpret_cast<LPCWSTR>(L"固定显示悬浮窗"));
+        AppendMenuW(
+            menu,
             MF_OWNERDRAW,
             kMenuReconnect,
             reinterpret_cast<LPCWSTR>(L"重新连接"));
@@ -2499,7 +2505,15 @@ private:
             return MA_NOACTIVATE;
 
         case WM_NCHITTEST:
-            return HTTRANSPARENT;
+            return app
+                ? app->HoverHitTest(hwnd, lParam)
+                : HTTRANSPARENT;
+
+        case WM_LBUTTONUP:
+            if (app && app->HandleHoverLeftButtonUp(hwnd, lParam)) {
+                return 0;
+            }
+            break;
         }
 
         return DefWindowProcW(hwnd, message, wParam, lParam);
@@ -3101,6 +3115,7 @@ private:
             ShowWindow(widgetWindow_, SW_SHOWNOACTIVATE);
             widgetVisible_ = true;
             UpdateBlinkTimer();
+            if (pinHover_) ShowPinnedHoverPopup();
             return;
         }
 
@@ -3121,6 +3136,9 @@ private:
 
         if (widgetWindow_ && IsWindow(widgetWindow_)) {
             ShowWindow(widgetWindow_, SW_HIDE);
+        }
+        if (pinHover_) {
+            HideHoverPopup();
         }
         widgetVisible_ = false;
 
@@ -3542,11 +3560,77 @@ private:
         hoverPopupVisible_ = false;
     }
 
-    void ResetHoverState() {
+    void ShowPinnedHoverPopup() {
+        if (!pinHover_ || !codexRunning_ || !widgetVisible_ ||
+            !widgetWindow_ || !IsWindowVisible(widgetWindow_)) {
+            return;
+        }
+
+        RECT widgetRect{};
+        if (!GetWindowRect(widgetWindow_, &widgetRect)) return;
+        POINT anchor{
+            widgetRect.left + (widgetRect.right - widgetRect.left) / 2,
+            widgetRect.top + (widgetRect.bottom - widgetRect.top) / 2};
+        ShowHoverPopup(anchor);
+    }
+
+    void SetPinHover(bool enabled) {
+        pinHover_ = enabled;
+        WriteRegistryDword(L"PinHover", pinHover_ ? 1u : 0u);
+
+        if (pinHover_) {
+            ShowPinnedHoverPopup();
+        } else {
+            HideHoverPopup();
+        }
+    }
+
+    bool PinHoverEnabled() const {
+        return pinHover_;
+    }
+
+    RECT HoverCloseRect(HWND hwnd) const {
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        const int size = 22;
+        return RECT{
+            std::max(client.left, client.right - size - 2),
+            client.top + 2,
+            client.right - 2,
+            std::min(client.bottom, client.top + size + 2)};
+    }
+
+    LRESULT HoverHitTest(HWND hwnd, LPARAM lParam) const {
+        if (!pinHover_) return HTTRANSPARENT;
+
+        POINT point{
+            GET_X_LPARAM(lParam),
+            GET_Y_LPARAM(lParam)};
+        ScreenToClient(hwnd, &point);
+        const RECT close = HoverCloseRect(hwnd);
+        return PtInRect(&close, point) ? HTCLIENT : HTTRANSPARENT;
+    }
+
+    bool HandleHoverLeftButtonUp(HWND hwnd, LPARAM lParam) {
+        if (!pinHover_) return false;
+
+        POINT point{
+            GET_X_LPARAM(lParam),
+            GET_Y_LPARAM(lParam)};
+        const RECT close = HoverCloseRect(hwnd);
+        if (!PtInRect(&close, point)) return false;
+
+        SetPinHover(false);
+        return true;
+    }
+
+    void ResetHoverState(bool forceHide = false) {
         hoverInside_ = false;
         hoverStartTick_ = 0;
         KillTimer(mainWindow_, kHoverTimer);
-        HideHoverPopup();
+        if (forceHide || !pinHover_) {
+            HideHoverPopup();
+        }
     }
 
     void HandleWidgetMouseMove(HWND hwnd) {
@@ -3566,7 +3650,7 @@ private:
     }
 
     void HandleWidgetMouseLeave() {
-        ResetHoverState();
+        ResetHoverState(false);
     }
 
     void ShowHoverAfterDelay() {
@@ -3846,6 +3930,10 @@ private:
             SetAutoStartRegistry(autoStart_);
             break;
 
+        case kMenuPinHover:
+            SetPinHover(!pinHover_);
+            break;
+
         case kMenuReconnect:
             RequestReconnect();
             break;
@@ -4016,6 +4104,7 @@ private:
     bool quotaValid_{false};
     std::int64_t lastQuotaSuccessMs_{0};
     bool autoStart_{true};
+    bool pinHover_{false};
     bool showFiveHourPercent_{true};
     bool showFiveHourTime_{true};
     bool showSevenDayPercent_{true};
