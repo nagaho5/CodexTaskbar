@@ -93,6 +93,7 @@ constexpr int kComboGenerationSpeedMode = 2027;
 constexpr int kCheckCompactHourUnderline = 2028;
 constexpr int kCheckHideWidgetWhenPinned = 2029;
 constexpr int kComboCacheScope = 2030;
+constexpr int kEditTurnAverageSpeedExcludeAt = 2031;
 
 constexpr int kHoverDefaultWidth = 560;
 constexpr int kHoverDefaultHeight = 520;
@@ -871,7 +872,12 @@ public:
         cacheScopeMode_ = std::clamp(
             ReadRegistryDword(L"CacheScopeMode", 0), 0, 1);
         showGenerationSpeed_ = ReadRegistryDword(L"ShowGenerationSpeed", 0) != 0;
-        generationSpeedMode_ = std::clamp(ReadRegistryDword(L"GenerationSpeedMode", 0), 0, 2);
+        generationSpeedMode_ = std::clamp(
+            ReadRegistryDword(L"GenerationSpeedMode", 0), 0, 2);
+        generationSpeedTurnAverageExcludeAt_ = std::clamp(
+            ReadRegistryDword(L"TurnAverageSpeedExcludeAt", 0),
+            0,
+            1000000);
         compactHourUnderline_ = ReadRegistryDword(L"CompactHourUnderline", 0) != 0;
         displayTarget_ = std::clamp(ReadRegistryDword(L"DisplayTarget", 0), 0, 1);
         automaticThreadMode_ = ReadRegistryDword(L"AutomaticThreadMode", 0) != 0;
@@ -1443,10 +1449,17 @@ public:
                             generationSpeedRecent_.begin());
                     }
 
-                    // Current-turn average is intentionally the simplest
-                    // possible arithmetic mean of all accepted speed samples.
-                    generationSpeedTurnSampleSum_ += generationSpeed_;
-                    ++generationSpeedTurnSampleCount_;
+                    // Current-turn average remains a plain arithmetic
+                    // mean, with one optional user-configured upper cutoff.
+                    // The sample still stays visible in current/recent speed;
+                    // only the current-turn average ignores >= cutoff.
+                    if (generationSpeedTurnAverageExcludeAt_ <= 0 ||
+                        generationSpeed_ <
+                            static_cast<double>(
+                                generationSpeedTurnAverageExcludeAt_)) {
+                        generationSpeedTurnSampleSum_ += generationSpeed_;
+                        ++generationSpeedTurnSampleCount_;
+                    }
 
                     // Advance only after accepting a real sample.
                     generationSpeedLastOutputTokens_ = metrics.outputTokens;
@@ -2236,10 +2249,38 @@ public:
             speedMode, CB_SETCURSEL,
             static_cast<WPARAM>(generationSpeedMode_), 0);
 
-        checkbox(
-            kCheckHideWidgetWhenPinned,
-            L"固定悬浮窗时隐藏任务栏信息区",
-            24, 322, hideWidgetWhenPinned_, 320);
+        CreateWindowW(
+            L"STATIC",
+            L"本轮平均排除 ≥",
+            WS_CHILD | WS_VISIBLE,
+            24, 326, 118, 24,
+            hwnd, nullptr, instance_, nullptr);
+        HWND turnAverageExcludeEdit = CreateWindowExW(
+            WS_EX_CLIENTEDGE,
+            L"EDIT",
+            nullptr,
+            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_NUMBER,
+            144, 321, 66, 28,
+            hwnd,
+            reinterpret_cast<HMENU>(
+                static_cast<INT_PTR>(
+                    kEditTurnAverageSpeedExcludeAt)),
+            instance_,
+            nullptr);
+        wchar_t turnAverageExcludeText[16]{};
+        swprintf_s(
+            turnAverageExcludeText,
+            L"%d",
+            generationSpeedTurnAverageExcludeAt_);
+        SetWindowTextW(
+            turnAverageExcludeEdit,
+            turnAverageExcludeText);
+        CreateWindowW(
+            L"STATIC",
+            L"token/s（0=关闭）",
+            WS_CHILD | WS_VISIBLE,
+            218, 326, 142, 24,
+            hwnd, nullptr, instance_, nullptr);
 
         // Right column: presentation and alert behavior.
         CreateWindowW(L"STATIC", L"显示样式与提醒", WS_CHILD | WS_VISIBLE,
@@ -2296,7 +2337,11 @@ public:
         checkbox(
             kCheckCompactHourUnderline,
             L"小时用下划线压缩",
-            400, 322, compactHourUnderline_, 250);
+            400, 322, compactHourUnderline_, 142);
+        checkbox(
+            kCheckHideWidgetWhenPinned,
+            L"固定时隐藏任务栏信息区",
+            544, 322, hideWidgetWhenPinned_, 194);
 
         // Session section spans the whole lower half.
         CreateWindowW(L"STATIC", L"会话来源", WS_CHILD | WS_VISIBLE,
@@ -2561,6 +2606,29 @@ public:
             ? 0
             : std::clamp(static_cast<int>(cacheScopeSelection), 0, 1);
 
+        wchar_t turnAverageExcludeText[32]{};
+        GetDlgItemTextW(
+            hwnd,
+            kEditTurnAverageSpeedExcludeAt,
+            turnAverageExcludeText,
+            static_cast<int>(
+                std::size(turnAverageExcludeText)));
+        wchar_t* turnAverageExcludeEnd = nullptr;
+        const long requestedTurnAverageExclude =
+            std::wcstol(
+                turnAverageExcludeText,
+                &turnAverageExcludeEnd,
+                10);
+        if (turnAverageExcludeEnd !=
+            turnAverageExcludeText) {
+            generationSpeedTurnAverageExcludeAt_ =
+                std::clamp(
+                    static_cast<int>(
+                        requestedTurnAverageExclude),
+                    0,
+                    1000000);
+        }
+
         const LRESULT speedSelection =
             SendDlgItemMessageW(
                 hwnd,
@@ -2608,6 +2676,10 @@ public:
         WriteRegistryDword(
             L"GenerationSpeedMode",
             static_cast<DWORD>(generationSpeedMode_));
+        WriteRegistryDword(
+            L"TurnAverageSpeedExcludeAt",
+            static_cast<DWORD>(
+                generationSpeedTurnAverageExcludeAt_));
         WriteRegistryDword(
             L"CompactHourUnderline",
             compactHourUnderline_ ? 1u : 0u);
@@ -5501,6 +5573,7 @@ private:
     int cacheScopeMode_{0};
     bool showGenerationSpeed_{false};
     int generationSpeedMode_{0};
+    int generationSpeedTurnAverageExcludeAt_{0};
     bool compactHourUnderline_{false};
     int displayTarget_{0};
     bool automaticThreadMode_{false};
