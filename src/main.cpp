@@ -2621,12 +2621,14 @@ public:
                 10);
         if (turnAverageExcludeEnd !=
             turnAverageExcludeText) {
-            generationSpeedTurnAverageExcludeAt_ =
-                std::clamp(
-                    static_cast<int>(
-                        requestedTurnAverageExclude),
+            const long clampedTurnAverageExclude =
+                std::clamp<long>(
+                    requestedTurnAverageExclude,
                     0,
                     1000000);
+            generationSpeedTurnAverageExcludeAt_ =
+                static_cast<int>(
+                    clampedTurnAverageExclude);
         }
 
         const LRESULT speedSelection =
@@ -5374,7 +5376,7 @@ private:
         case kMenuAbout:
             MessageBoxW(
                 mainWindow_,
-                L"CodexTaskbar v0.3.17\n\n"
+                L"CodexTaskbar v0.3.18\n\n"
                 L"在 Windows 10 任务栏显示 Codex 配额、绑定会话上下文/缓存和本轮代码改动。\n"
                 L"配额来自官方 app-server；会话指标通过只读 Codex Desktop IPC follower 获取。",
                 L"关于 CodexTaskbar",
