@@ -287,7 +287,7 @@ Implemented together:
   - code additions are green and removals are red.
 - Generation-speed display mode adds `本轮平均`.
   - This is intentionally a plain arithmetic mean of **all accepted generation-speed samples in the current Turn**: `sum / count`.
-  - No trimming, sorting, outlier removal, weighting, or extra filters are applied for the current-Turn average.
+  - No trimming, sorting, weighting, or automatic outlier logic is applied. Since v0.3.18, an optional user-configured upper cutoff can exclude samples `>= threshold` from the current-Turn average only.
   - It becomes available after 5 accepted samples, matching the existing recent-average visibility threshold.
   - Before 5 samples, taskbar `本轮平均` mode falls back to the current speed.
   - Hover always shows `本轮平均` while active; after completion it freezes as `上轮平均`.
@@ -369,3 +369,16 @@ Implemented rules:
 - No new polling, quota requests, timers, Desktop IPC reads, or disk I/O were added.
 
 Status: implemented in v0.3.17; real-device validation should focus on long-task 5h continuity and pinned 5h-row wrapping stability.
+
+
+## 14. Optional upper cutoff for current-turn average speed (implemented in v0.3.18)
+
+- New setting: `本轮平均排除 ≥ [N] token/s（0=关闭）`.
+- Default is `0`, so upgrading preserves the exact v0.3.17 behavior until the user chooses a threshold.
+- Example: with `N=200`, any accepted generation-speed sample `>= 200 token/s` is excluded from the current-Turn average's `sum/count`.
+- The cutoff applies **only** to `本轮平均 / 上轮平均`.
+- Realtime generation speed, the recent-speed list, and the existing recent-average calculation are unchanged; an excluded high value remains visible there for diagnosis.
+- The cutoff is applied at sample-accumulation time; it does not add sorting, trimming, weighting, extra polling, timers, or I/O.
+- The 5-sample visibility threshold counts only samples that were actually included in the current-Turn average.
+
+Status: implemented in v0.3.18; real-device validation should test several thresholds such as 100/150/200/300 and confirm excluded spikes remain visible in `最近速度`.
